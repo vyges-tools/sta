@@ -1,0 +1,25 @@
+# Build & test on every push to main and on pull requests (plus manual dispatch).
+# The crate has no dependencies: one job, test + clippy.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Test
+        run: cargo test --release --verbose
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
