@@ -48,6 +48,20 @@ pub struct Sdc {
     pub output_delays: Vec<PortDelay>,
 }
 
+/// A user-unit value (as the command line holds it, a `double`) in seconds: narrowed to `float`,
+/// then scaled in `float` by the unit (`scale`, e.g. `1e-9` for ns).
+pub fn user_to_sta(value: f64, scale: f32) -> f32 {
+    value as f32 * scale
+}
+
+/// A value in seconds back in user units, as a `double`: divided by the unit's DECIMAL scale in
+/// `double` (`1e-9`, not the `float` nearest to it). A constraint script reading a clock's period
+/// back and scaling it (`period * 0.2`) sees this value.
+pub fn sta_to_user(value: f32, scale: f32) -> f64 {
+    let decimal: f64 = format!("{scale:e}").parse().expect("a float's decimal form parses");
+    f64::from(value) / decimal
+}
+
 /// The setup required time between two edges of the SAME clock: the target edge the
 /// soonest strictly (fuzzily) after the source edge, as `target time − source cycle start`,
 /// computed in `double` and stored `float`.
@@ -84,6 +98,19 @@ mod tests {
 
     /// Rise to rise: one period; rise to fall: half a period; fall to rise: a full period from the
     /// source cycle start (the fall edge's arrival already carries its half period).
+    /// Rule: a period of 1.78 ns is `f32(1.78) × f32(1e-9)` (bits 30f4a42e, one below the
+    /// double-rounded value); read back it is 1.7799999252332555, and a delay of `period × 0.2`
+    /// set from it lands on bits 2fc3b68b — the value arrivals are seeded with.
+    #[test]
+    fn unit_conversions_round_where_the_commands_do() {
+        let period = user_to_sta(1.78, 1e-9);
+        assert_eq!(period.to_bits(), 0x30f4_a42e);
+        assert_ne!(period.to_bits(), (1.78e-9f64 as f32).to_bits());
+        let back = sta_to_user(period, 1e-9);
+        assert_eq!(back, 1.7799999252332555);
+        assert_eq!(user_to_sta(back * 0.2, 1e-9).to_bits(), 0x2fc3_b68b);
+    }
+
     #[test]
     fn setup_required_times_of_one_clock() {
         let c = Clock::new("c", 2.0, "clk", true);

@@ -137,6 +137,12 @@ fn is_check_role(r: Role) -> bool {
 }
 
 impl<'g, 'a> Search<'g, 'a> {
+    /// Search in the graph's own vertex order — the order vertices were created in: instances in
+    /// netlist order (each cell's pins in library order), then the top ports.
+    pub fn in_graph_order(graph: &'g Graph<'a>, sdc: &'g Sdc) -> Search<'g, 'a> {
+        Search::new(graph, sdc, (0..graph.vertices.len()).collect())
+    }
+
     /// `vertex_id[v]`: the creation-order id of vertex `v`.
     pub fn new(graph: &'g Graph<'a>, sdc: &'g Sdc, vertex_id: Vec<usize>) -> Search<'g, 'a> {
         let n = graph.vertices.len();
@@ -584,8 +590,7 @@ mod tests {
         let (libs, netlist, sdc) = design();
         let mut g = Graph::build(&libs, &netlist).unwrap();
         g.find_delays(&HashMap::new(), None).unwrap();
-        let ids = (0..g.vertices.len()).collect();
-        let mut s = Search::new(&g, &sdc, ids);
+        let mut s = Search::in_graph_order(&g, &sdc);
         s.find_arrivals().unwrap();
         s.find_requireds().unwrap();
         let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
