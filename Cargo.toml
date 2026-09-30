@@ -1,6 +1,6 @@
 [package]
 name = "vyges-sta"
-version = "0.1.38"
+version = "0.1.39"
 edition = "2021"
 description = "Static timing analysis with fully specified arithmetic: delays, arrivals, requireds and slacks reproducible bit for bit."
 license = "Apache-2.0"
