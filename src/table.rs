@@ -205,6 +205,21 @@ pub struct GateModel {
 }
 
 impl GateModel {
+    /// `GateTableModel::driveResistance` (no pvt): `maxCapSlew(0)` — the slew table at input
+    /// slew 0 and its LAST capacitance axis value, clipped at 0 — divided by that capacitance. A
+    /// slew table with no capacitance axis is cap 1, slew 0.
+    pub fn drive_resistance(&self) -> f32 {
+        let Some(t) = &self.slew else { return 0.0 };
+        let (slew, cap) = match t.axes.iter().take(3).find(|a| a.var == AxisVar::TotalOutputNetCapacitance) {
+            Some(ax) => {
+                let cap = *ax.values.last().unwrap_or(&0.0);
+                (t.gate_value(0.0, cap), cap)
+            }
+            None => (0.0, 1.0),
+        };
+        slew.max(0.0) / cap
+    }
+
     /// The delay and slew for an input slew and load cap; a negative slew clips to 0. (Process,
     /// voltage and temperature `k_` factors are not applied.)
     pub fn gate_delay(&self, in_slew: f32, load_cap: f32) -> (f32, f32) {

@@ -60,6 +60,14 @@ pub struct Port {
     pub is_clock: bool,
     /// `capacitance_` per `[rise/fall][min/max]`, after the defaults.
     pub capacitance: [[f32; 2]; 2],
+    /// `function`, as text (the reader keeps it unparsed; see [`Cell::is_buffer`]).
+    pub function: Option<String>,
+    /// `max_transition` (`× time unit`) and `max_capacitance` (`× capacitive load unit`), when set.
+    /// A `max_transition` of 0 is still set (the reference only warns).
+    pub max_transition: Option<f32>,
+    pub max_capacitance: Option<f32>,
+    /// `fanout_load`, unscaled, when set.
+    pub fanout_load: Option<f32>,
 }
 
 impl Port {
@@ -78,12 +86,79 @@ pub struct Cell {
     pub arc_sets: Vec<ArcSet>,
     /// `ff`/`latch` groups: `(output names, is_register, clock or enable expression)`.
     pub sequentials: Vec<(Vec<String>, bool, String)>,
+    /// `area` (unscaled), `cell_footprint`, `user_function_class` (empty when unset).
+    pub area: f32,
+    pub footprint: String,
+    pub user_function_class: String,
+    /// Boolean cell attributes, `true`/`false` compared case-insensitively. `is_pad` is set by
+    /// either `is_pad` or `pad_cell`, read in that order, so `pad_cell` wins when both appear.
+    pub dont_use: bool,
+    pub is_pad: bool,
+    pub is_level_shifter: bool,
+    pub is_isolation_cell: bool,
+    pub always_on: bool,
+    pub is_clock_cell: bool,
 }
 
 impl Cell {
     pub fn port(&self, name: &str) -> Option<&Port> {
         self.ports.iter().find(|p| p.name == name)
     }
+
+    /// `bufferPorts`: the single input and single output, in port order. A second input or
+    /// output, or a port of any other direction, means none.
+    pub fn buffer_ports(&self) -> Option<(&Port, &Port)> {
+        let (mut input, mut output) = (None, None);
+        for p in &self.ports {
+            match p.direction {
+                Direction::Input if input.is_none() => input = Some(p),
+                Direction::Output if output.is_none() => output = Some(p),
+                _ => return None,
+            }
+        }
+        Some((input?, output?))
+    }
+
+    /// `isBuffer`: buffer ports, the output's function is the input port itself, and neither a
+    /// level shifter nor a pad.
+    pub fn is_buffer(&self) -> bool {
+        self.buffer_ports().is_some_and(|(i, o)| o.function.as_deref().is_some_and(|f| function_is_port(f, &i.name))) && !self.is_level_shifter && !self.is_pad
+    }
+
+    /// `LibertyPort::driveResistance()`: the largest positive arc drive over the non-check arc
+    /// sets into `port`, every transition; 0 when none is positive.
+    pub fn drive_resistance(&self, port: &str) -> f32 {
+        let mut max_drive = f32::MIN;
+        let mut found = false;
+        for set in self.arc_sets.iter().filter(|s| s.to == port && !s.role.is_timing_check()) {
+            for arc in &set.arcs {
+                if let Model::Gate(m) = &arc.model {
+                    let drive = m.drive_resistance();
+                    if drive > 0.0 {
+                        if drive > max_drive {
+                            max_drive = drive;
+                        }
+                        found = true;
+                    }
+                }
+            }
+        }
+        if found {
+            max_drive
+        } else {
+            0.0
+        }
+    }
+}
+
+/// True when a liberty `function` is exactly one port — the expression parser reduces `A`,
+/// `(A)` and `((A))` to the port itself.
+pub fn function_is_port(function: &str, port: &str) -> bool {
+    let mut f = function.trim();
+    while f.len() >= 2 && f.starts_with('(') && f.ends_with(')') {
+        f = f[1..f.len() - 1].trim();
+    }
+    f == port
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -101,6 +176,10 @@ pub struct Library {
     pub slew_lower_threshold: [f32; 2],
     pub slew_upper_threshold: [f32; 2],
     pub slew_derate: f32,
+    /// `default_max_transition` (`× time unit`) and `default_fanout_load` (unscaled), when set —
+    /// a value of 0 is set too (the reference warns and keeps it).
+    pub default_max_transition: Option<f32>,
+    pub default_fanout_load: Option<f32>,
     /// `lu_table_template`s: each axis's variable and (scaled) values.
     pub templates: BTreeMap<String, Vec<Axis>>,
     pub cells: BTreeMap<String, Cell>,
@@ -165,6 +244,8 @@ impl Library {
         lib.slew_lower_threshold = [0.2; 2];
         lib.slew_upper_threshold = [0.8; 2];
         lib.slew_derate = g.attr_float("slew_derate_from_library").unwrap_or(1.0);
+        lib.default_max_transition = g.attr_float("default_max_transition").map(|v| v * lib.time_scale);
+        lib.default_fanout_load = g.attr_float("default_fanout_load");
         for (rf, word) in [(RISE, "rise"), (FALL, "fall")] {
             for (field, name) in [(&mut lib.input_threshold, "input_threshold_pct_"), (&mut lib.output_threshold, "output_threshold_pct_"), (&mut lib.slew_lower_threshold, "slew_lower_threshold_pct_"), (&mut lib.slew_upper_threshold, "slew_upper_threshold_pct_")] {
                 if let Some(v) = g.attr_float(&format!("{name}{word}")) {
@@ -202,6 +283,20 @@ impl Library {
 
     fn read_cell(&self, cg: &Group) -> Result<Cell, String> {
         let mut cell = Cell { name: cg.name().ok_or("cell without a name")?, ..Default::default() };
+        cell.area = cg.attr_float("area").unwrap_or(0.0);
+        cell.footprint = cg.attr_text("cell_footprint").unwrap_or_default();
+        cell.user_function_class = cg.attr_text("user_function_class").unwrap_or_default();
+        let flag = |name: &str, current: bool| match cg.attr_text(name) {
+            Some(v) if v.eq_ignore_ascii_case("true") => true,
+            Some(v) if v.eq_ignore_ascii_case("false") => false,
+            _ => current,
+        };
+        cell.dont_use = flag("dont_use", false);
+        cell.is_pad = flag("pad_cell", flag("is_pad", false));
+        cell.is_level_shifter = flag("is_level_shifter", false);
+        cell.is_isolation_cell = flag("is_isolation_cell", false);
+        cell.always_on = flag("always_on", false);
+        cell.is_clock_cell = flag("is_clock_cell", false);
         if cg.groups.iter().any(|g| g.kind == "bus" || g.kind == "bundle") {
             return Err(format!("cell {}: buses and bundles are not modelled", cell.name));
         }
@@ -256,7 +351,11 @@ impl Library {
         let default = self.default_cap(direction);
         let capacitance = cap.map(|row| row.map(|c| c.unwrap_or(default)));
         let is_clock = pg.attr_text("clock").is_some_and(|c| c == "true");
-        Port { name: name.to_string(), direction, is_clock, capacitance }
+        let function = pg.attr_text("function");
+        let max_transition = pg.attr_float("max_transition").map(|v| v * self.time_scale);
+        let max_capacitance = pg.attr_float("max_capacitance").map(|v| v * self.cap_scale);
+        let fanout_load = pg.attr_float("fanout_load");
+        Port { name: name.to_string(), direction, is_clock, capacitance, function, max_transition, max_capacitance, fanout_load }
     }
 }
 
@@ -274,6 +373,15 @@ pub enum Role {
     Removal,
     /// Pulse width, period, tristate, non-sequential checks, … — read, never timed here.
     Other,
+}
+
+impl Role {
+    /// `TimingRole::isTimingCheck` for the roles read with arcs. `Other` carries no arcs, so its
+    /// answer never reaches a value (a tristate enable arc, which the reference does time, is
+    /// among them — tristate drivers are not modelled).
+    pub fn is_timing_check(self) -> bool {
+        matches!(self, Role::Setup | Role::Hold | Role::Recovery | Role::Removal | Role::Other)
+    }
 }
 
 /// A timing model: a gate's delay and slew tables, or a check's constraint table.
@@ -478,6 +586,66 @@ mod tests {
         assert_eq!(unit_scale("10ps", "s"), 1e-12f32 * 10.0);
         assert_eq!(unit_scale("s", "s"), 1.0);
         assert_eq!(unit_scale("2ns", "s"), 1e-9f32, "an unknown multiplier is 1");
+    }
+
+    // Rules (LibertyReader::readCellAttributes, readPortAttributes): area / cell_footprint /
+    // user_function_class / dont_use; booleans compare case-insensitively; `pad_cell` is read
+    // after `is_pad`; max_transition × time unit, max_capacitance × cap unit; a 0
+    // default_max_transition is kept.
+    #[test]
+    fn cell_and_port_attributes_are_read_with_their_units() {
+        let text = r#"library (l) { time_unit : "1ns" ; capacitive_load_unit (1, ff) ;
+            default_max_transition : 0 ; default_fanout_load : 1 ;
+            cell (B) { area : 2.5 ; cell_footprint : "buf" ; dont_use : TRUE ; is_pad : true ; pad_cell : false ;
+              pin (A) { direction : input ; capacitance : 1 ; fanout_load : 2 ; }
+              pin (Z) { direction : output ; function : "(A)" ; max_transition : 0.5 ; max_capacitance : 30 ; }
+            } }"#;
+        let lib = Library::read(&parse(text).unwrap()).unwrap();
+        assert_eq!(lib.default_max_transition, Some(0.0));
+        assert_eq!(lib.default_fanout_load, Some(1.0));
+        let c = &lib.cells["B"];
+        assert_eq!((c.area, c.footprint.as_str(), c.dont_use, c.is_pad), (2.5, "buf", true, false));
+        let z = c.port("Z").unwrap();
+        assert_eq!(z.max_transition, Some(0.5 * 1e-9f32));
+        assert_eq!(z.max_capacitance, Some(30.0 * 1e-15f32));
+        assert_eq!(c.port("A").unwrap().fanout_load, Some(2.0));
+    }
+
+    // Rules (LibertyCell::bufferPorts, isBuffer, hasBufferFunc): one input and one output in
+    // port order; the output function is that input port; not a level shifter or pad.
+    #[test]
+    fn a_buffer_is_one_input_one_output_whose_function_is_the_input() {
+        let text = r#"library (l) {
+            cell (BUF) { pin (A) { direction : input ; } pin (Z) { direction : output ; function : "A" ; } }
+            cell (INV) { pin (A) { direction : input ; } pin (ZN) { direction : output ; function : "!A" ; } }
+            cell (AND) { pin (A) { direction : input ; } pin (B) { direction : input ; } pin (Z) { direction : output ; function : "A&B" ; } }
+            cell (LS) { is_level_shifter : true ; pin (A) { direction : input ; } pin (Z) { direction : output ; function : "A" ; } }
+            }"#;
+        let lib = Library::read(&parse(text).unwrap()).unwrap();
+        assert!(lib.cells["BUF"].is_buffer());
+        assert!(!lib.cells["INV"].is_buffer());
+        assert!(lib.cells["AND"].buffer_ports().is_none(), "a second input means no buffer ports");
+        assert!(!lib.cells["LS"].is_buffer());
+        assert!(function_is_port(" ((A)) ", "A") && !function_is_port("A B", "A"));
+    }
+
+    // Rules (GateTableModel::driveResistance via maxCapSlew, LibertyPort::driveResistance): the
+    // slew at input slew 0 and the LAST cap axis value, over that cap; the max positive drive
+    // over the arcs into the port.
+    #[test]
+    fn drive_resistance_is_the_slew_at_the_largest_cap_over_that_cap() {
+        let text = r#"library (l) { time_unit : "1ns" ; capacitive_load_unit (1, pf) ;
+            lu_table_template (t) { variable_1 : input_net_transition ; variable_2 : total_output_net_capacitance ;
+              index_1 ("0, 1") ; index_2 ("0, 2") ; }
+            cell (BUF) { pin (A) { direction : input ; }
+              pin (Z) { direction : output ; function : "A" ;
+                timing () { related_pin : "A" ; timing_sense : positive_unate ;
+                  rise_transition (t) { values ("1, 3", "5, 9") ; }
+                  fall_transition (t) { values ("1, 5", "5, 9") ; } } } } }"#;
+        let lib = Library::read(&parse(text).unwrap()).unwrap();
+        // rise: 3 ns / 2 pF; fall: 5 ns / 2 pF — the max.
+        assert_eq!(lib.cells["BUF"].drive_resistance("Z"), (5.0 * 1e-9f32) / (2.0 * 1e-12f32));
+        assert_eq!(lib.cells["BUF"].drive_resistance("A"), 0.0);
     }
 
     // Rules: capacitance sets all four, rise/fall override a
