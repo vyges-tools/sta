@@ -68,6 +68,8 @@ pub struct Port {
     pub max_capacitance: Option<f32>,
     /// `fanout_load`, unscaled, when set.
     pub fanout_load: Option<f32>,
+    /// `max_fanout`, unscaled, when set.
+    pub max_fanout: Option<f32>,
 }
 
 impl Port {
@@ -151,6 +153,39 @@ impl Cell {
     }
 }
 
+/// `isInverter`: buffer ports whose output function is the input inverted (`!A`, `A'`), and
+/// neither a level shifter nor a pad.
+impl Cell {
+    pub fn is_inverter(&self) -> bool {
+        self.buffer_ports().is_some_and(|(i, o)| o.function.as_deref().is_some_and(|f| function_is_not_port(f, &i.name))) && !self.is_level_shifter && !self.is_pad
+    }
+}
+
+fn strip_parens(mut f: &str) -> &str {
+    f = f.trim();
+    while f.len() >= 2 && f.starts_with('(') && f.ends_with(')') {
+        f = f[1..f.len() - 1].trim();
+    }
+    f
+}
+
+/// True when a `function` is one port inverted: `!A`, `!(A)`, `A'`, `(A)'`, in parentheses or not.
+pub fn function_is_not_port(function: &str, port: &str) -> bool {
+    let f = strip_parens(function);
+    if let Some(rest) = f.strip_prefix('!') {
+        return function_is_port(rest, port);
+    }
+    if let Some(rest) = f.strip_suffix('\'') {
+        return function_is_port(rest, port);
+    }
+    false
+}
+
+/// True when a `function` is a constant (`0`, `1`, `1'b0`, `1'b1`): a tie cell's output.
+pub fn function_is_constant(function: &str) -> bool {
+    matches!(strip_parens(function), "0" | "1" | "1'b0" | "1'b1")
+}
+
 /// True when a liberty `function` is exactly one port — the expression parser reduces `A`,
 /// `(A)` and `((A))` to the port itself.
 pub fn function_is_port(function: &str, port: &str) -> bool {
@@ -180,6 +215,9 @@ pub struct Library {
     /// a value of 0 is set too (the reference warns and keeps it).
     pub default_max_transition: Option<f32>,
     pub default_fanout_load: Option<f32>,
+    /// `default_max_fanout` (unscaled; a 0 is kept). ⚠️ No `default_max_capacitance`: the
+    /// reference's reader never sets it, so a library's value has no effect there.
+    pub default_max_fanout: Option<f32>,
     /// `lu_table_template`s: each axis's variable and (scaled) values.
     pub templates: BTreeMap<String, Vec<Axis>>,
     pub cells: BTreeMap<String, Cell>,
@@ -246,6 +284,7 @@ impl Library {
         lib.slew_derate = g.attr_float("slew_derate_from_library").unwrap_or(1.0);
         lib.default_max_transition = g.attr_float("default_max_transition").map(|v| v * lib.time_scale);
         lib.default_fanout_load = g.attr_float("default_fanout_load");
+        lib.default_max_fanout = g.attr_float("default_max_fanout");
         for (rf, word) in [(RISE, "rise"), (FALL, "fall")] {
             for (field, name) in [(&mut lib.input_threshold, "input_threshold_pct_"), (&mut lib.output_threshold, "output_threshold_pct_"), (&mut lib.slew_lower_threshold, "slew_lower_threshold_pct_"), (&mut lib.slew_upper_threshold, "slew_upper_threshold_pct_")] {
                 if let Some(v) = g.attr_float(&format!("{name}{word}")) {
@@ -355,7 +394,8 @@ impl Library {
         let max_transition = pg.attr_float("max_transition").map(|v| v * self.time_scale);
         let max_capacitance = pg.attr_float("max_capacitance").map(|v| v * self.cap_scale);
         let fanout_load = pg.attr_float("fanout_load");
-        Port { name: name.to_string(), direction, is_clock, capacitance, function, max_transition, max_capacitance, fanout_load }
+        let max_fanout = pg.attr_float("max_fanout");
+        Port { name: name.to_string(), direction, is_clock, capacitance, function, max_transition, max_capacitance, fanout_load, max_fanout }
     }
 }
 
@@ -627,6 +667,27 @@ mod tests {
         assert!(lib.cells["AND"].buffer_ports().is_none(), "a second input means no buffer ports");
         assert!(!lib.cells["LS"].is_buffer());
         assert!(function_is_port(" ((A)) ", "A") && !function_is_port("A B", "A"));
+    }
+
+    // Rules (LibertyCell::isInverter / hasInverterFunc; Sim's constant functions): the output is
+    // the input inverted, written `!A`, `A'` or parenthesized; a constant is 0 / 1 / 1'b0 / 1'b1.
+    #[test]
+    fn inverter_and_constant_functions() {
+        for f in ["!A", " !(A) ", "A'", "(A)'", "(!A)"] {
+            assert!(function_is_not_port(f, "A"), "{f}");
+        }
+        for f in ["A", "!B", "A&B", "!A&B"] {
+            assert!(!function_is_not_port(f, "A"), "{f}");
+        }
+        for f in ["0", "1", "1'b0", "(1'b1)"] {
+            assert!(function_is_constant(f), "{f}");
+        }
+        assert!(!function_is_constant("A"));
+        let lib = Library::read(&parse(r#"library (l) {
+            cell (INV) { pin (A) { direction : input ; } pin (ZN) { direction : output ; function : "!A" ; } }
+            cell (BUF) { pin (A) { direction : input ; } pin (Z) { direction : output ; function : "A" ; } }
+            }"#).unwrap()).unwrap();
+        assert!(lib.cells["INV"].is_inverter() && !lib.cells["BUF"].is_inverter());
     }
 
     // Rules (GateTableModel::driveResistance via maxCapSlew, LibertyPort::driveResistance): the

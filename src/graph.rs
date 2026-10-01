@@ -275,6 +275,43 @@ impl<'a> Graph<'a> {
         sum
     }
 
+    /// The pi-Elmore model of a driver's net, for a transition and min/max — the one delay
+    /// calculation and [`Graph::load_cap`] both read.
+    fn reduced(&self, drvr: usize, rf: usize, mm: usize, parasitics: &HashMap<String, NetParasitics>, index: &HashMap<String, usize>) -> Option<(crate::parasitics::PiElmore, Vec<String>)> {
+        let n = self.vertex_net[drvr]?;
+        let np = parasitics.get(&self.netlist.nets[n].name)?;
+        let d = np.node_names.iter().position(|x| x == &self.vertices[drvr].name)?;
+        let names = &np.node_names;
+        let cap = |i: usize| index.get(&names[i]).map_or(0.0, |&v| self.pin_cap(v, rf, mm));
+        let load = |i: usize| index.get(&names[i]).is_some_and(|&v| !self.vertices[v].is_driver);
+        Some((reduce_to_pi_elmore(&np.network, d, &NodePins { pin_cap: &cap, is_load: &load }), names.clone()))
+    }
+
+    /// `GraphDelayCalc::loadCap(drvr_pin, scene, max)`: over rise then fall, the larger of
+    /// `pin_cap + wire_cap` (`parasiticLoad`) — the pin capacitance of the driver's net
+    /// (`connectedCap`; no `set_load` here) plus, when the reduced pi model's total is at least
+    /// that, the total MINUS the pin cap (so the sum is `pin + (pi − pin)` in float, not the pi
+    /// total); a smaller pi model is ignored (wire cap 0). No parasitics: the pin cap alone.
+    pub fn load_cap(&self, drvr: usize, parasitics: &HashMap<String, NetParasitics>) -> f32 {
+        let index: HashMap<String, usize> = self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect();
+        let mut load_cap = -1e30f32;
+        for rf in [RISE, FALL] {
+            let pin_cap = self.net_pin_cap(drvr, rf, MAX, &index);
+            let mut wire_cap = 0.0f32;
+            if let Some((p, _)) = self.reduced(drvr, rf, MAX, parasitics, &index) {
+                let parasitic_cap = p.c1 + p.c2;
+                if parasitic_cap >= pin_cap {
+                    wire_cap = parasitic_cap - pin_cap;
+                }
+            }
+            let cap = pin_cap + wire_cap;
+            if cap > load_cap {
+                load_cap = cap;
+            }
+        }
+        load_cap
+    }
+
     /// Delay calculation over the whole graph. With `trace`, one line per DMP gate call
     /// (`dcalc|gate|drvr|rf pair|in_slew|c2|rpi|c1|alg|rd|t0|dt|ceff|valid|delay|slew`, bits in hex)
     /// and per load (`dcalc|load|drvr|load|wire delay|load slew`).
@@ -286,15 +323,7 @@ impl<'a> Graph<'a> {
         // Fuzzily worse for this min/max, so the merge order matters.
         let worse = |mm: usize, a: f32, b: f32| if mm == MAX { crate::fuzzy::greater(a, b) } else { crate::fuzzy::less(a, b) };
         // The pi-Elmore model of a driver's net, for a transition and min/max.
-        let reduce = |g: &Graph, drvr: usize, rf: usize, mm: usize| -> Option<(crate::parasitics::PiElmore, Vec<String>)> {
-            let n = g.vertex_net[drvr]?;
-            let np = parasitics.get(&g.netlist.nets[n].name)?;
-            let d = np.node_names.iter().position(|x| x == &g.vertices[drvr].name)?;
-            let names = &np.node_names;
-            let cap = |i: usize| index.get(&names[i]).map_or(0.0, |&v| g.pin_cap(v, rf, mm));
-            let load = |i: usize| index.get(&names[i]).is_some_and(|&v| !g.vertices[v].is_driver);
-            Some((reduce_to_pi_elmore(&np.network, d, &NodePins { pin_cap: &cap, is_load: &load }), names.clone()))
-        };
+        let reduce = |g: &Graph, drvr: usize, rf: usize, mm: usize| g.reduced(drvr, rf, mm, parasitics, &index);
         for &v in &order {
             let fanin: Vec<usize> = self.in_edges[v].iter().copied().filter(|&e| !self.is_check(e)).collect();
             let wires: Vec<usize> = self.out_edges[v].iter().copied().filter(|&e| matches!(self.edges[e].kind, EdgeKind::Wire)).collect();
