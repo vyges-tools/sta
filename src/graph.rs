@@ -79,6 +79,9 @@ pub struct Graph<'a> {
     pub slew_limit: HashMap<usize, f32>,
     /// The loads [`Graph::find_delays`] held at their limit, in the order it timed them.
     pub clamped: Vec<usize>,
+    /// Annotated max slews (`setAnnotatedSlew`): the vertex's max slew on both transitions IS the
+    /// value, whatever the delay calculation finds — applied before its fanout reads it.
+    pub slew_annotated: HashMap<usize, f32>,
 }
 
 fn cell<'a>(libs: &'a [Library], lib: usize, name: &str) -> &'a Cell {
@@ -164,7 +167,7 @@ impl<'a> Graph<'a> {
                 EdgeKind::Wire => vec![[0.0f32; 2]; 2],
             })
             .collect();
-        Ok(Graph { libs, netlist, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new() })
+        Ok(Graph { libs, netlist, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new() })
     }
 
     pub fn is_check(&self, e: usize) -> bool {
@@ -287,6 +290,20 @@ impl<'a> Graph<'a> {
         Some((reduce_to_pi_elmore(&np.network, d, &NodePins { pin_cap: &cap, is_load: &load }), names.clone()))
     }
 
+    /// `GraphDelayCalc::loadCap(drvr_pin, rf, scene, max, pin_cap, wire_cap)` for one transition,
+    /// and whether the driver has a reduced pi model at all (`findPiElmore`).
+    pub fn load_cap_parts(&self, drvr: usize, parasitics: &HashMap<String, NetParasitics>, rf: usize) -> (f32, f32, bool) {
+        let index: HashMap<String, usize> = self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect();
+        let pin_cap = self.net_pin_cap(drvr, rf, MAX, &index);
+        match self.reduced(drvr, rf, MAX, parasitics, &index) {
+            Some((p, _)) => {
+                let parasitic_cap = p.c1 + p.c2;
+                (pin_cap, if parasitic_cap >= pin_cap { parasitic_cap - pin_cap } else { 0.0 }, true)
+            }
+            None => (pin_cap, 0.0, false),
+        }
+    }
+
     /// `GraphDelayCalc::loadCap(drvr_pin, scene, max)`: over rise then fall, the larger of
     /// `pin_cap + wire_cap` (`parasiticLoad`) — the pin capacitance of the driver's net
     /// (`connectedCap`; no `set_load` here) plus, when the reduced pi model's total is at least
@@ -331,6 +348,9 @@ impl<'a> Graph<'a> {
                 if fanin.is_empty() {
                     // A root load's slew is 0.
                     self.slew[v] = [[0.0; 2]; 2];
+                } else if let Some(&value) = self.slew_annotated.get(&v) {
+                    self.slew[v][RISE][MAX] = value;
+                    self.slew[v][FALL][MAX] = value;
                 } else if let Some(&limit) = self.slew_limit.get(&v) {
                     // Its driver set its slew; before its fanout reads it, an excess on either
                     // transition holds BOTH max slews at the limit.
@@ -547,6 +567,19 @@ mod tests {
         assert_eq!([g.slew[u2a][RISE][MAX], g.slew[u2a][FALL][MAX]], [0.5e-9, 0.5e-9]);
         // u1/Y takes the B arc's slew (newest first, see below); the lumped load inherits it.
         assert_eq!(g.slew[u2a][RISE][MIN], 1.000_000_5f32 * 1e-9, "only max is held");
+    }
+
+    /// Rule (an annotated slew): the annotation IS the max slew, even below what the calculation
+    /// finds.
+    #[test]
+    fn an_annotated_load_slew_is_the_value() {
+        let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
+        let nl = chain();
+        let mut g = Graph::build(&libs, &nl).unwrap();
+        let u2a = g.vertices.iter().position(|v| v.name == "u2/A").unwrap();
+        g.slew_annotated.insert(u2a, 2.0e-9);
+        g.find_delays(&HashMap::new(), None).unwrap();
+        assert_eq!([g.slew[u2a][RISE][MAX], g.slew[u2a][FALL][MAX]], [2.0e-9, 2.0e-9]);
     }
 
     /// Rule (edges prepend to a vertex's in-edge list; merges are fuzzy): the B arc set, created
