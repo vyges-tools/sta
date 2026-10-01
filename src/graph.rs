@@ -74,6 +74,11 @@ pub struct Graph<'a> {
     pub slew: Vec<[[f32; 2]; 2]>,
     /// Per edge: gate arcs `[arc][min/max]`; wire edges `[rf][min/max]`.
     pub delay: Vec<Vec<[f32; 2]>>,
+    /// Load vertices whose max slew is held at a limit when it is exceeded (an annotated slew,
+    /// as a resizer sets on loads it will repair, so the excess does not propagate).
+    pub slew_limit: HashMap<usize, f32>,
+    /// The loads [`Graph::find_delays`] held at their limit, in the order it timed them.
+    pub clamped: Vec<usize>,
 }
 
 fn cell<'a>(libs: &'a [Library], lib: usize, name: &str) -> &'a Cell {
@@ -159,7 +164,7 @@ impl<'a> Graph<'a> {
                 EdgeKind::Wire => vec![[0.0f32; 2]; 2],
             })
             .collect();
-        Ok(Graph { libs, netlist, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay })
+        Ok(Graph { libs, netlist, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new() })
     }
 
     pub fn is_check(&self, e: usize) -> bool {
@@ -172,6 +177,43 @@ impl<'a> Graph<'a> {
     pub(crate) fn arc_set(&self, e: usize, set: usize) -> &crate::liberty::ArcSet {
         let v = &self.vertices[self.edges[e].to];
         &cell(self.libs, v.lib.unwrap(), v.cell.as_deref().unwrap()).arc_sets[set]
+    }
+
+    /// `Levelize::findLevels` on an acyclic graph: a root — no searched-through edge into it —
+    /// is level 0; every other vertex is one more than the highest level among the vertices
+    /// that reach it through a searched-through edge (`Levelize::searchThru`: every edge but
+    /// timing checks, latch D->Q, and the register set/clear arcs the reference leaves disabled
+    /// by default). ⚠️ Arc sets of role `Other` have no edge here (tristate enable/disable among
+    /// them, which the reference DOES search through) — a caller that needs exact levels refuses
+    /// cells carrying one. A vertex no
+    /// root reaches is 0. Levels are in steps of 1 (the reference's are a constant multiple,
+    /// which orders the same).
+    pub fn levels(&self) -> Result<Vec<i32>, String> {
+        let thru = |e: usize| -> bool {
+            match self.edges[e].kind {
+                EdgeKind::Gate { set } => !self.is_check(e) && !matches!(self.arc_set(e, set).role, Role::RegSetClr | Role::LatchDtoQ),
+                EdgeKind::Wire => true,
+            }
+        };
+        let order = self.topo_order()?;
+        let mut level = vec![-1i32; self.vertices.len()];
+        for (v, l) in level.iter_mut().enumerate() {
+            if !self.in_edges[v].iter().any(|&e| thru(e)) {
+                *l = 0;
+            }
+        }
+        for &v in &order {
+            if level[v] == -1 {
+                continue;
+            }
+            for &e in &self.out_edges[v] {
+                if thru(e) {
+                    let to = self.edges[e].to;
+                    level[to] = level[to].max(level[v] + 1);
+                }
+            }
+        }
+        Ok(level.into_iter().map(|l| l.max(0)).collect())
     }
 
     /// Topological order over the propagating edges (every edge but timing checks).
@@ -238,6 +280,7 @@ impl<'a> Graph<'a> {
     /// and per load (`dcalc|load|drvr|load|wire delay|load slew`).
     pub fn find_delays(&mut self, parasitics: &HashMap<String, NetParasitics>, mut trace: Option<&mut Vec<String>>) -> Result<(), String> {
         let order = self.topo_order()?;
+        self.clamped.clear();
         let index: HashMap<String, usize> = self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect();
         const INIT: [f32; 2] = [1e30, -1e30];
         // Fuzzily worse for this min/max, so the merge order matters.
@@ -259,6 +302,14 @@ impl<'a> Graph<'a> {
                 if fanin.is_empty() {
                     // A root load's slew is 0.
                     self.slew[v] = [[0.0; 2]; 2];
+                } else if let Some(&limit) = self.slew_limit.get(&v) {
+                    // Its driver set its slew; before its fanout reads it, an excess on either
+                    // transition holds BOTH max slews at the limit.
+                    if self.slew[v][RISE][MAX] > limit || self.slew[v][FALL][MAX] > limit {
+                        self.slew[v][RISE][MAX] = limit;
+                        self.slew[v][FALL][MAX] = limit;
+                        self.clamped.push(v);
+                    }
                 }
                 continue;
             }
@@ -422,6 +473,52 @@ mod tests {
         }
       }
     }"#;
+
+    /// Two `and2` in a chain: ports a, b into u1; u1/Y and port c into u2; u2/Y out to y.
+    fn chain() -> Netlist {
+        let pin = |i: usize, p: &str| Conn::Inst(i, p.into());
+        Netlist {
+            insts: vec![("u1".into(), "and2".into()), ("u2".into(), "and2".into())],
+            ports: vec![("a".into(), PortDir::Input), ("b".into(), PortDir::Input), ("c".into(), PortDir::Input), ("y".into(), PortDir::Output)],
+            nets: vec![
+                Net { name: "a".into(), pins: vec![pin(0, "A"), Conn::Port(0)] },
+                Net { name: "b".into(), pins: vec![pin(0, "B"), Conn::Port(1)] },
+                Net { name: "n1".into(), pins: vec![pin(0, "Y"), pin(1, "A")] },
+                Net { name: "c".into(), pins: vec![pin(1, "B"), Conn::Port(2)] },
+                Net { name: "y".into(), pins: vec![pin(1, "Y"), Conn::Port(3)] },
+            ],
+        }
+    }
+
+    /// Rule (Levelize::findLevels): roots 0; each vertex one past the highest of its fanin
+    /// through searched edges — so u2/B, reached straight from port c, is 1 while u2/A is 3.
+    #[test]
+    fn levels_are_the_longest_path_from_a_root() {
+        let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
+        let nl = chain();
+        let g = Graph::build(&libs, &nl).unwrap();
+        let lv = g.levels().unwrap();
+        let at = |n: &str| lv[g.vertices.iter().position(|v| v.name == n).unwrap()];
+        assert_eq!([at("a"), at("u1/A"), at("u1/Y"), at("u2/A"), at("u2/B"), at("u2/Y"), at("y")], [0, 1, 2, 3, 1, 4, 5]);
+    }
+
+    /// Rule (an annotated load slew): a load whose max slew exceeds its limit on either
+    /// transition holds BOTH at the limit and is recorded; a limit above its slew changes nothing.
+    #[test]
+    fn a_load_over_its_limit_is_held_at_it() {
+        let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
+        let nl = chain();
+        let mut g = Graph::build(&libs, &nl).unwrap();
+        let u2a = g.vertices.iter().position(|v| v.name == "u2/A").unwrap();
+        let u2b = g.vertices.iter().position(|v| v.name == "u2/B").unwrap();
+        g.slew_limit.insert(u2a, 0.5e-9);
+        g.slew_limit.insert(u2b, 0.5e-9);
+        g.find_delays(&HashMap::new(), None).unwrap();
+        assert_eq!(g.clamped, vec![u2a], "u2/B (slew 0 from an undriven port) is under its limit");
+        assert_eq!([g.slew[u2a][RISE][MAX], g.slew[u2a][FALL][MAX]], [0.5e-9, 0.5e-9]);
+        // u1/Y takes the B arc's slew (newest first, see below); the lumped load inherits it.
+        assert_eq!(g.slew[u2a][RISE][MIN], 1.000_000_5f32 * 1e-9, "only max is held");
+    }
 
     /// Rule (edges prepend to a vertex's in-edge list; merges are fuzzy): the B arc set, created
     /// SECOND, is visited FIRST, and A's slew — within 1 ppm — replaces it for
