@@ -70,6 +70,8 @@ pub struct Port {
     pub fanout_load: Option<f32>,
     /// `max_fanout`, unscaled, when set.
     pub max_fanout: Option<f32>,
+    /// `three_state` (the tristate enable function), as text.
+    pub three_state: Option<String>,
 }
 
 impl Port {
@@ -100,6 +102,15 @@ pub struct Cell {
     pub is_isolation_cell: bool,
     pub always_on: bool,
     pub is_clock_cell: bool,
+    /// The cell has a `statetable` group (not read further).
+    pub has_statetable: bool,
+    /// `pg_pin` groups, in order: (name, `pg_type`). The reference counts them among a cell's ports.
+    pub pg_pins: Vec<(String, String)>,
+    /// `cell_leakage_power` × the library's power scale, when set.
+    pub leakage_power: Option<f32>,
+    /// Each `leakage_power` group's `value` × the power scale, in order (groups without one are
+    /// skipped, as the reference only warns).
+    pub leakage_powers: Vec<f32>,
 }
 
 impl Cell {
@@ -211,6 +222,8 @@ pub struct Library {
     pub slew_lower_threshold: [f32; 2],
     pub slew_upper_threshold: [f32; 2],
     pub slew_derate: f32,
+    /// `leakage_power_unit` (default 1 W).
+    pub power_scale: f32,
     /// `default_max_transition` (`× time unit`) and `default_fanout_load` (unscaled), when set —
     /// a value of 0 is set too (the reference warns and keeps it).
     pub default_max_transition: Option<f32>,
@@ -257,7 +270,10 @@ fn unit_scale(units: &str, suffix: &str) -> f32 {
 impl Library {
     /// Read a parsed `library` group.
     pub fn read(g: &Group) -> Result<Library, String> {
-        let mut lib = Library { name: g.name().unwrap_or_default(), time_scale: 1e-9, cap_scale: 1e-12, ..Default::default() };
+        let mut lib = Library { name: g.name().unwrap_or_default(), time_scale: 1e-9, cap_scale: 1e-12, power_scale: 1.0, ..Default::default() };
+        if let Some(t) = g.attr_text("leakage_power_unit") {
+            lib.power_scale = unit_scale(&t, "W");
+        }
         if let Some(t) = g.attr_text("time_unit") {
             lib.time_scale = unit_scale(&t, "s");
         }
@@ -336,6 +352,14 @@ impl Library {
         cell.is_isolation_cell = flag("is_isolation_cell", false);
         cell.always_on = flag("always_on", false);
         cell.is_clock_cell = flag("is_clock_cell", false);
+        cell.has_statetable = cg.groups_of("statetable").next().is_some();
+        cell.leakage_power = cg.attr_float("cell_leakage_power").map(|v| v * self.power_scale);
+        cell.leakage_powers = cg.groups_of("leakage_power").filter_map(|lg| lg.attr_float("value")).map(|v| v * self.power_scale).collect();
+        for pg in cg.groups_of("pg_pin") {
+            if let Some(name) = pg.name() {
+                cell.pg_pins.push((name, pg.attr_text("pg_type").unwrap_or_default()));
+            }
+        }
         if cg.groups.iter().any(|g| g.kind == "bus" || g.kind == "bundle") {
             return Err(format!("cell {}: buses and bundles are not modelled", cell.name));
         }
@@ -395,7 +419,8 @@ impl Library {
         let max_capacitance = pg.attr_float("max_capacitance").map(|v| v * self.cap_scale);
         let fanout_load = pg.attr_float("fanout_load");
         let max_fanout = pg.attr_float("max_fanout");
-        Port { name: name.to_string(), direction, is_clock, capacitance, function, max_transition, max_capacitance, fanout_load, max_fanout }
+        let three_state = pg.attr_text("three_state");
+        Port { name: name.to_string(), direction, is_clock, capacitance, function, max_transition, max_capacitance, fanout_load, max_fanout, three_state }
     }
 }
 

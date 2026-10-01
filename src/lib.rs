@@ -8,6 +8,7 @@
 //! The pipeline, in data-flow order:
 //! - [`liberty_parse`]: liberty syntax, every value kept as the reader keeps it.
 //! - [`liberty`]: the library — units, cells, ports.
+//! - [`func_expr`]: liberty functions parsed as the reference parses them, and their equivalence.
 //! - [`table`]: NLDM tables and their lookup.
 //! - [`dcalc`]: gate and wire delay (DMP effective capacitance, Elmore).
 //! - [`netlist`], [`graph`]: the timing graph and delay calculation over it.
@@ -15,6 +16,7 @@
 //! - [`sdc`], [`search`]: the clock and port delays; arrivals, requireds and slacks.
 
 pub mod dcalc;
+pub mod func_expr;
 pub mod fuzzy;
 pub mod graph;
 pub mod liberty;
