@@ -96,6 +96,20 @@ pub struct SdcEnv {
     pub port_pin_cap: HashMap<String, [[Option<f32>; 2]; 2]>,
     /// `set_input_transition` on an input port (`InputDrive::slew`), per `[rf][min/max]`.
     pub input_slew: HashMap<String, [[Option<f32>; 2]; 2]>,
+    /// `set_driving_cell` on an input port (both min and max, rise and fall).
+    pub input_drive: HashMap<String, InputDrive>,
+}
+
+/// One `set_driving_cell`: the cell (the first library holding it), the port it drives from
+/// (`-pin`), the port its arcs start at (`-from_pin`, else `driveCellDefaultFromPort`: of the
+/// arc sets into `to_port`, the from-port first in the cell's port order), and the slews at that
+/// port per from-transition.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InputDrive {
+    pub cell: String,
+    pub from_port: Option<String>,
+    pub to_port: String,
+    pub from_slews: [f32; 2],
 }
 
 fn cell<'a>(libs: &'a [Library], lib: usize, name: &str) -> &'a Cell {
@@ -301,6 +315,67 @@ impl<'a> Graph<'a> {
         LibThresholds { output: l.output_threshold[rf], input: l.input_threshold[rf], lower: l.slew_lower_threshold[rf], upper: l.slew_upper_threshold[rf], derate: l.slew_derate }
     }
 
+    /// `GraphDelayCalc::findInputDriverDelay` for an input port with a driving cell: per min/max
+    /// and port transition, each of the cell's arcs from `from_port` into `to_port` ending in that
+    /// transition, at the slew given for its from-transition (`findInputArcDelay`): the gate at
+    /// the port's load (`parasiticLoad`: DMP on its pi, else lumped), and at no load (the
+    /// intrinsic delay); the port's slew is SET to the gate's, and each load's slew and wire delay
+    /// are SET from the gate's load waveforms, the wire delay plus the load-dependent part of the
+    /// gate delay (`gate − intrinsic`, in float). A later arc of the same transition overwrites.
+    fn time_input_drive(&mut self, v: usize, wires: &[usize], drive: &InputDrive, parasitics: &HashMap<String, NetParasitics>, index: &HashMap<String, usize>) -> Result<(), String> {
+        let li = self.libs.iter().position(|l| l.cells.contains_key(&drive.cell)).ok_or_else(|| format!("set_driving_cell: cell {} not found", drive.cell))?;
+        let cell = &self.libs[li].cells[&drive.cell];
+        let from_port = match &drive.from_port {
+            Some(f) => f.clone(),
+            None => {
+                let pos = |p: &str| cell.ports.iter().position(|x| x.name == p).unwrap_or(usize::MAX);
+                cell.arc_sets.iter().filter(|s| s.to == drive.to_port).min_by_key(|s| pos(&s.from)).map(|s| s.from.clone()).ok_or_else(|| format!("set_driving_cell: no arc into {}/{}", drive.cell, drive.to_port))?
+            }
+        };
+        let arcs: Vec<crate::liberty::Arc> = cell.arc_sets.iter().filter(|s| s.from == from_port && s.to == drive.to_port && !s.role.is_timing_check()).flat_map(|s| s.arcs.iter().cloned()).collect();
+        for mm in [MIN, MAX] {
+            for rf in [RISE, FALL] {
+                let (pin_cap, wire_cap, pe) = self.parasitic_load(v, rf, mm, parasitics, index);
+                let load_cap = pin_cap + wire_cap;
+                for arc in arcs.iter().filter(|a| a.to_rf == rf) {
+                    let Model::Gate(model) = &arc.model else { continue };
+                    let from_slew = drive.from_slews[arc.from_rf];
+                    let (intrinsic, _) = model.gate_delay(from_slew, 0.0);
+                    let l = &self.libs[li];
+                    let th = Thresholds { vth: l.output_threshold[rf], vl: l.slew_lower_threshold[rf], vh: l.slew_upper_threshold[rf], slew_derate: l.slew_derate };
+                    let (gate_delay, drvr_slew, mut dmp) = match &pe {
+                        Some((p, _)) => {
+                            let mut d = Dmp::new(model, &th, from_slew, p.c2, p.rpi, p.c1);
+                            let (gd, ds) = d.gate_delay_slew();
+                            (gd, ds, Some(d))
+                        }
+                        None => {
+                            let (gd, ds) = model.gate_delay(from_slew, load_cap);
+                            (f64::from(gd), f64::from(ds), None)
+                        }
+                    };
+                    self.slew[v][rf][mm] = drvr_slew as f32;
+                    let load_delay = gate_delay as f32 - intrinsic;
+                    for &w in wires {
+                        let load = self.edges[w].to;
+                        let (mut wire_delay, mut load_slew) = match (&mut dmp, &pe) {
+                            (Some(d), Some((p, names))) => match p.elmore.iter().find(|(n, _)| names[*n] == self.vertices[load].name) {
+                                Some(&(_, el)) => d.load_delay_slew(f64::from(el)),
+                                None => (0.0, drvr_slew),
+                            },
+                            _ => (0.0, drvr_slew),
+                        };
+                        let ll = self.threshold_library(load);
+                        threshold_adjust(ll == li, &self.lib_thresholds(li, rf), &self.lib_thresholds(ll, rf), rf == RISE, &mut wire_delay, &mut load_slew);
+                        self.slew[load][rf][mm] = load_slew as f32;
+                        self.delay[w][rf][mm] = wire_delay as f32 + load_delay;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The library whose thresholds a load uses: a port's is the default (first read) library.
     fn threshold_library(&self, v: usize) -> usize {
         self.vertices[v].lib.unwrap_or(0)
@@ -438,6 +513,10 @@ impl<'a> Graph<'a> {
                 continue;
             }
             if fanin.is_empty() {
+                if let Some(drive) = self.sdc.input_drive.get(&self.vertices[v].name).cloned() {
+                    self.time_input_drive(v, &wires, &drive, parasitics, &index)?;
+                    continue;
+                }
                 // An input port (`seedNoDrvrCellSlew` / `seedNoDrvrSlew`): its slew is the
                 // `set_input_transition`, else 0; its loads by the input-port delay at that slew
                 // over the `parasiticLoad` pi model — a load with no Elmore delay takes the slew.
@@ -744,6 +823,30 @@ mod tests {
         let mut nl2 = nl.clone();
         nl2.nets.push(Net { name: "b".into(), pins: vec![Conn::Inst(0, "PAD".into())] });
         assert!(Graph::build_with_pins(&libs, &nl2, Some(&pins)).is_err());
+    }
+
+    /// Rules (findInputArcDelay): an input port with a driving cell takes that cell's slew at the
+    /// port's load — here lumped, no parasitics — and its loads take the same slew; each wire edge
+    /// carries the load-dependent part of the cell's delay (`gate − intrinsic`).
+    #[test]
+    fn a_driving_cell_times_the_input_port() {
+        let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
+        let nl = chain();
+        let mut g = Graph::build(&libs, &nl).unwrap();
+        g.sdc.input_drive.insert("a".into(), InputDrive { cell: "and2".into(), from_port: Some("A".into()), to_port: "Y".into(), from_slews: [0.1e-9, 0.1e-9] });
+        g.find_delays(&HashMap::new(), None).unwrap();
+        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        let (a, u1a) = (v("a"), v("u1/A"));
+        let cell = &libs[0].cells["and2"];
+        let arc = cell.arc_sets.iter().find(|s| s.from == "A" && s.to == "Y").unwrap().arcs.iter().find(|x| x.to_rf == RISE).unwrap();
+        let Model::Gate(m) = &arc.model else { panic!() };
+        let load = g.load_cap(a, &HashMap::new());
+        let (gate, slew) = m.gate_delay(0.1e-9, load);
+        let (intrinsic, _) = m.gate_delay(0.1e-9, 0.0);
+        assert_eq!(g.slew[a][RISE][MAX], slew);
+        assert_eq!(g.slew[u1a][RISE][MAX], slew);
+        let e = g.out_edges[a].iter().copied().find(|&e| g.edges[e].to == u1a).unwrap();
+        assert_eq!(g.delay[e][RISE][MAX], gate - intrinsic);
     }
 
     /// Rule (seedNoDrvrCellSlew, inputPortDelay): an input port's slew is its
