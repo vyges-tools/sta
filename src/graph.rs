@@ -82,6 +82,20 @@ pub struct Graph<'a> {
     /// Annotated max slews (`setAnnotatedSlew`): the vertex's max slew on both transitions IS the
     /// value, whatever the delay calculation finds — applied before its fanout reads it.
     pub slew_annotated: HashMap<usize, f32>,
+    /// The SDC environment the delay calculation reads; empty unless a caller sets it.
+    pub sdc: SdcEnv,
+}
+
+/// The SDC loads and drives delay calculation reads (`Sdc::connectedCap`, `seedDrvrSlew`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SdcEnv {
+    /// `set_load` on a net (`setNetWireCap`), keyed — as `drvr_pin_wire_cap_map_` is — by each of
+    /// the net's DRIVER pins when it was set: per min/max, the wire cap and `-subtract_pin_load`.
+    pub net_wire_cap: HashMap<String, [Option<(f32, bool)>; 2]>,
+    /// `set_load -pin_load` on a port (`portExtCap`'s pin cap), per `[rf][min/max]`.
+    pub port_pin_cap: HashMap<String, [[Option<f32>; 2]; 2]>,
+    /// `set_input_transition` on an input port (`InputDrive::slew`), per `[rf][min/max]`.
+    pub input_slew: HashMap<String, [[Option<f32>; 2]; 2]>,
 }
 
 fn cell<'a>(libs: &'a [Library], lib: usize, name: &str) -> &'a Cell {
@@ -93,25 +107,57 @@ impl<'a> Graph<'a> {
     /// set between two of an instance's vertices, wire edges from each driver to each load of a
     /// net.
     pub fn build(libs: &'a [Library], netlist: &'a Netlist) -> Result<Graph<'a>, String> {
+        Graph::build_with_pins(libs, netlist, None)
+    }
+
+    /// [`Graph::build`] where an instance's pins are the ones its master HAS (`pins`: master name →
+    /// its signal terminals, as the database lists them; a master not listed keeps every liberty
+    /// port): a liberty port the master lacks gets no vertex (the reference's graph is made from
+    /// the instance's pins). A bidirect pin is two
+    /// vertices — a driver (arcs INTO it) and a load (arcs FROM it); one on a net is not modelled.
+    pub fn build_with_pins(libs: &'a [Library], netlist: &'a Netlist, pins: Option<&HashMap<String, Vec<String>>>) -> Result<Graph<'a>, String> {
         let find_cell = |name: &str| libs.iter().position(|l| l.cells.contains_key(name));
         let mut vertices = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
+        // Per instance: the vertex an arc set goes TO, and the one it comes FROM (they differ only
+        // for a bidirect pin).
         let mut inst_vertices: Vec<HashMap<String, usize>> = vec![HashMap::new(); netlist.insts.len()];
+        let mut inst_from: Vec<HashMap<String, usize>> = vec![HashMap::new(); netlist.insts.len()];
+        let mut bidirect: Vec<String> = Vec::new();
         for (i, (name, cname)) in netlist.insts.iter().enumerate() {
             // A physical-only cell (tap, fill, decap) has no liberty cell and nothing to time.
             let Some(lib) = find_cell(cname) else { continue };
+            let has = pins.and_then(|m| m.get(cname));
             for p in &cell(libs, lib, cname).ports {
-                let is_driver = match p.direction {
-                    Direction::Input => false,
-                    Direction::Output | Direction::Tristate => true,
-                    Direction::Bidirect => return Err(format!("{name}/{}: bidirect pins are not modelled", p.name)),
+                if has.is_some_and(|h| !h.contains(&p.name)) {
+                    continue;
+                }
+                let kinds: &[bool] = match p.direction {
+                    Direction::Input => &[false],
+                    Direction::Output | Direction::Tristate => &[true],
+                    Direction::Bidirect => &[true, false],
                     _ => continue,
                 };
-                let v = vertices.len();
                 let vname = format!("{name}/{}", p.name);
-                index.insert(vname.clone(), v);
-                inst_vertices[i].insert(p.name.clone(), v);
-                vertices.push(Vertex { name: vname, conn: Conn::Inst(i, p.name.clone()), is_driver, lib: Some(lib), cell: Some(cname.clone()), port: Some(p.name.clone()) });
+                if p.direction == Direction::Bidirect {
+                    bidirect.push(vname.clone());
+                }
+                for &is_driver in kinds {
+                    let v = vertices.len();
+                    index.entry(vname.clone()).or_insert(v);
+                    if is_driver || p.direction != Direction::Bidirect {
+                        inst_vertices[i].insert(p.name.clone(), v);
+                    }
+                    if !is_driver || p.direction != Direction::Bidirect {
+                        inst_from[i].insert(p.name.clone(), v);
+                    }
+                    vertices.push(Vertex { name: vname.clone(), conn: Conn::Inst(i, p.name.clone()), is_driver, lib: Some(lib), cell: Some(cname.clone()), port: Some(p.name.clone()) });
+                }
+            }
+        }
+        for net in &netlist.nets {
+            if let Some(b) = net.pins.iter().map(|c| netlist.pin_name(c)).find(|n| bidirect.contains(n)) {
+                return Err(format!("{b}: a bidirect pin on a net (net {}) is not modelled", net.name));
             }
         }
         for (i, (name, dir)) in netlist.ports.iter().enumerate() {
@@ -126,10 +172,11 @@ impl<'a> Graph<'a> {
         for (i, (_, cname)) in netlist.insts.iter().enumerate() {
             let Some(lib) = find_cell(cname) else { continue };
             for (k, set) in cell(libs, lib, cname).arc_sets.iter().enumerate() {
-                if set.role == Role::Other || set.arcs.is_empty() {
+                let tristate = matches!(set.role, Role::TristateEnable | Role::TristateDisable);
+                if set.role == Role::Other || (set.arcs.is_empty() && !tristate) {
                     continue;
                 }
-                if let (Some(&f), Some(&t)) = (inst_vertices[i].get(&set.from), inst_vertices[i].get(&set.to)) {
+                if let (Some(&f), Some(&t)) = (inst_from[i].get(&set.from), inst_vertices[i].get(&set.to)) {
                     edges.push(Edge { from: f, to: t, kind: EdgeKind::Gate { set: k } });
                 }
             }
@@ -167,7 +214,7 @@ impl<'a> Graph<'a> {
                 EdgeKind::Wire => vec![[0.0f32; 2]; 2],
             })
             .collect();
-        Ok(Graph { libs, netlist, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new() })
+        Ok(Graph { libs, netlist, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default() })
     }
 
     pub fn is_check(&self, e: usize) -> bool {
@@ -259,11 +306,54 @@ impl<'a> Graph<'a> {
         self.vertices[v].lib.unwrap_or(0)
     }
 
+    /// A pin's capacitance as `Sdc::pinCaps` and `ReduceToPi::pinCapacitance` read it: an
+    /// instance pin's liberty port capacitance; a top-level port's `set_load -pin_load` (0 without).
     fn pin_cap(&self, v: usize, rf: usize, mm: usize) -> f32 {
         match (&self.vertices[v].lib, &self.vertices[v].cell, &self.vertices[v].port) {
             (Some(l), Some(c), Some(p)) => cell(self.libs, *l, c).port(p).map_or(0.0, |p| p.capacitance(rf, mm)),
-            _ => 0.0,
+            _ => match self.vertices[v].conn {
+                Conn::Port(_) => self.sdc.port_pin_cap.get(&self.vertices[v].name).and_then(|c| c[rf][mm]).unwrap_or(0.0),
+                Conn::Inst(..) => 0.0,
+            },
         }
+    }
+
+    /// `Sdc::connectedCap(drvr, rf, scene, min_max)`: the net's pin cap, then the driver's net
+    /// `set_load` — which zeroes the pin cap with `-subtract_pin_load` and adds its wire cap.
+    /// `(pin_cap, wire_cap, has_net_load)`.
+    fn connected_cap(&self, drvr: usize, rf: usize, mm: usize, index: &HashMap<String, usize>) -> (f32, f32, bool) {
+        let mut pin_cap = self.net_pin_cap(drvr, rf, mm, index);
+        let mut wire_cap = 0.0f32;
+        let net_load = self.sdc.net_wire_cap.get(&self.vertices[drvr].name).and_then(|c| c[mm]);
+        if let Some((cap, subtract_pin_cap)) = net_load {
+            if subtract_pin_cap {
+                pin_cap = 0.0;
+            }
+            wire_cap += cap;
+        }
+        (pin_cap, wire_cap, net_load.is_some())
+    }
+
+    /// `GraphDelayCalc::parasiticLoad(drvr, rf, scene, min_max)`: the connected cap, and the pi
+    /// model `findParasitic` gives — none when the driver pin has a net `set_load` at all
+    /// (`drvrPinHasWireCap`: set_load net has precedence over parasitics; the gate is lumped at
+    /// the SDC's load). Otherwise a pi model at least the pin cap adds `pi − pin`; a smaller one is
+    /// dropped. `(pin_cap, wire_cap, the pi model)`.
+    fn parasitic_load(&self, drvr: usize, rf: usize, mm: usize, parasitics: &HashMap<String, NetParasitics>, index: &HashMap<String, usize>) -> (f32, f32, Option<(crate::parasitics::PiElmore, Vec<String>)>) {
+        let (pin_cap, mut wire_cap, has_net_load) = self.connected_cap(drvr, rf, mm, index);
+        let mut parasitic = if self.sdc.net_wire_cap.contains_key(&self.vertices[drvr].name) { None } else { self.reduced(drvr, rf, mm, parasitics, index) };
+        if !has_net_load {
+            if let Some((p, _)) = &parasitic {
+                let parasitic_cap = p.c1 + p.c2;
+                if parasitic_cap >= pin_cap {
+                    wire_cap = parasitic_cap - pin_cap;
+                } else {
+                    wire_cap = 0.0;
+                    parasitic = None;
+                }
+            }
+        }
+        (pin_cap, wire_cap, parasitic)
     }
 
     /// The net's pin capacitance: every pin on the driver's net, in the net's order, summed in `f32`.
@@ -294,33 +384,20 @@ impl<'a> Graph<'a> {
     /// and whether the driver has a reduced pi model at all (`findPiElmore`).
     pub fn load_cap_parts(&self, drvr: usize, parasitics: &HashMap<String, NetParasitics>, rf: usize) -> (f32, f32, bool) {
         let index: HashMap<String, usize> = self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect();
-        let pin_cap = self.net_pin_cap(drvr, rf, MAX, &index);
-        match self.reduced(drvr, rf, MAX, parasitics, &index) {
-            Some((p, _)) => {
-                let parasitic_cap = p.c1 + p.c2;
-                (pin_cap, if parasitic_cap >= pin_cap { parasitic_cap - pin_cap } else { 0.0 }, true)
-            }
-            None => (pin_cap, 0.0, false),
-        }
+        let (pin_cap, wire_cap, _) = self.parasitic_load(drvr, rf, MAX, parasitics, &index);
+        (pin_cap, wire_cap, self.reduced(drvr, rf, MAX, parasitics, &index).is_some())
     }
 
     /// `GraphDelayCalc::loadCap(drvr_pin, scene, max)`: over rise then fall, the larger of
-    /// `pin_cap + wire_cap` (`parasiticLoad`) — the pin capacitance of the driver's net
-    /// (`connectedCap`; no `set_load` here) plus, when the reduced pi model's total is at least
+    /// `pin_cap + wire_cap` ([`Graph::parasitic_load`]) — the pin capacitance of the driver's net
+    /// (`connectedCap`, with the SDC's loads) plus, when the reduced pi model's total is at least
     /// that, the total MINUS the pin cap (so the sum is `pin + (pi − pin)` in float, not the pi
-    /// total); a smaller pi model is ignored (wire cap 0). No parasitics: the pin cap alone.
+    /// total); a smaller pi model is ignored (wire cap 0); a net `set_load` replaces the pi model.
     pub fn load_cap(&self, drvr: usize, parasitics: &HashMap<String, NetParasitics>) -> f32 {
         let index: HashMap<String, usize> = self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect();
         let mut load_cap = -1e30f32;
         for rf in [RISE, FALL] {
-            let pin_cap = self.net_pin_cap(drvr, rf, MAX, &index);
-            let mut wire_cap = 0.0f32;
-            if let Some((p, _)) = self.reduced(drvr, rf, MAX, parasitics, &index) {
-                let parasitic_cap = p.c1 + p.c2;
-                if parasitic_cap >= pin_cap {
-                    wire_cap = parasitic_cap - pin_cap;
-                }
-            }
+            let (pin_cap, wire_cap, _) = self.parasitic_load(drvr, rf, MAX, parasitics, &index);
             let cap = pin_cap + wire_cap;
             if cap > load_cap {
                 load_cap = cap;
@@ -339,8 +416,6 @@ impl<'a> Graph<'a> {
         const INIT: [f32; 2] = [1e30, -1e30];
         // Fuzzily worse for this min/max, so the merge order matters.
         let worse = |mm: usize, a: f32, b: f32| if mm == MAX { crate::fuzzy::greater(a, b) } else { crate::fuzzy::less(a, b) };
-        // The pi-Elmore model of a driver's net, for a transition and min/max.
-        let reduce = |g: &Graph, drvr: usize, rf: usize, mm: usize| g.reduced(drvr, rf, mm, parasitics, &index);
         for &v in &order {
             let fanin: Vec<usize> = self.in_edges[v].iter().copied().filter(|&e| !self.is_check(e)).collect();
             let wires: Vec<usize> = self.out_edges[v].iter().copied().filter(|&e| matches!(self.edges[e].kind, EdgeKind::Wire)).collect();
@@ -363,21 +438,24 @@ impl<'a> Graph<'a> {
                 continue;
             }
             if fanin.is_empty() {
-                // An input port with no drive — slew 0, its loads by the input-port delay.
-                self.slew[v] = [[0.0; 2]; 2];
+                // An input port (`seedNoDrvrCellSlew` / `seedNoDrvrSlew`): its slew is the
+                // `set_input_transition`, else 0; its loads by the input-port delay at that slew
+                // over the `parasiticLoad` pi model — a load with no Elmore delay takes the slew.
                 for rf in [RISE, FALL] {
                     for mm in [MIN, MAX] {
-                        let pe = reduce(self, v, rf, mm);
+                        let in_slew = self.sdc.input_slew.get(&self.vertices[v].name).and_then(|s| s[rf][mm]).unwrap_or(0.0);
+                        self.slew[v][rf][mm] = in_slew;
+                        let (_, _, pe) = self.parasitic_load(v, rf, mm, parasitics, &index);
                         for &e in &wires {
                             let load = self.edges[e].to;
                             let mut wire_delay = 0.0f64;
-                            let mut load_slew = 0.0f64;
+                            let mut load_slew = f64::from(in_slew);
                             let elmore = pe.as_ref().and_then(|(p, names)| p.elmore.iter().find(|(n, _)| names[*n] == self.vertices[load].name).map(|(_, e)| *e));
                             let ll = self.threshold_library(load);
                             if let Some(el) = elmore {
                                 let l = &self.libs[ll];
                                 let th = Thresholds { vth: l.input_threshold[rf], vl: l.slew_lower_threshold[rf], vh: l.slew_upper_threshold[rf], slew_derate: l.slew_derate };
-                                (wire_delay, load_slew) = dspf_wire_delay_slew(0.0, el, &th);
+                                (wire_delay, load_slew) = dspf_wire_delay_slew(f64::from(in_slew), el, &th);
                             }
                             threshold_adjust(ll == 0, &self.lib_thresholds(0, rf), &self.lib_thresholds(ll, rf), rf == RISE, &mut wire_delay, &mut load_slew);
                             self.slew[load][rf][mm] = load_slew as f32;
@@ -409,8 +487,8 @@ impl<'a> Graph<'a> {
                         let Model::Gate(model) = &arc.model else { continue };
                         let rf = arc.to_rf;
                         let in_slew = self.slew[from][arc.from_rf][mm];
-                        let pin_cap = self.net_pin_cap(v, rf, mm, &index);
-                        let pe = reduce(self, v, rf, mm).filter(|(p, _)| p.c1 + p.c2 >= pin_cap);
+                        let (pin_cap, wire_cap, pe) = self.parasitic_load(v, rf, mm, parasitics, &index);
+                        let load_cap = pin_cap + wire_cap;
                         let l = &self.libs[drvr_lib];
                         let th = Thresholds { vth: l.output_threshold[rf], vl: l.slew_lower_threshold[rf], vh: l.slew_upper_threshold[rf], slew_derate: l.slew_derate };
                         let (gate_delay, drvr_slew, mut dmp) = match &pe {
@@ -420,7 +498,7 @@ impl<'a> Graph<'a> {
                                 (gd, ds, Some(d))
                             }
                             None => {
-                                let (gd, ds) = model.gate_delay(in_slew, pin_cap);
+                                let (gd, ds) = model.gate_delay(in_slew, load_cap);
                                 (f64::from(gd), f64::from(ds), None)
                             }
                         };
@@ -580,6 +658,107 @@ mod tests {
         g.slew_annotated.insert(u2a, 2.0e-9);
         g.find_delays(&HashMap::new(), None).unwrap();
         assert_eq!([g.slew[u2a][RISE][MAX], g.slew[u2a][FALL][MAX]], [2.0e-9, 2.0e-9]);
+    }
+
+    /// Rules (Sdc::connectedCap, parasiticLoad): a net `set_load` is keyed by its DRIVER pin and
+    /// adds its wire cap to the pin cap (`-subtract_pin_load` zeroes the pin cap); a port's
+    /// `set_load -pin_load` is that port's pin cap.
+    #[test]
+    fn sdc_loads_enter_the_load_cap() {
+        let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
+        let nl = chain();
+        let mut g = Graph::build(&libs, &nl).unwrap();
+        let v = |g: &Graph, n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        let (u1y, u2y) = (v(&g, "u1/Y"), v(&g, "u2/Y"));
+        let pins = g.load_cap(u1y, &HashMap::new());
+        g.sdc.net_wire_cap.insert("u1/Y".into(), [Some((0.5e-12, false)); 2]);
+        assert_eq!(g.load_cap(u1y, &HashMap::new()), pins + 0.5e-12);
+        g.sdc.net_wire_cap.insert("u1/Y".into(), [Some((0.5e-12, true)); 2]);
+        assert_eq!(g.load_cap(u1y, &HashMap::new()), 0.5e-12);
+        let before = g.load_cap(u2y, &HashMap::new());
+        g.sdc.port_pin_cap.insert("y".into(), [[Some(0.2e-12); 2]; 2]);
+        assert_eq!(g.load_cap(u2y, &HashMap::new()), before + 0.2e-12);
+    }
+
+    /// Rule (LumpedCapDelayCalc::findParasitic): a driver with a net `set_load` has NO parasitic —
+    /// its gate is lumped at the SDC load, so a net load of 0 times the gate at 0 whatever the
+    /// estimate says.
+    #[test]
+    fn a_net_load_drops_the_parasitic() {
+        use crate::parasitics::Network;
+        let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
+        let nl = chain();
+        let mut g = Graph::build(&libs, &nl).unwrap();
+        let mut par = HashMap::new();
+        let net = Network { node_caps: vec![0.0, 1e-12], resistors: vec![(0, 1, 1000.0)] };
+        par.insert("y".to_string(), NetParasitics { node_names: vec!["u2/Y".into(), "y".into()], network: net });
+        let u2y = g.vertices.iter().position(|v| v.name == "u2/Y").unwrap();
+        let with_pi = g.load_cap(u2y, &par);
+        assert!(with_pi > 0.9e-12);
+        g.sdc.net_wire_cap.insert("u2/Y".into(), [Some((0.0, false)); 2]);
+        g.find_delays(&par, None).unwrap();
+        let lumped = g.slew[u2y][RISE][MAX];
+        let mut g0 = Graph::build(&libs, &nl).unwrap();
+        g0.find_delays(&HashMap::new(), None).unwrap();
+        assert_eq!(lumped, g0.slew[u2y][RISE][MAX], "lumped at the pin cap + 0");
+    }
+
+    /// Rules (the reference's graph): pins are the instance's own (a liberty-only port has no
+    /// vertex); a bidirect pin is a DRIVER vertex (arcs into it) and a LOAD vertex (arcs from it);
+    /// a tristate enable arc set is an edge levelization searches through.
+    #[test]
+    fn pad_cell_pins_bidirect_and_tristate_edges() {
+        let lib = r#"library (p) { time_unit : "1ns"; capacitive_load_unit (1, pf);
+          lu_table_template (t) { variable_1 : input_net_transition; variable_2 : total_output_net_capacitance; index_1 ("0, 1"); index_2 ("0, 1"); }
+          cell (PADC) {
+            pin (DATA) { direction : input; capacitance : 0.001; }
+            pin (EN) { direction : input; capacitance : 0.001; }
+            pin (PAD) { direction : inout; function : "DATA"; three_state : "EN";
+              timing () { related_pin : "DATA"; timing_type : combinational; timing_sense : positive_unate;
+                cell_rise (t) { values ("1, 1", "1, 1"); } rise_transition (t) { values ("1, 1", "1, 1"); }
+                cell_fall (t) { values ("1, 1", "1, 1"); } fall_transition (t) { values ("1, 1", "1, 1"); } }
+              timing () { related_pin : "EN"; timing_type : three_state_enable; } }
+            pin (Y) { direction : output; function : "PAD";
+              timing () { related_pin : "PAD"; timing_type : combinational; timing_sense : positive_unate;
+                cell_rise (t) { values ("1, 1", "1, 1"); } rise_transition (t) { values ("1, 1", "1, 1"); }
+                cell_fall (t) { values ("1, 1", "1, 1"); } fall_transition (t) { values ("1, 1", "1, 1"); } } }
+            pin (NDOUT) { direction : output; function : "PAD"; } } }"#;
+        let libs = [Library::read(&crate::liberty_parse::parse(lib).unwrap()).unwrap()];
+        let nl = Netlist {
+            insts: vec![("p1".into(), "PADC".into())],
+            ports: vec![("a".into(), PortDir::Input)],
+            nets: vec![Net { name: "a".into(), pins: vec![Conn::Port(0), Conn::Inst(0, "DATA".into())] }],
+        };
+        let pins: HashMap<String, Vec<String>> = [("PADC".to_string(), vec!["DATA".into(), "EN".into(), "PAD".into(), "Y".into()])].into();
+        let g = Graph::build_with_pins(&libs, &nl, Some(&pins)).unwrap();
+        assert!(!g.vertices.iter().any(|v| v.name == "p1/NDOUT"), "a liberty-only port has no vertex");
+        let pad: Vec<usize> = (0..g.vertices.len()).filter(|&v| g.vertices[v].name == "p1/PAD").collect();
+        assert_eq!(pad.len(), 2);
+        let (drv, load) = if g.vertices[pad[0]].is_driver { (pad[0], pad[1]) } else { (pad[1], pad[0]) };
+        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        let level = g.levels().unwrap();
+        assert_eq!((level[v("a")], level[v("p1/DATA")], level[drv], level[load], level[v("p1/Y")]), (0, 1, 2, 0, 1));
+        assert!(g.in_edges[drv].iter().any(|&e| g.edges[e].from == v("p1/EN")), "the tristate enable edge");
+        assert!(g.out_edges[load].iter().any(|&e| g.edges[e].to == v("p1/Y")));
+        // A bidirect pin on a net is refused.
+        let mut nl2 = nl.clone();
+        nl2.nets.push(Net { name: "b".into(), pins: vec![Conn::Inst(0, "PAD".into())] });
+        assert!(Graph::build_with_pins(&libs, &nl2, Some(&pins)).is_err());
+    }
+
+    /// Rule (seedNoDrvrCellSlew, inputPortDelay): an input port's slew is its
+    /// `set_input_transition`, and a load with no Elmore delay takes that slew.
+    #[test]
+    fn an_input_transition_is_the_port_and_lumped_load_slew() {
+        let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
+        let nl = chain();
+        let mut g = Graph::build(&libs, &nl).unwrap();
+        g.sdc.input_slew.insert("a".into(), [[Some(0.3e-9); 2]; 2]);
+        g.find_delays(&HashMap::new(), None).unwrap();
+        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        assert_eq!(g.slew[v("a")][RISE][MAX], 0.3e-9);
+        assert_eq!(g.slew[v("u1/A")][FALL][MAX], 0.3e-9);
+        assert_eq!(g.slew[v("u1/B")][RISE][MAX], 0.0);
     }
 
     /// Rule (edges prepend to a vertex's in-edge list; merges are fuzzy): the B arc set, created

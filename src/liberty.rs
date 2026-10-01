@@ -90,6 +90,11 @@ pub struct Cell {
     pub arc_sets: Vec<ArcSet>,
     /// `ff`/`latch` groups: `(output names, is_register, clock or enable expression)`.
     pub sequentials: Vec<(Vec<String>, bool, String)>,
+    /// The same groups as the reference's `Sequential`s, in `makeSequentials` order (`ff`, then
+    /// `latch`), each as `equivCellSequentials` compares it.
+    pub seqs: Vec<Seq>,
+    /// The cell has an `ff_bank` or `latch_bank` group (not read: bus ports are not modelled).
+    pub has_seq_bank: bool,
     /// `area` (unscaled), `cell_footprint`, `user_function_class` (empty when unset).
     pub area: f32,
     pub footprint: String,
@@ -363,12 +368,25 @@ impl Library {
         if cg.groups.iter().any(|g| g.kind == "bus" || g.kind == "bundle") {
             return Err(format!("cell {}: buses and bundles are not modelled", cell.name));
         }
-        for (kind, is_register, clock_attr) in [("ff", true, "clocked_on"), ("latch", false, "enable")] {
+        for (kind, is_register, clock_attr, data_attr) in [("ff", true, "clocked_on", "next_state"), ("latch", false, "enable", "data_in")] {
             for sg in cg.groups_of(kind) {
-                let outputs = sg.params.iter().map(Value::text).collect();
-                cell.sequentials.push((outputs, is_register, sg.attr_text(clock_attr).unwrap_or_default()));
+                let outputs: Vec<String> = sg.params.iter().map(Value::text).collect();
+                cell.sequentials.push((outputs.clone(), is_register, sg.attr_text(clock_attr).unwrap_or_default()));
+                let attr = |a: &str| sg.attr_text(a).filter(|t| !t.is_empty());
+                cell.seqs.push(Seq {
+                    is_register,
+                    clock: attr(clock_attr),
+                    data: attr(data_attr),
+                    clear: attr("clear"),
+                    preset: attr("preset"),
+                    clear_preset_var1: LogicValue::read(sg.attr_text("clear_preset_var1")),
+                    clear_preset_var2: LogicValue::read(sg.attr_text("clear_preset_var2")),
+                    output: outputs.first().cloned(),
+                    output_inv: outputs.get(1).cloned(),
+                });
             }
         }
+        cell.has_seq_bank = cg.groups_of("ff_bank").next().is_some() || cg.groups_of("latch_bank").next().is_some();
         for pg in cg.groups_of("pin") {
             for name in &pg.params {
                 cell.ports.push(self.read_port(&name.text(), pg));
@@ -432,6 +450,11 @@ pub enum Role {
     LatchEnToQ,
     LatchDtoQ,
     RegSetClr,
+    /// `three_state_enable*` / `three_state_disable*`: an edge the levelization searches through.
+    /// Their delay models are not read (no arcs): a caller that would time a tristate driver must
+    /// refuse.
+    TristateEnable,
+    TristateDisable,
     Setup,
     Hold,
     Recovery,
@@ -442,8 +465,8 @@ pub enum Role {
 
 impl Role {
     /// `TimingRole::isTimingCheck` for the roles read with arcs. `Other` carries no arcs, so its
-    /// answer never reaches a value (a tristate enable arc, which the reference does time, is
-    /// among them — tristate drivers are not modelled).
+    /// answer never reaches a value; the tristate roles are not checks (they carry no arcs either:
+    /// tristate drivers are not timed here).
     pub fn is_timing_check(self) -> bool {
         matches!(self, Role::Setup | Role::Hold | Role::Recovery | Role::Removal | Role::Other)
     }
@@ -454,6 +477,43 @@ impl Role {
 pub enum Model {
     Gate(GateModel),
     Check(Table),
+}
+
+/// `clear_preset_var1/2` as `getAttrLogicValue` reads them: `L` zero, `H` one, anything else —
+/// `X`, an unrecognized value, or no attribute — unknown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LogicValue {
+    Zero,
+    One,
+    #[default]
+    Unknown,
+}
+
+impl LogicValue {
+    fn read(text: Option<String>) -> LogicValue {
+        match text.as_deref() {
+            Some("L") => LogicValue::Zero,
+            Some("H") => LogicValue::One,
+            _ => LogicValue::Unknown,
+        }
+    }
+}
+
+/// One `ff` (register) or `latch` group as `LibertyReader::makeSequentials` makes it: its
+/// clock (`clocked_on` / `enable`), data (`next_state` / `data_in`), `clear` and `preset`
+/// expressions as text (an empty attribute is none), the two `clear_preset_var`s, and its output
+/// and inverted-output internal port names (the group's first and second parameters).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Seq {
+    pub is_register: bool,
+    pub clock: Option<String>,
+    pub data: Option<String>,
+    pub clear: Option<String>,
+    pub preset: Option<String>,
+    pub clear_preset_var1: LogicValue,
+    pub clear_preset_var2: LogicValue,
+    pub output: Option<String>,
+    pub output_inv: Option<String>,
 }
 
 /// One timing arc: from and to transitions (`RISE`/`FALL`) and its model.
@@ -630,6 +690,8 @@ impl Library {
                     };
                     ArcSet { from: from.clone(), to: to.to_string(), role: Role::RegSetClr, timing_type: timing_type.clone(), cond: cond.clone(), arcs }
                 }
+                t if t.starts_with("three_state_enable") => ArcSet { from: from.clone(), to: to.to_string(), role: Role::TristateEnable, timing_type: timing_type.clone(), cond: cond.clone(), arcs: Vec::new() },
+                t if t.starts_with("three_state_disable") => ArcSet { from: from.clone(), to: to.to_string(), role: Role::TristateDisable, timing_type: timing_type.clone(), cond: cond.clone(), arcs: Vec::new() },
                 _ => ArcSet { from: from.clone(), to: to.to_string(), role: Role::Other, timing_type: timing_type.clone(), cond: cond.clone(), arcs: Vec::new() },
             };
             out.push(set);
@@ -732,6 +794,34 @@ mod tests {
         // rise: 3 ns / 2 pF; fall: 5 ns / 2 pF — the max.
         assert_eq!(lib.cells["BUF"].drive_resistance("Z"), (5.0 * 1e-9f32) / (2.0 * 1e-12f32));
         assert_eq!(lib.cells["BUF"].drive_resistance("A"), 0.0);
+    }
+
+    // Rules (LibertyReader::makeSequentials): ff then latch; clock / data from clocked_on /
+    // next_state (enable / data_in); outputs are the group parameters; clear_preset_var L / H /
+    // anything else unknown; an empty attribute is none.
+    #[test]
+    fn sequentials_are_read_as_the_reference_makes_them() {
+        let lib = Library::read(
+            &crate::liberty_parse::parse(
+                r#"library (t) { cell (F) {
+                  latch (IL) { enable : "G" ; data_in : "D" ; }
+                  ff (IQ, IQN) { clocked_on : "CK" ; next_state : "D" ; clear : "!RN" ; clear_preset_var1 : L ; clear_preset_var2 : X ; preset : "" ; }
+                  pin (D) { direction : input ; } pin (CK) { direction : input ; clock : true ; } pin (G) { direction : input ; }
+                  pin (RN) { direction : input ; } pin (Q) { direction : output ; function : "IQ" ; } } }"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let c = &lib.cells["F"];
+        assert_eq!(c.seqs.len(), 2);
+        let ff = &c.seqs[0];
+        assert!(ff.is_register);
+        assert_eq!((ff.clock.as_deref(), ff.data.as_deref(), ff.clear.as_deref(), ff.preset.as_deref()), (Some("CK"), Some("D"), Some("!RN"), None));
+        assert_eq!((ff.clear_preset_var1, ff.clear_preset_var2), (LogicValue::Zero, LogicValue::Unknown));
+        assert_eq!((ff.output.as_deref(), ff.output_inv.as_deref()), (Some("IQ"), Some("IQN")));
+        assert!(!c.seqs[1].is_register);
+        assert_eq!((c.seqs[1].clock.as_deref(), c.seqs[1].output_inv.as_deref()), (Some("G"), None));
+        assert!(!c.has_seq_bank);
     }
 
     // Rules: capacitance sets all four, rise/fall override a
