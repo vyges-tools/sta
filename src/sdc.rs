@@ -48,18 +48,18 @@ pub struct Sdc {
     pub output_delays: Vec<PortDelay>,
 }
 
-/// A user-unit value (as the command line holds it, a `double`) in seconds: narrowed to `float`,
-/// then scaled in `float` by the unit (`scale`, e.g. `1e-9` for ns).
+/// A user-unit value (as the command line holds it, a `double`) in seconds: `Unit::userToSta`
+/// multiplies the `double` by the unit's `float` scale (`scale_`, e.g. `f32(1e-9)` for ns) in
+/// `double`; the command's `float` argument narrows the product once.
 pub fn user_to_sta(value: f64, scale: f32) -> f32 {
-    value as f32 * scale
+    (value * f64::from(scale)) as f32
 }
 
-/// A value in seconds back in user units, as a `double`: divided by the unit's DECIMAL scale in
-/// `double` (`1e-9`, not the `float` nearest to it). A constraint script reading a clock's period
-/// back and scaling it (`period * 0.2`) sees this value.
+/// A value in seconds back in user units, as a `double`: `Unit::staToUser` divides by the unit's
+/// `float` scale in `double`. A constraint script reading a clock's period back and scaling it
+/// (`period * 0.2`) sees this value.
 pub fn sta_to_user(value: f32, scale: f32) -> f64 {
-    let decimal: f64 = format!("{scale:e}").parse().expect("a float's decimal form parses");
-    f64::from(value) / decimal
+    f64::from(value) / f64::from(scale)
 }
 
 /// The setup required time between two edges of the SAME clock: the target edge the
@@ -98,16 +98,22 @@ mod tests {
 
     /// Rise to rise: one period; rise to fall: half a period; fall to rise: a full period from the
     /// source cycle start (the fall edge's arrival already carries its half period).
-    /// Rule: a period of 1.78 ns is `f32(1.78) × f32(1e-9)` (bits 30f4a42e, one below the
-    /// double-rounded value); read back it is 1.7799999252332555, and a delay of `period × 0.2`
-    /// set from it lands on bits 2fc3b68b — the value arrivals are seeded with.
+    /// Rule (`Unit::userToSta` / `staToUser`, both in `double` against the `float` scale; probed
+    /// on the reference with `create_clock -period p` and `[$clk period]` / `time_sta_ui`): 0.1 ns
+    /// is 9.99999944e-11 (bits 2edbe6fe) and 0.35 ns 3.500000012e-10 (2fc06a1f) — narrowing 0.1 to
+    /// `float` first would give 1.000000013e-10, one ulp up, and move every setup required time.
+    /// 1.78 ns is bits 30f4a42e either way; read back it is 1.7799999755750928 (the decimal 1e-9
+    /// would give 1.7799999252332555), and `period × 0.2` set from it lands on bits 2fc3b68b.
     #[test]
     fn unit_conversions_round_where_the_commands_do() {
+        assert_eq!(user_to_sta(0.1, 1e-9).to_bits(), 0x2edb_e6fe);
+        assert_ne!(user_to_sta(0.1, 1e-9).to_bits(), (0.1f32 * 1e-9f32).to_bits());
+        assert_eq!(user_to_sta(0.35, 1e-9).to_bits(), 0x2fc0_6a1f);
         let period = user_to_sta(1.78, 1e-9);
         assert_eq!(period.to_bits(), 0x30f4_a42e);
-        assert_ne!(period.to_bits(), (1.78e-9f64 as f32).to_bits());
         let back = sta_to_user(period, 1e-9);
-        assert_eq!(back, 1.7799999252332555);
+        assert_eq!(back, 1.7799999755750928);
+        assert_eq!(sta_to_user(user_to_sta(0.1, 1e-9), 1e-9), 0.09999999722444236);
         assert_eq!(user_to_sta(back * 0.2, 1e-9).to_bits(), 0x2fc3_b68b);
     }
 
