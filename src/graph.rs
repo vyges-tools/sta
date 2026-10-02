@@ -9,7 +9,8 @@
 //!   and wire delays merge the same way per output transition; a transition no arc drives is
 //!   zeroed (slew 0, wire delays 0, load slews 0);
 //! - a gate arc's input slew is its from-pin's slew for the arc's from transition and this
-//!   min/max (propagated clocks: never an ideal clock slew here);
+//!   min/max — except a register clock-to-Q edge from an IDEAL clock's network, which reads the
+//!   ideal clock slew (0) instead, as a timing check's clock side does ([`Graph::ideal_clock`]);
 //! - the parasitic is the pi model reduced from the net's network at the pin caps of this
 //!   transition and min/max; it is dropped when its total is under the net's pin cap, and without
 //!   one the gate is lumped at that pin cap (wire delay 0, load slew = driver slew);
@@ -91,6 +92,11 @@ pub struct Graph<'a> {
     pub slew_annotated: HashMap<usize, f32>,
     /// The SDC environment the delay calculation reads; empty unless a caller sets it.
     pub sdc: SdcEnv,
+    /// Vertices on an IDEAL clock's network (`ClkNetwork::isIdealClock`). A register's clock-to-Q
+    /// edge and a timing check read their clock-side slew from such a vertex as the ideal clock
+    /// slew, 0 (`edgeFromSlew`, `checkEdgeClkSlew`); every other edge reads the graph's slew.
+    /// Empty unless a caller sets it — a propagated clock has none.
+    pub ideal_clock: std::collections::HashSet<usize>,
 }
 
 /// The SDC loads and drives delay calculation reads (`Sdc::connectedCap`, `seedDrvrSlew`).
@@ -235,7 +241,7 @@ impl<'a> Graph<'a> {
                 EdgeKind::Wire => vec![[0.0f32; 2]; 2],
             })
             .collect();
-        Ok(Graph { libs, netlist, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default() })
+        Ok(Graph { libs, netlist, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), ideal_clock: std::collections::HashSet::new() })
     }
 
     pub fn is_check(&self, e: usize) -> bool {
@@ -573,11 +579,12 @@ impl<'a> Graph<'a> {
                     return Err("latch D->Q arcs are not modelled".into());
                 }
                 let from = self.edges[e].from;
+                let ideal_clk_to_q = self.arc_set(e, set).role == Role::RegClkToQ && self.ideal_clock.contains(&from);
                 for mm in [MIN, MAX] {
                     for (k, arc) in arcs.iter().enumerate() {
                         let Model::Gate(model) = &arc.model else { continue };
                         let rf = arc.to_rf;
-                        let in_slew = self.slew[from][arc.from_rf][mm];
+                        let in_slew = if ideal_clk_to_q { 0.0 } else { self.slew[from][arc.from_rf][mm] };
                         let (pin_cap, wire_cap, pe) = self.parasitic_load(v, rf, mm, parasitics, &index);
                         let load_cap = pin_cap + wire_cap;
                         let l = &self.libs[drvr_lib];
@@ -656,7 +663,7 @@ impl<'a> Graph<'a> {
             for (k, arc) in arcs.iter().enumerate() {
                 let Model::Check(table) = &arc.model else { continue };
                 for mm in [MIN, MAX] {
-                    let clk_slew = self.slew[from][arc.from_rf][1 - mm];
+                    let clk_slew = if self.ideal_clock.contains(&from) { 0.0 } else { self.slew[from][arc.from_rf][1 - mm] };
                     let data_slew = self.slew[to][arc.to_rf][mm];
                     let pick = |a: usize| match table.axes.get(a).map(|x| x.var) {
                         Some(crate::table::AxisVar::RelatedPinTransition) => clk_slew,

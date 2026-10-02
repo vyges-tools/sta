@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Arrival, required and slack search over a delay-calculated graph, for one propagated clock
-//! with input and output delays, setup checks and common-path pessimism removal (CRPR).
+//! Arrival, required and slack search over a delay-calculated graph, for one clock — propagated,
+//! or ideal (launched at its edge, captured with no network latency) — with input and output delays, setup checks and common-path pessimism removal (CRPR).
 //!
 //! Stages in order: [`Search::find_arrivals`] (per vertex in level order: fanin paths, CRPR
 //! pruning, seeds), [`Search::find_requireds`] (per vertex in reverse level order: fanout paths,
@@ -210,7 +210,10 @@ impl<'g, 'a> Search<'g, 'a> {
                 }
                 let crpr = from.tag.crpr.or(Some(CrprPath { vertex: from_v, rf: from.tag.rf, mm, clk_edge: from.tag.clk_edge.unwrap() }));
                 let tag = Tag { rf: arc.to_rf, mm, clk_edge: from.tag.clk_edge, is_clock: false, crpr };
-                Some((tag, delay, from.arrival + delay))
+                // `clkPathArrival`: an IDEAL clock launches at its edge (no insertion or latency
+                // set), whatever the clock network's delays.
+                let launch = if self.sdc.clock.propagated { from.arrival } else { self.sdc.clock.edge_time(from.tag.clk_edge.unwrap()) };
+                Some((tag, delay, launch + delay))
             }
             Some(Role::LatchDtoQ | Role::LatchEnToQ) => None,
             _ if from.tag.is_clock => {
@@ -439,7 +442,8 @@ impl<'g, 'a> Search<'g, 'a> {
                         }
                         let tgt_edge = tgt.tag.clk_edge.expect("a clock path has an edge");
                         // The check's required time.
-                        let latency = (tgt.arrival - clock.edge_time(tgt_edge)) - 0.0;
+                        // An ideal clock's target has no network latency (`targetClkDelay`).
+                        let latency = if clock.propagated { (tgt.arrival - clock.edge_time(tgt_edge)) - 0.0 } else { 0.0 };
                         let tgt_clk_arrival = (0.0 + latency) + setup_required_time(clock, src_edge, tgt_edge);
                         let margin = self.arc_delay(e, k, MAX);
                         let crpr = self.check_crpr(path, tgt_v, tgt);
@@ -625,6 +629,23 @@ mod tests {
             assert_eq!(path(s, v("f1/Q"), RISE, false).arrival, (0.0 + b) + 0.3f32 * 1e-9);
             assert_eq!(path(s, v("f1/D"), FALL, false).arrival, 0.0 + 0.2e-9f32);
         });
+    }
+
+    /// Rules (clkPathArrival, targetClkDelay): an IDEAL clock launches its registers at the edge
+    /// and captures them with no network latency — the clock buffer's 0.1 ns counts for neither.
+    #[test]
+    fn an_ideal_clock_launches_and_captures_at_its_edge() {
+        let (libs, netlist, mut sdc) = design();
+        sdc.clock.propagated = false;
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        g.find_delays(&HashMap::new(), None).unwrap();
+        let mut s = Search::in_graph_order(&g, &sdc);
+        s.find_arrivals().unwrap();
+        s.find_requireds().unwrap();
+        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        assert_eq!(path(&s, v("f1/Q"), RISE, false).arrival, 0.0 + 0.3f32 * 1e-9, "launched at the edge");
+        let d = path(&s, v("f2/D"), RISE, false);
+        assert_eq!(d.required, (0.0 + 1e-9f32) - 0.05e-9, "captured at the edge, less the setup");
     }
 
     /// Rule: ((min capture clock arrival − edge time) +
