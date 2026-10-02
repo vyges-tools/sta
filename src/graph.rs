@@ -59,6 +59,13 @@ pub struct Edge {
 pub struct NetParasitics {
     pub node_names: Vec<String>,
     pub network: Network,
+    /// The ports' `set_load -pin_load` in force when the estimator REDUCED this net, per
+    /// `[rf][min/max]` — `None`: reduced against the loads in force now.
+    ///
+    /// Rule: the placement estimator reduces each net to its pi model as soon as it builds the
+    /// network, and keeps only the pi model; a later `set_load` on a port changes the pin cap the
+    /// delay calculation compares the pi model against, never the pi model itself.
+    pub port_pin_caps: Option<HashMap<String, [[Option<f32>; 2]; 2]>>,
 }
 
 pub struct Graph<'a> {
@@ -450,7 +457,12 @@ impl<'a> Graph<'a> {
         let np = parasitics.get(&self.netlist.nets[n].name)?;
         let d = np.node_names.iter().position(|x| x == &self.vertices[drvr].name)?;
         let names = &np.node_names;
-        let cap = |i: usize| index.get(&names[i]).map_or(0.0, |&v| self.pin_cap(v, rf, mm));
+        let cap = |i: usize| {
+            index.get(&names[i]).map_or(0.0, |&v| match (&np.port_pin_caps, &self.vertices[v].conn) {
+                (Some(m), Conn::Port(_)) => m.get(&names[i]).and_then(|c| c[rf][mm]).unwrap_or(0.0),
+                _ => self.pin_cap(v, rf, mm),
+            })
+        };
         let load = |i: usize| index.get(&names[i]).is_some_and(|&v| !self.vertices[v].is_driver);
         Some((reduce_to_pi_elmore(&np.network, d, &NodePins { pin_cap: &cap, is_load: &load }), names.clone()))
     }
@@ -770,7 +782,7 @@ mod tests {
         let mut g = Graph::build(&libs, &nl).unwrap();
         let mut par = HashMap::new();
         let net = Network { node_caps: vec![0.0, 1e-12], resistors: vec![(0, 1, 1000.0)] };
-        par.insert("y".to_string(), NetParasitics { node_names: vec!["u2/Y".into(), "y".into()], network: net });
+        par.insert("y".to_string(), NetParasitics { node_names: vec!["u2/Y".into(), "y".into()], network: net, ..Default::default() });
         let u2y = g.vertices.iter().position(|v| v.name == "u2/Y").unwrap();
         let with_pi = g.load_cap(u2y, &par);
         assert!(with_pi > 0.9e-12);
@@ -780,6 +792,31 @@ mod tests {
         let mut g0 = Graph::build(&libs, &nl).unwrap();
         g0.find_delays(&HashMap::new(), None).unwrap();
         assert_eq!(lumped, g0.slew[u2y][RISE][MAX], "lumped at the pin cap + 0");
+    }
+
+    /// Rules (the estimator reduces at estimate time; GraphDelayCalc::parasiticLoad): a port load
+    /// set AFTER the estimate is not in the pi model, which keeps the caps of the moment it was
+    /// reduced; the delay calculation compares that pi model against the pin cap in force NOW and,
+    /// when the pin cap is the larger, drops the pi model and times the gate lumped at the pin cap.
+    #[test]
+    fn a_port_load_set_after_the_estimate_is_not_in_the_pi_model() {
+        use crate::parasitics::Network;
+        let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
+        let nl = chain();
+        let net = Network { node_caps: vec![0.05e-15, 0.05e-15], resistors: vec![(0, 1, 5.0)] };
+        let np = |caps| NetParasitics { node_names: vec!["u2/Y".into(), "y".into()], network: net.clone(), port_pin_caps: caps };
+        let mut g = Graph::build(&libs, &nl).unwrap();
+        g.sdc.port_pin_cap.insert("y".into(), [[Some(2e-12); 2]; 2]);
+        let u2y = g.vertices.iter().position(|v| v.name == "u2/Y").unwrap();
+        // Estimated with no port load: the pi model is the wire alone, under the 2 pF pin cap —
+        // dropped, so the load is the pin cap and no wire.
+        let estimated_before: HashMap<String, NetParasitics> = [("y".to_string(), np(Some(HashMap::new())))].into();
+        assert_eq!(g.load_cap_parts(u2y, &estimated_before, RISE).1, 0.0);
+        assert_eq!(g.load_cap(u2y, &estimated_before), g.load_cap(u2y, &HashMap::new()));
+        // Reduced against the load in force now: the pi model holds the port load and is kept,
+        // adding its wire.
+        let reduced_now: HashMap<String, NetParasitics> = [("y".to_string(), np(None))].into();
+        assert!(g.load_cap_parts(u2y, &reduced_now, RISE).1 > 0.0);
     }
 
     /// Rules (the reference's graph): pins are the instance's own (a liberty-only port has no
