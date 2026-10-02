@@ -75,6 +75,14 @@ pub struct Port {
 }
 
 impl Port {
+    /// `PortDirection::isAnyTristate`, as the reader sets it: a tristate or bidirect port, or an
+    /// OUTPUT with a non-empty `three_state` (the reader makes such an output tristate; the
+    /// `direction` this crate keeps is the attribute as written).
+    pub fn is_any_tristate(&self) -> bool {
+        matches!(self.direction, Direction::Tristate | Direction::Bidirect)
+            || (self.direction == Direction::Output && self.three_state.as_deref().is_some_and(|t| !t.trim().is_empty()))
+    }
+
     /// The pin capacitance for a transition and min/max.
     pub fn capacitance(&self, rf: usize, min_max: usize) -> f32 {
         self.capacitance[rf][min_max]
@@ -704,6 +712,22 @@ impl Library {
 mod tests {
     use super::*;
     use crate::liberty_parse::parse;
+
+    // Rule (LibertyReader: three_state): an OUTPUT with a non-empty three_state is tristate; a
+    // plain output is not, nor is an empty three_state.
+    #[test]
+    fn an_output_with_three_state_is_tristate() {
+        let lib = r#"library (t) { time_unit : "1ns"; capacitive_load_unit (1, pf);
+          cell (EB) { pin (A) { direction : input; capacitance : 0.001; }
+                      pin (TE_B) { direction : input; capacitance : 0.001; }
+                      pin (Z) { direction : output; function : "A"; three_state : "TE_B"; } }
+          cell (B) { pin (A) { direction : input; capacitance : 0.001; }
+                     pin (X) { direction : output; function : "A"; three_state : ""; } } }"#;
+        let l = Library::read(&parse(lib).unwrap()).unwrap();
+        assert!(l.cells["EB"].port("Z").unwrap().is_any_tristate());
+        assert!(!l.cells["EB"].port("A").unwrap().is_any_tristate());
+        assert!(!l.cells["B"].port("X").unwrap().is_any_tristate());
+    }
 
     // Rule: <1|10|100><prefix><suffix>, both factors f32; an unknown
     // multiplier only warns and counts as 1.
