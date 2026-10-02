@@ -119,6 +119,12 @@ pub struct Cell {
     pub has_statetable: bool,
     /// `pg_pin` groups, in order: (name, `pg_type`). The reference counts them among a cell's ports.
     pub pg_pins: Vec<(String, String)>,
+    /// Bus ports: name and member bit ports, in the reader's member order (bit_from to bit_to).
+    /// Only the members are in [`Cell::ports`].
+    pub buses: Vec<(String, Vec<String>)>,
+    /// Each bus as the one top-level port the reader also makes (its name, the bus group's
+    /// direction, its function unsliced), in `buses` order.
+    pub bus_ports: Vec<Port>,
     /// `cell_leakage_power` × the library's power scale, when set.
     pub leakage_power: Option<f32>,
     /// Each `leakage_power` group's `value` × the power scale, in order (groups without one are
@@ -134,6 +140,10 @@ impl Cell {
     /// `bufferPorts`: the single input and single output, in port order. A second input or
     /// output, or a port of any other direction, means none.
     pub fn buffer_ports(&self) -> Option<(&Port, &Port)> {
+        // A bus is no single pin: a cell with one has no buffer pins (see `is_buffer`).
+        if !self.buses.is_empty() {
+            return None;
+        }
         let (mut input, mut output) = (None, None);
         for p in &self.ports {
             match p.direction {
@@ -148,7 +158,31 @@ impl Cell {
     /// `isBuffer`: buffer ports, the output's function is the input port itself, and neither a
     /// level shifter nor a pad.
     pub fn is_buffer(&self) -> bool {
-        self.buffer_ports().is_some_and(|(i, o)| o.function.as_deref().is_some_and(|f| function_is_port(f, &i.name))) && !self.is_level_shifter && !self.is_pad
+        // `bufferPorts` walks the cell's TOP-LEVEL ports: a pin, or a whole bus as one port.
+        let top = self.top_level_ports();
+        let (mut input, mut output) = (None, None);
+        for p in &top {
+            match p.direction {
+                Direction::Input if input.is_none() => input = Some(*p),
+                Direction::Output if output.is_none() => output = Some(*p),
+                _ => return false,
+            }
+        }
+        let (Some(i), Some(o)) = (input, output) else { return false };
+        o.function.as_deref().is_some_and(|f| function_is_port(f, &i.name)) && !self.is_level_shifter && !self.is_pad
+    }
+
+    /// The cell's top-level ports in order: each pin, and each bus once (where its first member is).
+    pub fn top_level_ports(&self) -> Vec<&Port> {
+        let mut out = Vec::new();
+        for p in &self.ports {
+            match self.buses.iter().position(|(_, m)| m.contains(&p.name)) {
+                Some(b) if self.buses[b].1.first() == Some(&p.name) => out.push(&self.bus_ports[b]),
+                Some(_) => {}
+                None => out.push(p),
+            }
+        }
+        out
     }
 
     /// `LibertyPort::driveResistance()`: the largest positive arc drive over the non-check arc
@@ -246,6 +280,8 @@ pub struct Library {
     pub default_max_fanout: Option<f32>,
     /// `lu_table_template`s: each axis's variable and (scaled) values.
     pub templates: BTreeMap<String, Vec<Axis>>,
+    /// Library-level bus types (`type` groups): name -> (bit_from, bit_to).
+    pub bus_types: BTreeMap<String, (i32, i32)>,
     pub cells: BTreeMap<String, Cell>,
 }
 
@@ -333,6 +369,12 @@ impl Library {
             }
             lib.templates.insert(name, axes);
         }
+        if let Some(style) = g.attr_text("bus_naming_style") {
+            if style != "%s[%d]" {
+                return Err(format!("bus_naming_style {style}: only %s[%d] is modelled"));
+            }
+        }
+        lib.bus_types = read_bus_types(g);
         for cg in g.groups_of("cell") {
             let cell = lib.read_cell(cg)?;
             lib.cells.insert(cell.name.clone(), cell);
@@ -373,8 +415,8 @@ impl Library {
                 cell.pg_pins.push((name, pg.attr_text("pg_type").unwrap_or_default()));
             }
         }
-        if cg.groups.iter().any(|g| g.kind == "bus" || g.kind == "bundle") {
-            return Err(format!("cell {}: buses and bundles are not modelled", cell.name));
+        if cg.groups.iter().any(|g| g.kind == "bundle") {
+            return Err(format!("cell {}: bundles are not modelled", cell.name));
         }
         for (kind, is_register, clock_attr, data_attr) in [("ff", true, "clocked_on", "next_state"), ("latch", false, "enable", "data_in")] {
             for sg in cg.groups_of(kind) {
@@ -395,22 +437,143 @@ impl Library {
             }
         }
         cell.has_seq_bank = cg.groups_of("ff_bank").next().is_some() || cg.groups_of("latch_bank").next().is_some();
-        for pg in cg.groups_of("pin") {
-            for name in &pg.params {
-                cell.ports.push(self.read_port(&name.text(), pg));
+        // makeCellPorts: pin and bus groups in the file's order (the port group map is ordered by
+        // line); a bus makes its member bits, then the pin groups inside it name bits of it.
+        let cell_types = read_bus_types(cg);
+        // (group, the ports its attributes and timing apply to: a pin's names, or the bus).
+        let mut port_groups: Vec<(&Group, Vec<PortRef>)> = Vec::new();
+        for pg in &cg.groups {
+            match pg.kind.as_str() {
+                "pin" => {
+                    let names: Vec<String> = pg.params.iter().map(Value::text).collect();
+                    for name in &names {
+                        cell.ports.push(self.read_port(name, pg));
+                    }
+                    port_groups.push((pg, names.into_iter().map(PortRef::Pin).collect()));
+                }
+                "bus" => {
+                    let ty = pg.attr_text("bus_type").ok_or_else(|| format!("cell {}: a bus without bus_type is not modelled", cell.name))?;
+                    let &(from, to) = cell_types.get(&ty).or_else(|| self.bus_types.get(&ty)).ok_or_else(|| format!("cell {}: bus_type {ty} not found", cell.name))?;
+                    for bus in pg.params.iter().map(Value::text) {
+                        let bits = bus_bits(&bus, from, to);
+                        cell.buses.push((bus.clone(), bits.iter().map(|(b, _)| b.clone()).collect()));
+                        cell.bus_ports.push(self.read_port(&bus, pg));
+                        port_groups.push((pg, vec![PortRef::Bus(bus.clone())]));
+                        for (bit, _) in &bits {
+                            let mut port = self.read_port(bit, pg);
+                            // Functions are made once every port exists (makePortFuncs), below.
+                            port.function = None;
+                            port.three_state = None;
+                            cell.ports.push(port);
+                        }
+                        // The pin groups inside the bus name bits of it.
+                        for ipg in pg.groups_of("pin") {
+                            let mut names = Vec::new();
+                            for n in ipg.params.iter().map(Value::text) {
+                                names.extend(cell.port_bits(&n));
+                            }
+                            port_groups.push((ipg, names.into_iter().map(PortRef::Pin).collect()));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
-        for pg in cg.groups_of("pin") {
-            for to in &pg.params {
-                let to = to.text();
-                let function = pg.attr_text("function");
-                for tg in pg.groups_of("timing") {
-                    let sets = self.read_timing(&cell, &to, function.as_deref(), tg)?;
-                    cell.arc_sets.extend(sets);
+        // readPortAttributes / makePortFuncs per port group, in line order: a bus sets every
+        // member (its function sliced by member OFFSET, its three_state by member BUS INDEX); a pin
+        // group inside a bus then sets what it states on its bits.
+        for (pg, refs) in &port_groups {
+            for r in refs {
+                match r {
+                    PortRef::Bus(b) => {
+                        let members = cell.bus_members(b).to_vec();
+                        for (offset, bit) in members.iter().enumerate() {
+                            let index = bit.rsplit_once('[').and_then(|(_, i)| i.strip_suffix(']')).and_then(|i| i.parse::<usize>().ok()).unwrap_or(usize::MAX);
+                            let function = pg.attr_text("function").filter(|f| !f.is_empty()).map(|f| bit_sub_expr(&f, offset, &cell.buses)).transpose().map_err(|e| format!("cell {}: {e}", cell.name))?;
+                            let three_state = pg.attr_text("three_state").filter(|t| !t.is_empty()).map(|t| bit_sub_expr(&t, index, &cell.buses)).transpose().map_err(|e| format!("cell {}: {e}", cell.name))?;
+                            let port = cell.ports.iter_mut().find(|p| &p.name == bit).expect("a member port");
+                            port.function = function;
+                            port.three_state = three_state;
+                        }
+                    }
+                    PortRef::Pin(n) if pg.kind == "pin" && !cg.groups.iter().any(|g| std::ptr::eq(g, *pg)) => {
+                        let i = cell.ports.iter().position(|p| &p.name == n).ok_or_else(|| format!("cell {}: pin {n} not found", cell.name))?;
+                        self.override_port(&mut cell.ports[i], pg);
+                    }
+                    PortRef::Pin(_) => {}
+                }
+            }
+        }
+        // Per port group, in line order: its timing groups; per timing group, per port, per
+        // related name, the bit pairs that name expands to.
+        for (pg, refs) in &port_groups {
+            for tg in pg.groups_of("timing") {
+                let related = |attr: &str| tg.attr_text(attr).map(|r| r.split_whitespace().map(String::from).collect::<Vec<_>>()).unwrap_or_default();
+                let (pins, bus_pins) = (related("related_pin"), related("related_bus_pins"));
+                for to in refs {
+                    let to_bits = match to {
+                        PortRef::Pin(n) => vec![n.clone()],
+                        PortRef::Bus(b) => cell.bus_members(b).to_vec(),
+                    };
+                    let is_bus = matches!(to, PortRef::Bus(_));
+                    let mut pairs = Vec::new();
+                    for r in &pins {
+                        pairs.extend(expand_pairs(&cell.port_bits(r), &to_bits, is_bus, true));
+                    }
+                    for r in &bus_pins {
+                        pairs.extend(expand_pairs(&cell.port_bits(r), &to_bits, is_bus, false));
+                    }
+                    if pins.is_empty() && bus_pins.is_empty() {
+                        for t in &to_bits {
+                            let function = cell.ports.iter().find(|p| &p.name == t).and_then(|p| p.function.clone());
+                            cell.arc_sets.extend(self.read_timing(&cell, t, function.as_deref(), tg, &[])?);
+                        }
+                    }
+                    for (f, t) in pairs {
+                        let function = cell.ports.iter().find(|p| p.name == t).and_then(|p| p.function.clone());
+                        let sets = self.read_timing(&cell, &t, function.as_deref(), tg, std::slice::from_ref(&f))?;
+                        cell.arc_sets.extend(sets);
+                    }
                 }
             }
         }
         Ok(cell)
+    }
+
+    /// A pin group inside a bus, over the bit the bus made: the attributes it states replace the
+    /// bus's (its group comes later in the file, and the reader applies groups in line order).
+    fn override_port(&self, port: &mut Port, pg: &Group) {
+        let own = self.read_port(&port.name, pg);
+        if pg.attr_text("direction").is_some() {
+            port.direction = own.direction;
+        }
+        let caps = ["capacitance", "rise_capacitance", "fall_capacitance", "rise_capacitance_range", "fall_capacitance_range"];
+        if caps.iter().any(|a| pg.attr_text(a).is_some() || pg.complex_attr(a).is_some()) {
+            port.capacitance = own.capacitance;
+        }
+        if pg.attr_text("clock").is_some() {
+            port.is_clock = own.is_clock;
+        }
+        for (field, value, present) in [
+            (&mut port.function, own.function, pg.attr_text("function").is_some()),
+            (&mut port.three_state, own.three_state, pg.attr_text("three_state").is_some()),
+        ] {
+            if present {
+                *field = value;
+            }
+        }
+        if own.max_transition.is_some() {
+            port.max_transition = own.max_transition;
+        }
+        if own.max_capacitance.is_some() {
+            port.max_capacitance = own.max_capacitance;
+        }
+        if own.fanout_load.is_some() {
+            port.fanout_load = own.fanout_load;
+        }
+        if own.max_fanout.is_some() {
+            port.max_fanout = own.max_fanout;
+        }
     }
 
     /// Port attributes: `capacitance` sets all four values, then
@@ -562,6 +725,99 @@ fn float_seq(values: &[Value], scale: f32) -> Vec<f32> {
     out
 }
 
+/// The ports a port group's attributes and timing apply to: a pin, or a whole bus.
+enum PortRef {
+    Pin(String),
+    Bus(String),
+}
+
+/// `readBusTypes`: the `type` groups under a library or a cell, name -> (bit_from, bit_to).
+fn read_bus_types(g: &Group) -> BTreeMap<String, (i32, i32)> {
+    let mut out = BTreeMap::new();
+    for tg in g.groups_of("type") {
+        let int = |a: &str| tg.attr_float(a).map(|v| v as i32);
+        if let (Some(name), Some(from), Some(to)) = (tg.name(), int("bit_from"), int("bit_to")) {
+            out.insert(name, (from, to));
+        }
+    }
+    out
+}
+
+/// `makeBusPortBits`: `name[i]` for i from `from` to `to`, counting up or down, with each index.
+fn bus_bits(name: &str, from: i32, to: i32) -> Vec<(String, i32)> {
+    let idx: Vec<i32> = if from < to { (from..=to).collect() } else { (to..=from).rev().collect() };
+    idx.into_iter().map(|i| (format!("{name}[{i}]"), i)).collect()
+}
+
+/// `FuncExpr::bitSubExpr(k)` on an expression's text: each bus named in it becomes its member at
+/// position `k`; a bit or a plain pin stays as written.
+fn bit_sub_expr(expr: &str, k: usize, buses: &[(String, Vec<String>)]) -> Result<String, String> {
+    let chars: Vec<char> = expr.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_ascii_alphanumeric() || chars[i] == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            match buses.iter().find(|(b, _)| *b == word) {
+                Some((_, members)) if chars.get(i) != Some(&'[') => {
+                    out.push_str(members.get(k).ok_or_else(|| format!("{word} has no member {k}"))?);
+                }
+                _ => out.push_str(&word),
+            }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// `LibertyReader::makeTimingArcs(cell, from_name, to_port, one_to_one)`: the (from, to) bit pairs,
+/// in the order the reader makes them. One to one and a bus to one: every from bit; one to a bus:
+/// every to bit; a bus to a bus: one to one aligned at the LAST bits (`related_pin`), or every
+/// pair, from bits outer (`related_bus_pins`).
+fn expand_pairs(from: &[String], to: &[String], to_is_bus: bool, one_to_one: bool) -> Vec<(String, String)> {
+    if from.len() > 1 && to_is_bus {
+        if one_to_one {
+            let n = from.len().min(to.len());
+            let (f, t) = (&from[from.len() - n..], &to[to.len() - n..]);
+            return f.iter().cloned().zip(t.iter().cloned()).collect();
+        }
+        return from.iter().flat_map(|f| to.iter().map(move |t| (f.clone(), t.clone()))).collect();
+    }
+    if to_is_bus {
+        return from.first().map(|f| to.iter().map(|t| (f.clone(), t.clone())).collect()).unwrap_or_default();
+    }
+    from.iter().map(|f| (f.clone(), to[0].clone())).collect()
+}
+
+impl Cell {
+    /// A bus's member bits, in member order (empty when there is no such bus).
+    pub fn bus_members(&self, bus: &str) -> &[String] {
+        self.buses.iter().find(|(b, _)| b == bus).map_or(&[], |(_, m)| m.as_slice())
+    }
+
+    /// `PortNameBitIterator`: a bus name -> its bits; `name[a:b]` -> bits a to b; else the name.
+    pub fn port_bits(&self, name: &str) -> Vec<String> {
+        let members = self.bus_members(name);
+        if !members.is_empty() {
+            return members.to_vec();
+        }
+        if let Some((base, rest)) = name.split_once('[') {
+            if let Some((a, b)) = rest.strip_suffix(']').and_then(|r| r.split_once(':')) {
+                if let (Ok(a), Ok(b)) = (a.trim().parse::<i32>(), b.trim().parse::<i32>()) {
+                    return bus_bits(base, a, b).into_iter().map(|(n, _)| n).collect();
+                }
+            }
+        }
+        vec![name.to_string()]
+    }
+}
+
 fn identifiers(expr: &str) -> Vec<String> {
     expr.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '[' || c == ']')).filter(|t| !t.is_empty()).map(String::from).collect()
 }
@@ -593,7 +849,7 @@ impl Library {
 
     /// The arc sets of one timing group to port `to`: its models per transition, its role and arcs
     /// by `timing_type` and `timing_sense`, one arc set per related pin.
-    fn read_timing(&self, cell: &Cell, to: &str, function: Option<&str>, tg: &Group) -> Result<Vec<ArcSet>, String> {
+    fn read_timing(&self, cell: &Cell, to: &str, function: Option<&str>, tg: &Group, related: &[String]) -> Result<Vec<ArcSet>, String> {
         let timing_type = tg.attr_text("timing_type").unwrap_or_else(|| "combinational".into());
         let sense = tg.attr_text("timing_sense");
         let cond = tg.attr_text("when");
@@ -613,13 +869,12 @@ impl Library {
             let ids = identifiers(f);
             cell.sequentials.iter().find(|(outs, _, _)| outs.iter().any(|o| ids.contains(o)))
         });
-        let related: Vec<String> = tg.attr_text("related_pin").map(|r| r.split_whitespace().map(String::from).collect()).unwrap_or_default();
         if related.is_empty() {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
         for from in related {
-            let in_clock = seq.is_some_and(|(_, _, clk)| identifiers(clk).contains(&from));
+            let in_clock = seq.is_some_and(|(_, _, clk)| identifiers(clk).contains(from));
             if timing_type == "combinational" && seq.is_some() && in_clock {
                 return Err(format!("cell {}: a register timing group without timing_type (from {from}) is not modelled", cell.name));
             }
@@ -674,7 +929,7 @@ impl Library {
                 "rising_edge" | "falling_edge" => {
                     let from_rf = if timing_type == "rising_edge" { RISE } else { FALL };
                     let role = match seq {
-                        Some((_, false, clk)) if identifiers(clk).contains(&from) => Role::LatchEnToQ,
+                        Some((_, false, clk)) if identifiers(clk).contains(from) => Role::LatchEnToQ,
                         _ => Role::RegClkToQ,
                     };
                     from_transition(from_rf, role)
@@ -712,6 +967,60 @@ impl Library {
 mod tests {
     use super::*;
     use crate::liberty_parse::parse;
+
+    const BUS_LIB: &str = r#"library (b) { time_unit : "1ns"; capacitive_load_unit (1, pf);
+      type (b4) { base_type : array; data_type : bit; bit_width : 4; bit_from : 3; bit_to : 0; }
+      type (b2) { base_type : array; data_type : bit; bit_width : 2; bit_from : 1; bit_to : 0; }
+      cell (bus4) {
+        bus (in) { bus_type : b4; direction : input; capacitance : 0.0077;
+          pin (in[0]) { capacitance : 0.002; } }
+        pin (en) { direction : input; capacitance : 0.001; }
+        bus (out) { bus_type : b4; direction : output; function : "in";
+          timing () { related_pin : "in"; timing_sense : positive_unate;
+            cell_rise (scalar) { values ("1"); } cell_fall (scalar) { values ("2"); }
+            rise_transition (scalar) { values ("1"); } fall_transition (scalar) { values ("2"); } }
+          timing () { related_pin : "en"; timing_sense : positive_unate;
+            cell_rise (scalar) { values ("1"); } cell_fall (scalar) { values ("2"); }
+            rise_transition (scalar) { values ("1"); } fall_transition (scalar) { values ("2"); } } }
+        bus (q) { bus_type : b2; direction : output; function : "in";
+          timing () { related_pin : "in"; timing_sense : positive_unate;
+            cell_rise (scalar) { values ("1"); } rise_transition (scalar) { values ("1"); } }
+          timing () { related_bus_pins : "in"; timing_sense : positive_unate;
+            cell_rise (scalar) { values ("1"); } rise_transition (scalar) { values ("1"); } } } } }"#;
+
+    // Rules (makeBusPort, makeBusPortBits, LibertyPort setters): a bus is its bits `name[i]`, bit_from
+    // to bit_to; the bus's attributes reach every bit; a pin group inside the bus states its own
+    // over them; the function is sliced by member OFFSET (out[3] = in[3], the first of each).
+    #[test]
+    fn a_bus_is_its_bits_with_the_bus_attributes() {
+        let l = Library::read(&parse(BUS_LIB).unwrap()).unwrap();
+        let c = &l.cells["bus4"];
+        let names: Vec<&str> = c.ports.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["in[3]", "in[2]", "in[1]", "in[0]", "en", "out[3]", "out[2]", "out[1]", "out[0]", "q[1]", "q[0]"]);
+        assert_eq!(c.port("in[2]").unwrap().capacitance[RISE][MAX], 0.0077e-12);
+        assert_eq!(c.port("in[0]").unwrap().capacitance[RISE][MAX], 0.002e-12, "the inner pin's own");
+        assert_eq!(c.port("in[0]").unwrap().direction, Direction::Input, "kept from the bus");
+        assert_eq!(c.port("out[3]").unwrap().function.as_deref(), Some("in[3]"));
+        assert_eq!(c.port("out[0]").unwrap().function.as_deref(), Some("in[0]"));
+        assert_eq!(c.port("q[1]").unwrap().function.as_deref(), Some("in[3]"), "offset 0 of in");
+    }
+
+    // Rules (makeTimingArcs): related_pin bus -> bus is one to one, aligned at the LAST bits when
+    // the sizes differ; one -> bus is every bit; related_bus_pins is the cross product, from bits outer.
+    #[test]
+    fn bus_timing_expands_by_the_readers_rules() {
+        let l = Library::read(&parse(BUS_LIB).unwrap()).unwrap();
+        let pairs = |to_bus: &str, role_from: &str| -> Vec<(String, String)> {
+            l.cells["bus4"].arc_sets.iter().filter(|a| a.to.starts_with(to_bus) && a.from.starts_with(role_from)).map(|a| (a.from.clone(), a.to.clone())).collect()
+        };
+        let p = |v: &[(&str, &str)]| v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
+        assert_eq!(pairs("out", "in"), p(&[("in[3]", "out[3]"), ("in[2]", "out[2]"), ("in[1]", "out[1]"), ("in[0]", "out[0]")]));
+        assert_eq!(pairs("out", "en"), p(&[("en", "out[3]"), ("en", "out[2]"), ("en", "out[1]"), ("en", "out[0]")]));
+        let q = pairs("q", "in");
+        assert_eq!(&q[..2], p(&[("in[1]", "q[1]"), ("in[0]", "q[0]")]).as_slice(), "the last two bits of in");
+        assert_eq!(q.len(), 2 + 8, "then the 4 x 2 cross product");
+        assert_eq!(&q[2..4], p(&[("in[3]", "q[1]"), ("in[3]", "q[0]")]).as_slice());
+    }
 
     // Rule (LibertyReader: three_state): an OUTPUT with a non-empty three_state is tristate; a
     // plain output is not, nor is an empty three_state.
