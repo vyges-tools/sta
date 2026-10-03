@@ -91,6 +91,33 @@ pub fn setup_required_time(clock: &Clock, src_rf: usize, tgt_rf: usize) -> f32 {
     best.map_or(0.0, |(_, r)| r as f32)
 }
 
+/// The hold required time between two edges of the SAME clock: the target edge the nearest at
+/// or (fuzzily) before the source edge, as `target time − source cycle start` (`CycleAccting`,
+/// hold role), computed in `double` and stored `float`.
+///
+/// Rule: target cycles walked from the first, source cycles from the first within each; the
+/// first pairing with the smallest `source − target` wins (fuzzily less than the incumbent).
+pub fn hold_required_time(clock: &Clock, src_rf: usize, tgt_rf: usize) -> f32 {
+    let period = f64::from(clock.period);
+    let src_time = f64::from(clock.edge_time(src_rf));
+    let tgt_edge = f64::from(clock.edge_time(tgt_rf));
+    let mut best: Option<(f64, f64)> = None;
+    for tgt_cycle in 0..=2 {
+        let tgt_time = f64::from(tgt_cycle) * period + tgt_edge;
+        for src_cycle in 0..=2 {
+            let src_cycle_start = f64::from(src_cycle) * period;
+            let src = src_cycle_start + src_time;
+            if crate::fuzzy::less_equal(tgt_time as f32, src as f32) {
+                let delay = src - tgt_time;
+                if best.is_none_or(|(d, _)| crate::fuzzy::less(delay as f32, d as f32)) {
+                    best = Some((delay, tgt_time - src_cycle_start));
+                }
+            }
+        }
+    }
+    best.map_or(0.0, |(_, r)| r as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +151,16 @@ mod tests {
         assert_eq!(setup_required_time(&c, RISE, FALL), 1.0);
         assert_eq!(setup_required_time(&c, FALL, RISE), 2.0);
         assert_eq!(setup_required_time(&c, FALL, FALL), 3.0);
+    }
+
+    // Rule (CycleAccting::findDelays, hold): the target edge at or before the source edge with
+    // the least separation, less the source cycle's start.
+    #[test]
+    fn hold_required_times_of_one_clock() {
+        let c = Clock::new("c", 2.0, "clk", true);
+        assert_eq!(hold_required_time(&c, RISE, RISE), 0.0);
+        assert_eq!(hold_required_time(&c, RISE, FALL), -1.0);
+        assert_eq!(hold_required_time(&c, FALL, RISE), 0.0);
+        assert_eq!(hold_required_time(&c, FALL, FALL), 1.0);
     }
 }

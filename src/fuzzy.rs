@@ -33,6 +33,11 @@ pub fn greater(v1: f32, v2: f32) -> bool {
     v1 > v2 && !equal(v1, v2)
 }
 
+/// Less, or fuzzily equal.
+pub fn less_equal(v1: f32, v2: f32) -> bool {
+    v1 < v2 || equal(v1, v2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

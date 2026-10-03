@@ -19,6 +19,7 @@ pub mod dcalc;
 pub mod func_expr;
 pub mod fuzzy;
 pub mod graph;
+pub mod incr;
 pub mod liberty;
 pub mod liberty_parse;
 pub mod netlist;

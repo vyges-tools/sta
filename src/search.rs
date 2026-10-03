@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use crate::graph::{EdgeKind, Graph};
 use crate::liberty::{Role, MAX, MIN};
-use crate::sdc::{setup_required_time, Sdc};
+use crate::sdc::{hold_required_time, setup_required_time, Sdc};
 
 /// The min/max initial value (`INF` = 1e30).
 const INF: f32 = 1e30;
@@ -248,6 +248,12 @@ impl<'g, 'a> Search<'g, 'a> {
 
     /// One vertex's arrivals.
     fn arrival_visit(&mut self, v: usize) {
+        self.paths[v] = self.arrival_paths(v);
+    }
+
+    /// The paths a visit of `v` builds from its fanin's paths as they stand (`ArrivalVisitor`:
+    /// fanin paths, CRPR pruning, seeds), in tag order — not stored.
+    pub fn arrival_paths(&self, v: usize) -> Vec<Path> {
         let mut bldr = Bldr::default();
         let mut no_crpr = NoCrprBldr::default();
         let has_fanin_one = self.graph.in_edges[v].len() == 1;
@@ -258,7 +264,7 @@ impl<'g, 'a> Search<'g, 'a> {
         self.seed_arrivals(v, &mut bldr);
         let vid = &self.vertex_id;
         bldr.paths.sort_by_key(|p| p.tag.key(vid));
-        self.paths[v] = bldr.paths;
+        bldr.paths
     }
 
     /// In-edges newest first (edges are prepended), each fanin path in tag order, each arc from its
@@ -364,22 +370,36 @@ impl<'g, 'a> Search<'g, 'a> {
 
     /// Requireds from the fanout, then the endpoint's path ends.
     fn required_visit(&mut self, v: usize) {
-        let mut req: Vec<f32> = self.paths[v].iter().map(|p| if p.tag.mm == MAX { INF } else { -INF }).collect();
-        self.visit_fanout_paths(v, &mut req);
-        self.visit_path_ends(v, &mut req);
+        let req = self.required_values(v);
         for (p, r) in self.paths[v].iter_mut().zip(req) {
             p.required = r;
         }
     }
 
-    /// A MAX path's required: the fuzzily smaller.
-    fn required_set(req: &mut [f32], i: usize, value: f32) {
-        if crate::fuzzy::less(value, req[i]) {
+    /// The requireds a visit of `v` computes for its paths (`RequiredVisitor`: from the fanout's
+    /// requireds as they stand, then the endpoint's path ends) — not stored.
+    pub fn required_values(&self, v: usize) -> Vec<f32> {
+        let mut req: Vec<f32> = self.paths[v].iter().map(|p| if p.tag.mm == MAX { INF } else { -INF }).collect();
+        self.visit_fanout_paths(v, &mut req);
+        self.visit_path_ends(v, &mut req);
+        req
+    }
+
+    /// Whether `v` drives a register's clock-to-output arc (`isRegClk`).
+    pub fn is_reg_clk(&self, v: usize) -> bool {
+        self.is_reg_clk[v]
+    }
+
+    /// `RequiredCmp::requiredSet` with the path's opposite min/max: a MAX path's required is the
+    /// fuzzily smaller, a MIN path's the fuzzily greater.
+    fn required_set(req: &mut [f32], i: usize, value: f32, mm: usize) {
+        let better = if mm == MAX { crate::fuzzy::less(value, req[i]) } else { crate::fuzzy::greater(value, req[i]) };
+        if better {
             req[i] = value;
         }
     }
 
-    /// Requireds back from the fanout (max paths).
+    /// Requireds back from the fanout (max and min paths).
     fn visit_fanout_paths(&self, v: usize, req: &mut [f32]) {
         for &e in self.graph.out_edges[v].iter().rev() {
             if self.is_check(e) || self.role(e) == Some(Role::LatchDtoQ) {
@@ -387,9 +407,6 @@ impl<'g, 'a> Search<'g, 'a> {
             }
             let to_v = self.graph.edges[e].to;
             for (i, from) in self.paths[v].iter().enumerate() {
-                if from.tag.mm != MAX {
-                    continue;
-                }
                 for arc in self.arcs_from(e, from.tag.rf) {
                     let Some((to_tag, delay, _)) = self.visit_from_path(v, from, e, &arc) else { continue };
                     let to_paths = &self.paths[to_v];
@@ -400,29 +417,30 @@ impl<'g, 'a> Search<'g, 'a> {
                         None => to_paths.iter().find(|p| p.tag.mm == to_tag.mm && p.tag.rf == to_tag.rf && p.tag.matches_no_crpr(&to_tag)).map(|p| p.required),
                     };
                     if let Some(r) = to_required {
-                        Self::required_set(req, i, r - delay);
+                        Self::required_set(req, i, r - delay, from.tag.mm);
                     }
                 }
             }
         }
     }
 
-    /// The endpoint's path ends, for max paths: an output delay
-    /// end if the port has one, else a setup check end.
+    /// The endpoint's path ends: an output delay end if the port has one, else a check end —
+    /// setup for a max path, hold for a min path.
     fn visit_path_ends(&self, v: usize, req: &mut [f32]) {
         let name = &self.graph.vertices[v].name;
         let od = if self.graph.vertices[v].lib.is_none() { self.output_delay.get(name).copied() } else { None };
         let clock = &self.sdc.clock;
         for (i, path) in self.paths[v].iter().enumerate() {
-            if path.tag.mm != MAX {
+            let Some(src_edge) = path.tag.clk_edge else { continue };
+            if path.tag.mm == MIN {
+                self.hold_path_ends(v, od, i, path, src_edge, req);
                 continue;
             }
-            let Some(src_edge) = path.tag.clk_edge else { continue };
             if let Some(d) = od {
                 // Target clock time (the delay's rise edge) − the delay.
                 let tgt_time = setup_required_time(clock, src_edge, 0);
                 let margin = self.sdc.output_delays[d].delay[path.tag.rf][MAX];
-                Self::required_set(req, i, (tgt_time + (0.0 + 0.0)) - margin);
+                Self::required_set(req, i, (tgt_time + (0.0 + 0.0)) - margin, MAX);
                 continue;
             }
             for &e in self.graph.in_edges[v].iter().rev() {
@@ -447,8 +465,45 @@ impl<'g, 'a> Search<'g, 'a> {
                         let tgt_clk_arrival = (0.0 + latency) + setup_required_time(clock, src_edge, tgt_edge);
                         let margin = self.arc_delay(e, k, MAX);
                         let crpr = self.check_crpr(path, tgt_v, tgt);
-                        Self::required_set(req, i, (tgt_clk_arrival - (margin + 0.0)) + crpr);
+                        Self::required_set(req, i, (tgt_clk_arrival - (margin + 0.0)) + crpr, MAX);
                     }
+                }
+            }
+        }
+    }
+
+    /// A min path's ends (`PathEndOutputDelay` / `PathEndCheck` under the hold role): the
+    /// output delay's hold end, `target + −min delay`; else each hold check, against the LATE
+    /// (max) target clock path (`tgtClkEarlyLate`), `(target + margin) − crpr`. The target time is
+    /// the hold cycle accounting's.
+    fn hold_path_ends(&self, v: usize, od: Option<usize>, i: usize, path: &Path, src_edge: usize, req: &mut [f32]) {
+        let clock = &self.sdc.clock;
+        if let Some(d) = od {
+            let tgt_time = hold_required_time(clock, src_edge, 0);
+            let margin = -self.sdc.output_delays[d].delay[path.tag.rf][MIN];
+            Self::required_set(req, i, (tgt_time + (0.0 + 0.0)) + margin, MIN);
+            return;
+        }
+        for &e in self.graph.in_edges[v].iter().rev() {
+            if self.role(e) != Some(Role::Hold) {
+                continue;
+            }
+            let EdgeKind::Gate { set } = self.graph.edges[e].kind else { continue };
+            let tgt_v = self.graph.edges[e].from;
+            for (k, arc) in self.graph.arc_set(e, set).arcs.iter().enumerate() {
+                if arc.to_rf != path.tag.rf {
+                    continue;
+                }
+                for tgt in &self.paths[tgt_v] {
+                    if tgt.tag.mm != MAX || tgt.tag.rf != arc.from_rf || !tgt.tag.is_clock {
+                        continue;
+                    }
+                    let tgt_edge = tgt.tag.clk_edge.expect("a clock path has an edge");
+                    let latency = if clock.propagated { (tgt.arrival - clock.edge_time(tgt_edge)) - 0.0 } else { 0.0 };
+                    let tgt_clk_arrival = (0.0 + latency) + hold_required_time(clock, src_edge, tgt_edge);
+                    let margin = self.arc_delay(e, k, MIN);
+                    let crpr = self.check_crpr(path, tgt_v, tgt);
+                    Self::required_set(req, i, (tgt_clk_arrival + (margin - 0.0)) + (0.0 - crpr), MIN);
                 }
             }
         }
@@ -558,7 +613,9 @@ mod tests {
         pin (CLK) { direction : input; capacitance : 0.001; clock : true; }
         pin (D) { direction : input; capacitance : 0.001;
           timing () { related_pin : "CLK"; timing_type : setup_rising;
-            rise_constraint (scalar) { values ("0.05"); } fall_constraint (scalar) { values ("0.06"); } } }
+            rise_constraint (scalar) { values ("0.05"); } fall_constraint (scalar) { values ("0.06"); } }
+          timing () { related_pin : "CLK"; timing_type : hold_rising;
+            rise_constraint (scalar) { values ("0.02"); } fall_constraint (scalar) { values ("0.03"); } } }
         pin (Q) { direction : output; function : "IQ";
           timing () { related_pin : "CLK"; timing_type : rising_edge;
             cell_rise (scalar) { values ("0.3"); } rise_transition (scalar) { values ("0.1"); }
@@ -658,6 +715,24 @@ mod tests {
             assert_eq!(path(s, v("f2/D"), RISE, false).required, ((0.0 + ((0.0 + b) - 0.0 - 0.0)) + t) - (0.05f32 * 1e-9 + 0.0));
             assert_eq!(path(s, v("f2/D"), FALL, false).required, ((0.0 + ((0.0 + b) - 0.0 - 0.0)) + t) - (0.06f32 * 1e-9 + 0.0));
             assert_eq!(path(s, v("out"), RISE, false).required, (t + 0.0) - 0.2e-9f32);
+        });
+    }
+
+    /// Rules (PathEndCheck::requiredTimeNoCrpr / checkCrpr under the hold role; RequiredCmp with
+    /// the min path's opposite, max): a min path's required at a hold check is (the LATE capture
+    /// clock arrival + the hold cycle's target time) + the hold margin − crpr; at an output delay,
+    /// the hold target time + −its min delay; back through the fanout, the greatest.
+    #[test]
+    fn min_paths_take_hold_requireds() {
+        timed(|s, v| {
+            let b = 0.1f32 * 1e-9;
+            let min = |vx: usize, rf: usize| *s.paths[vx].iter().find(|p| p.tag.rf == rf && p.tag.mm == MIN && !p.tag.is_clock).unwrap();
+            let d = min(v("f2/D"), RISE);
+            assert_eq!(d.required, (((0.0 + ((0.0 + b) - 0.0 - 0.0)) + 0.0) + (0.02f32 * 1e-9 - 0.0)) + (0.0 - 0.0));
+            assert_eq!(min(v("f2/D"), FALL).required, (((0.0 + ((0.0 + b) - 0.0 - 0.0)) + 0.0) + (0.03f32 * 1e-9 - 0.0)) + (0.0 - 0.0));
+            assert_eq!(min(v("out"), RISE).required, (0.0 + (0.0 + 0.0)) + -0.2e-9f32);
+            // f1/Q drives f2/D over a wire with no delay: the same required.
+            assert_eq!(min(v("f1/Q"), RISE).required, d.required);
         });
     }
 

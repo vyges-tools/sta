@@ -505,176 +505,193 @@ impl<'a> Graph<'a> {
     pub fn find_delays(&mut self, parasitics: &HashMap<String, NetParasitics>, mut trace: Option<&mut Vec<String>>) -> Result<(), String> {
         let order = self.topo_order()?;
         self.clamped.clear();
-        let index: HashMap<String, usize> = self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect();
+        let index = self.pin_index();
+        for &v in &order {
+            self.find_vertex_delays(v, parasitics, &index, trace.as_deref_mut())?;
+        }
+        // Timing-check delays, after every slew is known.
+        for e in 0..self.edges.len() {
+            if self.is_check(e) {
+                self.find_check_edge_delays(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Every vertex's index by name (the parasitics name their nodes by pin).
+    pub fn pin_index(&self) -> HashMap<String, usize> {
+        self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect()
+    }
+
+    /// One vertex of the delay calculation (`findVertexDelay`): a load takes its root slew, its
+    /// annotation or its limit; an input port its drive; a driver every arc of every in-edge,
+    /// its slew and its loads' slews and wire delays merged from the initial values.
+    pub fn find_vertex_delays(&mut self, v: usize, parasitics: &HashMap<String, NetParasitics>, index: &HashMap<String, usize>, mut trace: Option<&mut Vec<String>>) -> Result<(), String> {
         const INIT: [f32; 2] = [1e30, -1e30];
         // Fuzzily worse for this min/max, so the merge order matters.
         let worse = |mm: usize, a: f32, b: f32| if mm == MAX { crate::fuzzy::greater(a, b) } else { crate::fuzzy::less(a, b) };
-        for &v in &order {
-            let fanin: Vec<usize> = self.in_edges[v].iter().copied().filter(|&e| !self.is_check(e)).collect();
-            let wires: Vec<usize> = self.out_edges[v].iter().copied().filter(|&e| matches!(self.edges[e].kind, EdgeKind::Wire)).collect();
-            if !self.vertices[v].is_driver {
-                if fanin.is_empty() {
-                    // A root load's slew is 0.
-                    self.slew[v] = [[0.0; 2]; 2];
-                } else if let Some(&value) = self.slew_annotated.get(&v) {
-                    self.slew[v][RISE][MAX] = value;
-                    self.slew[v][FALL][MAX] = value;
-                } else if let Some(&limit) = self.slew_limit.get(&v) {
-                    // Its driver set its slew; before its fanout reads it, an excess on either
-                    // transition holds BOTH max slews at the limit.
-                    if self.slew[v][RISE][MAX] > limit || self.slew[v][FALL][MAX] > limit {
-                        self.slew[v][RISE][MAX] = limit;
-                        self.slew[v][FALL][MAX] = limit;
-                        self.clamped.push(v);
-                    }
-                }
-                continue;
-            }
+        let fanin: Vec<usize> = self.in_edges[v].iter().copied().filter(|&e| !self.is_check(e)).collect();
+        let wires: Vec<usize> = self.out_edges[v].iter().copied().filter(|&e| matches!(self.edges[e].kind, EdgeKind::Wire)).collect();
+        if !self.vertices[v].is_driver {
             if fanin.is_empty() {
-                if let Some(drive) = self.sdc.input_drive.get(&self.vertices[v].name).cloned() {
-                    self.time_input_drive(v, &wires, &drive, parasitics, &index)?;
-                    continue;
-                }
-                // An input port (`seedNoDrvrCellSlew` / `seedNoDrvrSlew`): its slew is the
-                // `set_input_transition`, else 0; its loads by the input-port delay at that slew
-                // over the `parasiticLoad` pi model — a load with no Elmore delay takes the slew.
-                for rf in [RISE, FALL] {
-                    for mm in [MIN, MAX] {
-                        let in_slew = self.sdc.input_slew.get(&self.vertices[v].name).and_then(|s| s[rf][mm]).unwrap_or(0.0);
-                        self.slew[v][rf][mm] = in_slew;
-                        let (_, _, pe) = self.parasitic_load(v, rf, mm, parasitics, &index);
-                        for &e in &wires {
-                            let load = self.edges[e].to;
-                            let mut wire_delay = 0.0f64;
-                            let mut load_slew = f64::from(in_slew);
-                            let elmore = pe.as_ref().and_then(|(p, names)| p.elmore.iter().find(|(n, _)| names[*n] == self.vertices[load].name).map(|(_, e)| *e));
-                            let ll = self.threshold_library(load);
-                            if let Some(el) = elmore {
-                                let l = &self.libs[ll];
-                                let th = Thresholds { vth: l.input_threshold[rf], vl: l.slew_lower_threshold[rf], vh: l.slew_upper_threshold[rf], slew_derate: l.slew_derate };
-                                (wire_delay, load_slew) = dspf_wire_delay_slew(f64::from(in_slew), el, &th);
-                            }
-                            threshold_adjust(ll == 0, &self.lib_thresholds(0, rf), &self.lib_thresholds(ll, rf), rf == RISE, &mut wire_delay, &mut load_slew);
-                            self.slew[load][rf][mm] = load_slew as f32;
-                            self.delay[e][rf][mm] = wire_delay as f32;
-                        }
-                    }
-                }
-                continue;
-            }
-            // Driver delays: init, then every arc of every in-edge.
-            let drvr_lib = self.vertices[v].lib.expect("an instance driver");
-            for &e in &wires {
-                self.slew[self.edges[e].to] = [[INIT[MIN], INIT[MAX]], [INIT[MIN], INIT[MAX]]];
-                self.delay[e] = vec![[INIT[MIN], INIT[MAX]]; 2];
-            }
-            self.slew[v] = [[INIT[MIN], INIT[MAX]], [INIT[MIN], INIT[MAX]]];
-            let mut exists = [false; 2];
-            // Edges are PREPENDED to a vertex's in-edge list, so they are visited newest first —
-            // the reverse of the cell's arc-set order.
-            for &e in fanin.iter().rev() {
-                let EdgeKind::Gate { set } = self.edges[e].kind else { continue };
-                let arcs = self.arc_set(e, set).arcs.clone();
-                if self.arc_set(e, set).role == Role::LatchDtoQ {
-                    return Err("latch D->Q arcs are not modelled".into());
-                }
-                let from = self.edges[e].from;
-                let ideal_clk_to_q = self.arc_set(e, set).role == Role::RegClkToQ && self.ideal_clock.contains(&from);
-                for mm in [MIN, MAX] {
-                    for (k, arc) in arcs.iter().enumerate() {
-                        let Model::Gate(model) = &arc.model else { continue };
-                        let rf = arc.to_rf;
-                        let in_slew = if ideal_clk_to_q { 0.0 } else { self.slew[from][arc.from_rf][mm] };
-                        let (pin_cap, wire_cap, pe) = self.parasitic_load(v, rf, mm, parasitics, &index);
-                        let load_cap = pin_cap + wire_cap;
-                        let l = &self.libs[drvr_lib];
-                        let th = Thresholds { vth: l.output_threshold[rf], vl: l.slew_lower_threshold[rf], vh: l.slew_upper_threshold[rf], slew_derate: l.slew_derate };
-                        let (gate_delay, drvr_slew, mut dmp) = match &pe {
-                            Some((p, _)) => {
-                                let mut d = Dmp::new(model, &th, in_slew, p.c2, p.rpi, p.c1);
-                                let (gd, ds) = d.gate_delay_slew();
-                                (gd, ds, Some(d))
-                            }
-                            None => {
-                                let (gd, ds) = model.gate_delay(in_slew, load_cap);
-                                (f64::from(gd), f64::from(ds), None)
-                            }
-                        };
-                        exists[rf] = true;
-                        if let (Some(t), Some(d), Some((p, _))) = (trace.as_deref_mut(), &dmp, &pe) {
-                            let (rd, t0, dt, ceff) = d.state();
-                            let alg = match d.alg {
-                                crate::dcalc::Alg::Cap => "cap",
-                                crate::dcalc::Alg::Pi => "Pi",
-                                crate::dcalc::Alg::ZeroC2 => "c2=0",
-                            };
-                            let rfc = |r: usize| if r == RISE { '^' } else { 'v' };
-                            t.push(format!("dcalc|gate|{}|{}{}|{:08x}|{:08x}|{:08x}|{:08x}|{alg}|{:016x}|{:016x}|{:016x}|{:016x}|{}|{:016x}|{:016x}", self.vertices[v].name, rfc(arc.from_rf), rfc(rf), in_slew.to_bits(), p.c2.to_bits(), p.rpi.to_bits(), p.c1.to_bits(), rd.to_bits(), t0.to_bits(), dt.to_bits(), ceff.to_bits(), i32::from(d.driver_valid()), gate_delay.to_bits(), drvr_slew.to_bits()));
-                        }
-                        let (gd32, ds32) = (gate_delay as f32, drvr_slew as f32);
-                        if worse(mm, ds32, self.slew[v][rf][mm]) {
-                            self.slew[v][rf][mm] = ds32;
-                        }
-                        self.delay[e][k][mm] = gd32;
-                        for &w in &wires {
-                            let load = self.edges[w].to;
-                            let (mut wire_delay, mut load_slew) = match (&mut dmp, &pe) {
-                                (Some(d), Some((p, names))) => match p.elmore.iter().find(|(n, _)| names[*n] == self.vertices[load].name) {
-                                    Some(&(_, el)) => d.load_delay_slew(f64::from(el)),
-                                    None => (0.0, drvr_slew),
-                                },
-                                _ => (0.0, f64::from(ds32)),
-                            };
-                            if let (Some(t), Some(_)) = (trace.as_deref_mut(), &dmp) {
-                                t.push(format!("dcalc|load|{}|{}|{:016x}|{:016x}", self.vertices[v].name, self.vertices[load].name, wire_delay.to_bits(), load_slew.to_bits()));
-                            }
-                            let ll = self.threshold_library(load);
-                            threshold_adjust(ll == drvr_lib, &self.lib_thresholds(drvr_lib, rf), &self.lib_thresholds(ll, rf), rf == RISE, &mut wire_delay, &mut load_slew);
-                            if worse(mm, load_slew as f32, self.slew[load][rf][mm]) {
-                                self.slew[load][rf][mm] = load_slew as f32;
-                            }
-                            if worse(mm, wire_delay as f32, self.delay[w][rf][mm]) {
-                                self.delay[w][rf][mm] = wire_delay as f32;
-                            }
-                        }
-                    }
+                // A root load's slew is 0.
+                self.slew[v] = [[0.0; 2]; 2];
+            } else if let Some(&value) = self.slew_annotated.get(&v) {
+                self.slew[v][RISE][MAX] = value;
+                self.slew[v][FALL][MAX] = value;
+            } else if let Some(&limit) = self.slew_limit.get(&v) {
+                // Its driver set its slew; before its fanout reads it, an excess on either
+                // transition holds BOTH max slews at the limit.
+                if self.slew[v][RISE][MAX] > limit || self.slew[v][FALL][MAX] > limit {
+                    self.slew[v][RISE][MAX] = limit;
+                    self.slew[v][FALL][MAX] = limit;
+                    self.clamped.push(v);
                 }
             }
+            return Ok(());
+        }
+        if fanin.is_empty() {
+            if let Some(drive) = self.sdc.input_drive.get(&self.vertices[v].name).cloned() {
+                self.time_input_drive(v, &wires, &drive, parasitics, index)?;
+                return Ok(());
+            }
+            // An input port (`seedNoDrvrCellSlew` / `seedNoDrvrSlew`): its slew is the
+            // `set_input_transition`, else 0; its loads by the input-port delay at that slew
+            // over the `parasiticLoad` pi model — a load with no Elmore delay takes the slew.
             for rf in [RISE, FALL] {
-                if !exists[rf] {
-                    for mm in [MIN, MAX] {
-                        self.slew[v][rf][mm] = INIT[mm];
-                        for &w in &wires {
-                            self.delay[w][rf][mm] = 0.0;
-                            self.slew[self.edges[w].to][rf][mm] = 0.0;
+                for mm in [MIN, MAX] {
+                    let in_slew = self.sdc.input_slew.get(&self.vertices[v].name).and_then(|s| s[rf][mm]).unwrap_or(0.0);
+                    self.slew[v][rf][mm] = in_slew;
+                    let (_, _, pe) = self.parasitic_load(v, rf, mm, parasitics, index);
+                    for &e in &wires {
+                        let load = self.edges[e].to;
+                        let mut wire_delay = 0.0f64;
+                        let mut load_slew = f64::from(in_slew);
+                        let elmore = pe.as_ref().and_then(|(p, names)| p.elmore.iter().find(|(n, _)| names[*n] == self.vertices[load].name).map(|(_, e)| *e));
+                        let ll = self.threshold_library(load);
+                        if let Some(el) = elmore {
+                            let l = &self.libs[ll];
+                            let th = Thresholds { vth: l.input_threshold[rf], vl: l.slew_lower_threshold[rf], vh: l.slew_upper_threshold[rf], slew_derate: l.slew_derate };
+                            (wire_delay, load_slew) = dspf_wire_delay_slew(f64::from(in_slew), el, &th);
+                        }
+                        threshold_adjust(ll == 0, &self.lib_thresholds(0, rf), &self.lib_thresholds(ll, rf), rf == RISE, &mut wire_delay, &mut load_slew);
+                        self.slew[load][rf][mm] = load_slew as f32;
+                        self.delay[e][rf][mm] = wire_delay as f32;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        // Driver delays: init, then every arc of every in-edge.
+        let drvr_lib = self.vertices[v].lib.expect("an instance driver");
+        for &e in &wires {
+            self.slew[self.edges[e].to] = [[INIT[MIN], INIT[MAX]], [INIT[MIN], INIT[MAX]]];
+            self.delay[e] = vec![[INIT[MIN], INIT[MAX]]; 2];
+        }
+        self.slew[v] = [[INIT[MIN], INIT[MAX]], [INIT[MIN], INIT[MAX]]];
+        let mut exists = [false; 2];
+        // Edges are PREPENDED to a vertex's in-edge list, so they are visited newest first —
+        // the reverse of the cell's arc-set order.
+        for &e in fanin.iter().rev() {
+            let EdgeKind::Gate { set } = self.edges[e].kind else { continue };
+            let arcs = self.arc_set(e, set).arcs.clone();
+            if self.arc_set(e, set).role == Role::LatchDtoQ {
+                return Err("latch D->Q arcs are not modelled".into());
+            }
+            let from = self.edges[e].from;
+            let ideal_clk_to_q = self.arc_set(e, set).role == Role::RegClkToQ && self.ideal_clock.contains(&from);
+            for mm in [MIN, MAX] {
+                for (k, arc) in arcs.iter().enumerate() {
+                    let Model::Gate(model) = &arc.model else { continue };
+                    let rf = arc.to_rf;
+                    let in_slew = if ideal_clk_to_q { 0.0 } else { self.slew[from][arc.from_rf][mm] };
+                    let (pin_cap, wire_cap, pe) = self.parasitic_load(v, rf, mm, parasitics, index);
+                    let load_cap = pin_cap + wire_cap;
+                    let l = &self.libs[drvr_lib];
+                    let th = Thresholds { vth: l.output_threshold[rf], vl: l.slew_lower_threshold[rf], vh: l.slew_upper_threshold[rf], slew_derate: l.slew_derate };
+                    let (gate_delay, drvr_slew, mut dmp) = match &pe {
+                        Some((p, _)) => {
+                            let mut d = Dmp::new(model, &th, in_slew, p.c2, p.rpi, p.c1);
+                            let (gd, ds) = d.gate_delay_slew();
+                            (gd, ds, Some(d))
+                        }
+                        None => {
+                            let (gd, ds) = model.gate_delay(in_slew, load_cap);
+                            (f64::from(gd), f64::from(ds), None)
+                        }
+                    };
+                    exists[rf] = true;
+                    if let (Some(t), Some(d), Some((p, _))) = (trace.as_deref_mut(), &dmp, &pe) {
+                        let (rd, t0, dt, ceff) = d.state();
+                        let alg = match d.alg {
+                            crate::dcalc::Alg::Cap => "cap",
+                            crate::dcalc::Alg::Pi => "Pi",
+                            crate::dcalc::Alg::ZeroC2 => "c2=0",
+                        };
+                        let rfc = |r: usize| if r == RISE { '^' } else { 'v' };
+                        t.push(format!("dcalc|gate|{}|{}{}|{:08x}|{:08x}|{:08x}|{:08x}|{alg}|{:016x}|{:016x}|{:016x}|{:016x}|{}|{:016x}|{:016x}", self.vertices[v].name, rfc(arc.from_rf), rfc(rf), in_slew.to_bits(), p.c2.to_bits(), p.rpi.to_bits(), p.c1.to_bits(), rd.to_bits(), t0.to_bits(), dt.to_bits(), ceff.to_bits(), i32::from(d.driver_valid()), gate_delay.to_bits(), drvr_slew.to_bits()));
+                    }
+                    let (gd32, ds32) = (gate_delay as f32, drvr_slew as f32);
+                    if worse(mm, ds32, self.slew[v][rf][mm]) {
+                        self.slew[v][rf][mm] = ds32;
+                    }
+                    self.delay[e][k][mm] = gd32;
+                    for &w in &wires {
+                        let load = self.edges[w].to;
+                        let (mut wire_delay, mut load_slew) = match (&mut dmp, &pe) {
+                            (Some(d), Some((p, names))) => match p.elmore.iter().find(|(n, _)| names[*n] == self.vertices[load].name) {
+                                Some(&(_, el)) => d.load_delay_slew(f64::from(el)),
+                                None => (0.0, drvr_slew),
+                            },
+                            _ => (0.0, f64::from(ds32)),
+                        };
+                        if let (Some(t), Some(_)) = (trace.as_deref_mut(), &dmp) {
+                            t.push(format!("dcalc|load|{}|{}|{:016x}|{:016x}", self.vertices[v].name, self.vertices[load].name, wire_delay.to_bits(), load_slew.to_bits()));
+                        }
+                        let ll = self.threshold_library(load);
+                        threshold_adjust(ll == drvr_lib, &self.lib_thresholds(drvr_lib, rf), &self.lib_thresholds(ll, rf), rf == RISE, &mut wire_delay, &mut load_slew);
+                        if worse(mm, load_slew as f32, self.slew[load][rf][mm]) {
+                            self.slew[load][rf][mm] = load_slew as f32;
+                        }
+                        if worse(mm, wire_delay as f32, self.delay[w][rf][mm]) {
+                            self.delay[w][rf][mm] = wire_delay as f32;
                         }
                     }
                 }
             }
         }
-        // Timing-check delays, after every slew is known.
-        for e in 0..self.edges.len() {
-            if !self.is_check(e) {
-                continue;
-            }
-            let EdgeKind::Gate { set } = self.edges[e].kind else { continue };
-            let arcs = self.arc_set(e, set).arcs.clone();
-            let (from, to) = (self.edges[e].from, self.edges[e].to);
-            for (k, arc) in arcs.iter().enumerate() {
-                let Model::Check(table) = &arc.model else { continue };
+        for rf in [RISE, FALL] {
+            if !exists[rf] {
                 for mm in [MIN, MAX] {
-                    let clk_slew = if self.ideal_clock.contains(&from) { 0.0 } else { self.slew[from][arc.from_rf][1 - mm] };
-                    let data_slew = self.slew[to][arc.to_rf][mm];
-                    let pick = |a: usize| match table.axes.get(a).map(|x| x.var) {
-                        Some(crate::table::AxisVar::RelatedPinTransition) => clk_slew,
-                        Some(crate::table::AxisVar::ConstrainedPinTransition) => data_slew,
-                        _ => 0.0,
-                    };
-                    self.delay[e][k][mm] = table.find_value(pick(0), pick(1), pick(2));
+                    self.slew[v][rf][mm] = INIT[mm];
+                    for &w in &wires {
+                        self.delay[w][rf][mm] = 0.0;
+                        self.slew[self.edges[w].to][rf][mm] = 0.0;
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    /// One timing check edge's delays (`findCheckEdgeDelays`), from the slews at both ends.
+    pub fn find_check_edge_delays(&mut self, e: usize) {
+        let EdgeKind::Gate { set } = self.edges[e].kind else { return };
+        let arcs = self.arc_set(e, set).arcs.clone();
+        let (from, to) = (self.edges[e].from, self.edges[e].to);
+        for (k, arc) in arcs.iter().enumerate() {
+            let Model::Check(table) = &arc.model else { continue };
+            for mm in [MIN, MAX] {
+                let clk_slew = if self.ideal_clock.contains(&from) { 0.0 } else { self.slew[from][arc.from_rf][1 - mm] };
+                let data_slew = self.slew[to][arc.to_rf][mm];
+                let pick = |a: usize| match table.axes.get(a).map(|x| x.var) {
+                    Some(crate::table::AxisVar::RelatedPinTransition) => clk_slew,
+                    Some(crate::table::AxisVar::ConstrainedPinTransition) => data_slew,
+                    _ => 0.0,
+                };
+                self.delay[e][k][mm] = table.find_value(pick(0), pick(1), pick(2));
+            }
+        }
     }
 }
 
