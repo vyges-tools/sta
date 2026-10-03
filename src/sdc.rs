@@ -32,12 +32,15 @@ impl Clock {
 pub struct PortDelay {
     pub port: String,
     pub delay: [[f32; 2]; 2],
+    /// Which `[rf][min/max]` values the constraint sets (`RiseFallMinMax::exists`): a missing
+    /// one makes no path end for that transition and min/max.
+    pub exists: [[bool; 2]; 2],
 }
 
 impl PortDelay {
     /// The same value for every transition and min/max (`set_*_delay <value>`).
     pub fn uniform(port: &str, value: f32) -> PortDelay {
-        PortDelay { port: port.into(), delay: [[value; 2]; 2] }
+        PortDelay { port: port.into(), delay: [[value; 2]; 2], exists: [[true; 2]; 2] }
     }
 }
 

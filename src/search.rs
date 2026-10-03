@@ -437,10 +437,13 @@ impl<'g, 'a> Search<'g, 'a> {
                 continue;
             }
             if let Some(d) = od {
-                // Target clock time (the delay's rise edge) − the delay.
-                let tgt_time = setup_required_time(clock, src_edge, 0);
-                let margin = self.sdc.output_delays[d].delay[path.tag.rf][MAX];
-                Self::required_set(req, i, (tgt_time + (0.0 + 0.0)) - margin, MAX);
+                // Target clock time (the delay's rise edge) − the delay; none when the delay
+                // sets no max value for this transition.
+                if self.sdc.output_delays[d].exists[path.tag.rf][MAX] {
+                    let tgt_time = setup_required_time(clock, src_edge, 0);
+                    let margin = self.sdc.output_delays[d].delay[path.tag.rf][MAX];
+                    Self::required_set(req, i, (tgt_time + (0.0 + 0.0)) - margin, MAX);
+                }
                 continue;
             }
             for &e in self.graph.in_edges[v].iter().rev() {
@@ -479,9 +482,11 @@ impl<'g, 'a> Search<'g, 'a> {
     fn hold_path_ends(&self, v: usize, od: Option<usize>, i: usize, path: &Path, src_edge: usize, req: &mut [f32]) {
         let clock = &self.sdc.clock;
         if let Some(d) = od {
-            let tgt_time = hold_required_time(clock, src_edge, 0);
-            let margin = -self.sdc.output_delays[d].delay[path.tag.rf][MIN];
-            Self::required_set(req, i, (tgt_time + (0.0 + 0.0)) + margin, MIN);
+            if self.sdc.output_delays[d].exists[path.tag.rf][MIN] {
+                let tgt_time = hold_required_time(clock, src_edge, 0);
+                let margin = -self.sdc.output_delays[d].delay[path.tag.rf][MIN];
+                Self::required_set(req, i, (tgt_time + (0.0 + 0.0)) + margin, MIN);
+            }
             return;
         }
         for &e in self.graph.in_edges[v].iter().rev() {
@@ -552,6 +557,20 @@ impl<'g, 'a> Search<'g, 'a> {
             }
         }
         self.crpr_arrival_diff(sv, sp).min(self.crpr_arrival_diff(tv, tp))
+    }
+
+    /// `Sta::slack(vertex, rf, min_max)`: over the paths of that min/max (and transition, when
+    /// given), the fuzzily least slack in tag order — `Path::slack`: `required − arrival` for a
+    /// max path, `arrival − required` for a min path; `INF` with none.
+    pub fn slack_of(&self, v: usize, mm: usize, rf: Option<usize>) -> f32 {
+        let mut slack = INF;
+        for p in self.paths[v].iter().filter(|p| p.tag.mm == mm && rf.is_none_or(|r| p.tag.rf == r)) {
+            let s = if mm == MAX { p.required - p.arrival } else { p.arrival - p.required };
+            if crate::fuzzy::less(s, slack) {
+                slack = s;
+            }
+        }
+        slack
     }
 
     /// The fuzzily least `required − arrival` over max paths, in tag
@@ -733,6 +752,37 @@ mod tests {
             assert_eq!(min(v("out"), RISE).required, (0.0 + (0.0 + 0.0)) + -0.2e-9f32);
             // f1/Q drives f2/D over a wire with no delay: the same required.
             assert_eq!(min(v("f1/Q"), RISE).required, d.required);
+        });
+    }
+
+    /// Rule (RiseFallMinMax::value exists): an output delay set for min only makes a hold end
+    /// and no setup end — the max required stays unconstrained.
+    #[test]
+    fn a_min_only_output_delay_constrains_hold_alone() {
+        let (libs, netlist, mut sdc) = design();
+        sdc.output_delays[0].exists = [[true, false], [true, false]];
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        g.find_delays(&HashMap::new(), None).unwrap();
+        let mut s = Search::in_graph_order(&g, &sdc);
+        s.find_arrivals().unwrap();
+        s.find_requireds().unwrap();
+        let out = g.vertices.iter().position(|x| x.name == "out").unwrap();
+        assert_eq!(s.slack_of(out, MAX, None), INF);
+        let hold = *s.paths[out].iter().find(|p| p.tag.rf == RISE && p.tag.mm == MIN).unwrap();
+        assert_eq!(hold.required, (0.0 + (0.0 + 0.0)) + -0.2e-9f32);
+    }
+
+    /// Rule (Path::slack, Sta::slack): a min path's slack is arrival − required; the vertex's is
+    /// the least over the min paths (per transition when asked).
+    #[test]
+    fn a_min_slack_is_arrival_less_required() {
+        timed(|s, v| {
+            let d = v("f2/D");
+            let min = |rf: usize| *s.paths[d].iter().find(|p| p.tag.rf == rf && p.tag.mm == MIN && !p.tag.is_clock).unwrap();
+            let (r, f) = (min(RISE), min(FALL));
+            assert_eq!(s.slack_of(d, MIN, Some(RISE)), r.arrival - r.required);
+            assert_eq!(s.slack_of(d, MIN, None), (r.arrival - r.required).min(f.arrival - f.required));
+            assert_eq!(s.slack_of(d, MAX, None), s.vertex_slack(d));
         });
     }
 
