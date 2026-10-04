@@ -204,102 +204,7 @@ impl IncTimer {
     /// `GraphDelayCalc::findDelays(to_level)` (all levels with `None`), after `relevelize`.
     /// The graph must hold the imported state; it holds the updated one after.
     pub fn find_delays(&mut self, g: &mut Graph<'_>, parasitics: &HashMap<String, NetParasitics>, to_level: Option<i32>) -> Result<(), String> {
-        self.relevelize(g)?;
-        self.visited.clear();
-        if !self.delays_exist {
-            // Not incremental: every vertex from the roots (`seedRootSlews`).
-            g.find_delays(parasitics, None)?;
-            self.delays_exist = true;
-            self.invalid_delays.clear();
-            self.delay_queue.clear();
-            self.invalid_check_edges.clear();
-            return Ok(());
-        }
-        let index = g.pin_index();
-        // `seedInvalidDelays`.
-        self.delay_queue.extend(std::mem::take(&mut self.invalid_delays));
-        // The levels, read while the observer writes the rest of the state.
-        let levels = std::mem::take(&mut self.levels);
-        let level_of = |name: &str| levels.get(name).copied().unwrap_or(0);
-        // The queue by level (`BfsIterator`), names kept sorted within a level.
-        let mut by_level: BTreeMap<i32, BTreeSet<String>> = BTreeMap::new();
-        for n in std::mem::take(&mut self.delay_queue) {
-            by_level.entry(level_of(&n)).or_default().insert(n);
-        }
-        while let Some((&lvl, _)) = by_level.iter().next() {
-            if to_level.is_some_and(|t| lvl > t) {
-                break;
-            }
-            let names = by_level.remove(&lvl).expect("a level");
-            for name in names {
-                let Some(&v) = index.get(&name) else { continue };
-                self.visited.push(name.clone());
-                let enqueue = |g: &Graph<'_>, to: usize, q: &mut BTreeMap<i32, BTreeSet<String>>| {
-                    let n = g_name(g, to);
-                    q.entry(level_of(&n)).or_default().insert(n);
-                };
-                let fanout: Vec<usize> = g.out_edges[v].iter().copied().filter(|&e| !g.is_check(e) && !is_latch_d_to_q(g, e)).map(|e| g.edges[e].to).collect();
-                let is_root = level_of(&name) == 0;
-                if is_root {
-                    // `seedRootSlew`, then every fanout.
-                    g.find_vertex_delays(v, parasitics, &index, None)?;
-                    for to in fanout {
-                        enqueue(g, to, &mut by_level);
-                    }
-                } else if g.vertices[v].is_driver {
-                    let wires: Vec<usize> = g.out_edges[v].iter().copied().filter(|&e| matches!(g.edges[e].kind, EdgeKind::Wire)).collect();
-                    let prev_load: Vec<[[f32; 2]; 2]> = wires.iter().map(|&w| g.slew[g.edges[w].to]).collect();
-                    let gates: Vec<usize> = g.in_edges[v].iter().copied().filter(|&e| !g.is_check(e) && !is_latch_d_to_q(g, e) && matches!(g.edges[e].kind, EdgeKind::Gate { .. })).collect();
-                    let prev_gate: Vec<Vec<[f32; 2]>> = gates.iter().map(|&e| g.delay[e].clone()).collect();
-                    g.find_vertex_delays(v, parasitics, &index, None)?;
-                    // The observer: a changed gate delay ([`gate_delay_changed`]), every load's
-                    // wire delay.
-                    let mut changed = false;
-                    for (k, &e) in gates.iter().enumerate() {
-                        let differs = g.delay[e].iter().zip(&prev_gate[k]).any(|(new, prev)| (0..2).any(|mm| gate_delay_changed(prev[mm], new[mm])));
-                        if differs {
-                            changed = true;
-                            self.required_invalid(g_name(g, g.edges[e].from));
-                            self.required_invalid(name.clone());
-                        }
-                    }
-                    if changed {
-                        self.arrival_invalid(name.clone());
-                    }
-                    for (k, &w) in wires.iter().enumerate() {
-                        let load = g.edges[w].to;
-                        self.arrival_invalid(g_name(g, load));
-                        // `loadSlewChanged`: any of the four slews beyond fuzzy equality.
-                        let now = g.slew[load];
-                        let was = prev_load[k];
-                        let differs = (0..2).any(|rf| (0..2).any(|mm| !crate::fuzzy::equal(now[rf][mm], was[rf][mm])));
-                        if differs {
-                            enqueue(g, load, &mut by_level);
-                        }
-                    }
-                } else {
-                    // A load: its slew comes from its driver; checks at it, then every fanout.
-                    g.find_vertex_delays(v, parasitics, &index, None)?;
-                    self.enqueue_check_edges(g, v);
-                    for to in fanout {
-                        enqueue(g, to, &mut by_level);
-                    }
-                }
-            }
-        }
-        // Vertices above the queried level stay queued.
-        for (_, names) in by_level {
-            self.delay_queue.extend(names);
-        }
-        self.levels = levels;
-        // Timing checks, after the slews they read.
-        for key in std::mem::take(&mut self.invalid_check_edges) {
-            if let Some(e) = (0..g.edges.len()).find(|&e| Self::edge_key(g, e) == key) {
-                g.find_check_edge_delays(e);
-                self.required_invalid(g_name(g, g.edges[e].to));
-            }
-        }
-        Ok(())
+        find_delays_scenes(std::slice::from_mut(self), std::slice::from_mut(g), &[parasitics], to_level)
     }
 
     /// `enqueueCheckEdges`: the check edges into a data pin and out of a check clock pin.
@@ -389,140 +294,15 @@ impl IncTimer {
         })
     }
 
-    /// `Search::findArrivals(to_level)` (all with `None`) over the imported paths: the queue from
-    /// the invalid vertices, level by level; a vertex whose arrivals changed is stored (in place
-    /// for the same tag group, else a new array) and its fanout enqueued; an unchanged one keeps
-    /// what it had and enqueues nothing.
+    /// `Search::findArrivals(to_level)` (all with `None`) over the imported paths: see
+    /// [`find_arrivals_scenes`].
     pub fn find_arrivals(&mut self, search: &mut Search<'_, '_>, to_level: Option<i32>) -> Result<(), String> {
-        let g = search.graph;
-        self.arrival_visits.clear();
-        if !self.arrivals_exist {
-            search.find_arrivals()?;
-            self.arrivals_exist = true;
-            self.invalid_arrivals.clear();
-            self.arrival_queue.clear();
-            self.store_all(search);
-            return Ok(());
-        }
-        let index = g.pin_index();
-        self.arrival_queue.extend(std::mem::take(&mut self.invalid_arrivals));
-        let mut by_level: BTreeMap<i32, BTreeSet<String>> = BTreeMap::new();
-        for n in std::mem::take(&mut self.arrival_queue) {
-            by_level.entry(self.levels.get(&n).copied().unwrap_or(0)).or_default().insert(n);
-        }
-        while let Some((&lvl, _)) = by_level.iter().next() {
-            if to_level.is_some_and(|t| lvl > t) {
-                break;
-            }
-            for name in by_level.remove(&lvl).expect("a level") {
-                let Some(&v) = index.get(&name) else { continue };
-                let new: Vec<Path> = search.arrival_paths(v);
-                let snew: Vec<SPath> = new.iter().map(|p| self.spath(g, p)).collect();
-                let changed = Self::arrivals_changed(self.paths.get(&name), &snew);
-                self.arrival_visits.push((name.clone(), changed));
-                if !changed {
-                    continue;
-                }
-                for &e in &g.out_edges[v] {
-                    if g.is_check(e) || is_latch_d_to_q(g, e) {
-                        continue;
-                    }
-                    let to = g_name(g, g.edges[e].to);
-                    by_level.entry(self.levels.get(&to).copied().unwrap_or(0)).or_default().insert(to);
-                }
-                // `setVertexArrivals`: the same tag group keeps its array, else a new one.
-                let same_group = self.paths.get(&name).is_some_and(|o| o.len() == snew.len() && o.iter().all(|p| snew.iter().any(|q| q.tag == p.tag)));
-                if !same_group {
-                    self.next_gen += 1;
-                    self.path_gen.insert(name.clone(), self.next_gen);
-                }
-                // A new path's required is 0 (`Path::Path`) until the required visit the change
-                // invalidates — which compares against that 0.
-                let mut stored = snew;
-                for p in stored.iter_mut() {
-                    p.required = 0.0;
-                }
-                search.paths[v] = new.into_iter().map(|mut p| {
-                    p.required = 0.0;
-                    p
-                }).collect();
-                self.paths.insert(name.clone(), stored);
-                self.required_invalid(name.clone());
-                // `constrainedRequiredsInvalid`: a clock arrival at a check clock pin changes the
-                // required at the data pins it constrains.
-                let is_clk = search.paths[v].iter().any(|p| p.tag.is_clock);
-                if is_clk && !g.vertices[v].is_driver {
-                    for &e in &g.out_edges[v] {
-                        if g.is_check(e) {
-                            self.required_invalid(g_name(g, g.edges[e].to));
-                        }
-                    }
-                }
-            }
-        }
-        for (_, names) in by_level {
-            self.arrival_queue.extend(names);
-        }
-        Ok(())
+        find_arrivals_scenes(std::slice::from_mut(self), std::slice::from_mut(search), to_level)
     }
 
-    /// `Search::findRequireds(level)` (all with `None`): the queue from the invalid vertices,
-    /// highest level first down to `level`; each visited vertex's requireds are stored, and its
-    /// fanin enqueued if one changed beyond fuzzy equality.
+    /// `Search::findRequireds(level)` (all with `None`): see [`find_requireds_scenes`].
     pub fn find_requireds(&mut self, search: &mut Search<'_, '_>, down_to_level: Option<i32>) -> Result<(), String> {
-        let g = search.graph;
-        self.required_visits.clear();
-        if !self.requireds_exist {
-            search.find_requireds()?;
-            self.requireds_exist = true;
-            self.invalid_requireds.clear();
-            self.required_queue.clear();
-            self.store_all(search);
-            return Ok(());
-        }
-        let index = g.pin_index();
-        self.required_queue.extend(std::mem::take(&mut self.invalid_requireds));
-        let mut by_level: BTreeMap<i32, BTreeSet<String>> = BTreeMap::new();
-        for n in std::mem::take(&mut self.required_queue) {
-            by_level.entry(self.levels.get(&n).copied().unwrap_or(0)).or_default().insert(n);
-        }
-        while let Some((&lvl, _)) = by_level.iter().next_back() {
-            if down_to_level.is_some_and(|t| lvl < t) {
-                break;
-            }
-            for name in by_level.remove(&lvl).expect("a level") {
-                let Some(&v) = index.get(&name) else { continue };
-                let req = search.required_values(v);
-                let mut changed = false;
-                for (p, r) in search.paths[v].iter_mut().zip(req) {
-                    if !crate::fuzzy::equal(p.required, r) {
-                        changed = true;
-                    }
-                    p.required = r;
-                }
-                if let Some(stored) = self.paths.get_mut(&name) {
-                    for sp in stored.iter_mut() {
-                        if let Some(p) = search.paths[v].iter().find(|p| Self::stag(g, &p.tag) == sp.tag) {
-                            sp.required = p.required;
-                        }
-                    }
-                }
-                self.required_visits.push((name.clone(), changed));
-                if changed {
-                    for &e in &g.in_edges[v] {
-                        if g.is_check(e) || is_latch_d_to_q(g, e) {
-                            continue;
-                        }
-                        let from = g_name(g, g.edges[e].from);
-                        by_level.entry(self.levels.get(&from).copied().unwrap_or(0)).or_default().insert(from);
-                    }
-                }
-            }
-        }
-        for (_, names) in by_level {
-            self.required_queue.extend(names);
-        }
-        Ok(())
+        find_requireds_scenes(std::slice::from_mut(self), std::slice::from_mut(search), down_to_level)
     }
 
     /// Every vertex's paths into the state (after a full pass).
@@ -533,6 +313,321 @@ impl IncTimer {
             self.paths.insert(g_name(g, v), stored);
         }
     }
+}
+
+/// The queue's levels: each name at its level (scene 0's levels; every scene's are alike — one
+/// netlist, one levelization).
+fn queue_by_level(levels: &HashMap<String, i32>, names: impl IntoIterator<Item = String>) -> BTreeMap<i32, BTreeSet<String>> {
+    let mut by_level: BTreeMap<i32, BTreeSet<String>> = BTreeMap::new();
+    for n in names {
+        by_level.entry(levels.get(&n).copied().unwrap_or(0)).or_default().insert(n);
+    }
+    by_level
+}
+
+/// `GraphDelayCalc::findDelays(to_level)` over every scene at once, after `relevelize`: ONE
+/// level-ordered queue, as the reference's one graph holds every scene's delays and slews. A
+/// visited vertex is recomputed in every scene. A driver enqueues a load if the load's slew
+/// changed beyond fuzzy equality in ANY scene (`loadSlewChanged` over `slewCount()`, every
+/// analysis point); the observer's invalidations are raised in each scene whose delay changed —
+/// the union is the reference's per-vertex OR. A load enqueues its fanout. Check edges at
+/// visited check pins are recomputed after the queue. Each graph must hold its imported state;
+/// it holds the updated one after.
+pub fn find_delays_scenes(incs: &mut [IncTimer], gs: &mut [Graph<'_>], parasitics: &[&HashMap<String, NetParasitics>], to_level: Option<i32>) -> Result<(), String> {
+    for (inc, g) in incs.iter_mut().zip(gs.iter()) {
+        inc.relevelize(g)?;
+        inc.visited.clear();
+    }
+    if !incs[0].delays_exist {
+        // Not incremental: every vertex from the roots (`seedRootSlews`).
+        for ((inc, g), par) in incs.iter_mut().zip(gs.iter_mut()).zip(parasitics) {
+            g.find_delays(par, None)?;
+            inc.delays_exist = true;
+            inc.invalid_delays.clear();
+            inc.delay_queue.clear();
+            inc.invalid_check_edges.clear();
+        }
+        return Ok(());
+    }
+    let indexes: Vec<HashMap<String, usize>> = gs.iter().map(|g| g.pin_index()).collect();
+    // `seedInvalidDelays`: every scene's invalid vertices (alike: one netlist's edits).
+    let mut seed = BTreeSet::new();
+    for inc in incs.iter_mut() {
+        seed.extend(std::mem::take(&mut inc.invalid_delays));
+        seed.extend(std::mem::take(&mut inc.delay_queue));
+    }
+    // The levels, read while the observer writes the rest of the state.
+    let levels = std::mem::take(&mut incs[0].levels);
+    let level_of = |name: &str| levels.get(name).copied().unwrap_or(0);
+    // The queue by level (`BfsIterator`), names kept sorted within a level.
+    let mut by_level = queue_by_level(&levels, seed);
+    let enqueue = |n: String, q: &mut BTreeMap<i32, BTreeSet<String>>| {
+        q.entry(level_of(&n)).or_default().insert(n);
+    };
+    while let Some((&lvl, _)) = by_level.iter().next() {
+        if to_level.is_some_and(|t| lvl > t) {
+            break;
+        }
+        let names = by_level.remove(&lvl).expect("a level");
+        for name in names {
+            let mut fanout_names: BTreeSet<String> = BTreeSet::new();
+            for k in 0..gs.len() {
+                let Some(&v) = indexes[k].get(&name) else { continue };
+                let (inc, g) = (&mut incs[k], &mut gs[k]);
+                inc.visited.push(name.clone());
+                let fanout: Vec<usize> = g.out_edges[v].iter().copied().filter(|&e| !g.is_check(e) && !is_latch_d_to_q(g, e)).map(|e| g.edges[e].to).collect();
+                let is_root = level_of(&name) == 0;
+                if is_root {
+                    // `seedRootSlew`, then every fanout.
+                    g.find_vertex_delays(v, parasitics[k], &indexes[k], None)?;
+                    fanout_names.extend(fanout.iter().map(|&to| g_name(g, to)));
+                } else if g.vertices[v].is_driver {
+                    let wires: Vec<usize> = g.out_edges[v].iter().copied().filter(|&e| matches!(g.edges[e].kind, EdgeKind::Wire)).collect();
+                    let prev_load: Vec<[[f32; 2]; 2]> = wires.iter().map(|&w| g.slew[g.edges[w].to]).collect();
+                    let gates: Vec<usize> = g.in_edges[v].iter().copied().filter(|&e| !g.is_check(e) && !is_latch_d_to_q(g, e) && matches!(g.edges[e].kind, EdgeKind::Gate { .. })).collect();
+                    let prev_gate: Vec<Vec<[f32; 2]>> = gates.iter().map(|&e| g.delay[e].clone()).collect();
+                    g.find_vertex_delays(v, parasitics[k], &indexes[k], None)?;
+                    // The observer: a changed gate delay ([`gate_delay_changed`]), every load's
+                    // wire delay.
+                    let mut changed = false;
+                    for (j, &e) in gates.iter().enumerate() {
+                        let differs = g.delay[e].iter().zip(&prev_gate[j]).any(|(new, prev)| (0..2).any(|mm| gate_delay_changed(prev[mm], new[mm])));
+                        if differs {
+                            changed = true;
+                            inc.required_invalid(g_name(g, g.edges[e].from));
+                            inc.required_invalid(name.clone());
+                        }
+                    }
+                    if changed {
+                        inc.arrival_invalid(name.clone());
+                    }
+                    for (j, &w) in wires.iter().enumerate() {
+                        let load = g.edges[w].to;
+                        inc.arrival_invalid(g_name(g, load));
+                        // `loadSlewChanged`: any of the slews beyond fuzzy equality — in this
+                        // scene; a load any scene enqueues is visited in every scene.
+                        let now = g.slew[load];
+                        let was = prev_load[j];
+                        let differs = (0..2).any(|rf| (0..2).any(|mm| !crate::fuzzy::equal(now[rf][mm], was[rf][mm])));
+                        if differs {
+                            fanout_names.insert(g_name(g, load));
+                        }
+                    }
+                } else {
+                    // A load: its slew comes from its driver; checks at it, then every fanout.
+                    g.find_vertex_delays(v, parasitics[k], &indexes[k], None)?;
+                    inc.enqueue_check_edges(g, v);
+                    fanout_names.extend(fanout.iter().map(|&to| g_name(g, to)));
+                }
+            }
+            for n in fanout_names {
+                enqueue(n, &mut by_level);
+            }
+        }
+    }
+    // Vertices above the queried level stay queued.
+    let rest: BTreeSet<String> = by_level.into_values().flatten().collect();
+    for inc in incs.iter_mut() {
+        inc.delay_queue.extend(rest.iter().cloned());
+    }
+    incs[0].levels = levels;
+    // Timing checks, after the slews they read.
+    for (inc, g) in incs.iter_mut().zip(gs.iter_mut()) {
+        for key in std::mem::take(&mut inc.invalid_check_edges) {
+            if let Some(e) = (0..g.edges.len()).find(|&e| IncTimer::edge_key(g, e) == key) {
+                g.find_check_edge_delays(e);
+                inc.required_invalid(g_name(g, g.edges[e].to));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One scene's recomputed arrivals at a vertex: its index there, the paths, as stored.
+type SceneArrivals = (usize, Vec<Path>, Vec<SPath>);
+
+/// `Search::findArrivals(to_level)` (all with `None`) over every scene's imported paths at once:
+/// ONE queue from the invalid vertices, level by level, as the reference's vertex holds every
+/// scene's paths in one tag group. A vertex's arrivals changed if they did in ANY scene
+/// (`arrivalsChanged` over the whole group); then every scene's are stored — the same tag group
+/// keeps its array, else ONE new array for the vertex (a new generation in every scene) — and the
+/// fanout enqueued; an unchanged vertex keeps what it had and enqueues nothing.
+pub fn find_arrivals_scenes(incs: &mut [IncTimer], searches: &mut [Search<'_, '_>], to_level: Option<i32>) -> Result<(), String> {
+    for inc in incs.iter_mut() {
+        inc.arrival_visits.clear();
+    }
+    if !incs[0].arrivals_exist {
+        for (inc, search) in incs.iter_mut().zip(searches.iter_mut()) {
+            search.find_arrivals()?;
+            inc.arrivals_exist = true;
+            inc.invalid_arrivals.clear();
+            inc.arrival_queue.clear();
+            inc.store_all(search);
+        }
+        return Ok(());
+    }
+    let indexes: Vec<HashMap<String, usize>> = searches.iter().map(|s| s.graph.pin_index()).collect();
+    let mut seed = BTreeSet::new();
+    for inc in incs.iter_mut() {
+        seed.extend(std::mem::take(&mut inc.invalid_arrivals));
+        seed.extend(std::mem::take(&mut inc.arrival_queue));
+    }
+    let levels = incs[0].levels.clone();
+    let mut by_level = queue_by_level(&levels, seed);
+    while let Some((&lvl, _)) = by_level.iter().next() {
+        if to_level.is_some_and(|t| lvl > t) {
+            break;
+        }
+        for name in by_level.remove(&lvl).expect("a level") {
+            // Every scene's new paths, then the vertex's verdict.
+            let mut news: Vec<Option<SceneArrivals>> = Vec::with_capacity(searches.len());
+            let mut changed = false;
+            let mut same_group = true;
+            for k in 0..searches.len() {
+                let Some(&v) = indexes[k].get(&name) else {
+                    news.push(None);
+                    continue;
+                };
+                let g = searches[k].graph;
+                let new: Vec<Path> = searches[k].arrival_paths(v);
+                let snew: Vec<SPath> = new.iter().map(|p| incs[k].spath(g, p)).collect();
+                changed |= IncTimer::arrivals_changed(incs[k].paths.get(&name), &snew);
+                // `setVertexArrivals`: the same tag group keeps its array.
+                same_group &= incs[k].paths.get(&name).is_some_and(|o| o.len() == snew.len() && o.iter().all(|p| snew.iter().any(|q| q.tag == p.tag)));
+                news.push(Some((v, new, snew)));
+            }
+            for inc in incs.iter_mut() {
+                inc.arrival_visits.push((name.clone(), changed));
+            }
+            if !changed {
+                continue;
+            }
+            if !same_group {
+                let generation = incs.iter().map(|i| i.next_gen).max().unwrap_or(0) + 1;
+                for inc in incs.iter_mut() {
+                    inc.next_gen = generation;
+                    inc.path_gen.insert(name.clone(), generation);
+                }
+            }
+            let mut fanout_names: BTreeSet<String> = BTreeSet::new();
+            for (k, item) in news.into_iter().enumerate() {
+                let Some((v, new, snew)) = item else { continue };
+                let g = searches[k].graph;
+                for &e in &g.out_edges[v] {
+                    if g.is_check(e) || is_latch_d_to_q(g, e) {
+                        continue;
+                    }
+                    fanout_names.insert(g_name(g, g.edges[e].to));
+                }
+                // A new path's required is 0 (`Path::Path`) until the required visit the change
+                // invalidates — which compares against that 0.
+                let mut stored = snew;
+                for p in stored.iter_mut() {
+                    p.required = 0.0;
+                }
+                searches[k].paths[v] = new.into_iter().map(|mut p| {
+                    p.required = 0.0;
+                    p
+                }).collect();
+                let inc = &mut incs[k];
+                inc.paths.insert(name.clone(), stored);
+                inc.required_invalid(name.clone());
+                // `constrainedRequiredsInvalid`: a clock arrival at a check clock pin changes the
+                // required at the data pins it constrains.
+                let is_clk = searches[k].paths[v].iter().any(|p| p.tag.is_clock);
+                if is_clk && !g.vertices[v].is_driver {
+                    for &e in &g.out_edges[v] {
+                        if g.is_check(e) {
+                            inc.required_invalid(g_name(g, g.edges[e].to));
+                        }
+                    }
+                }
+            }
+            for n in fanout_names {
+                by_level.entry(levels.get(&n).copied().unwrap_or(0)).or_default().insert(n);
+            }
+        }
+    }
+    let rest: BTreeSet<String> = by_level.into_values().flatten().collect();
+    for inc in incs.iter_mut() {
+        inc.arrival_queue.extend(rest.iter().cloned());
+    }
+    Ok(())
+}
+
+/// `Search::findRequireds(level)` (all with `None`) over every scene at once: ONE queue from the
+/// invalid vertices, highest level first down to `level`; each visited vertex's requireds are
+/// stored in every scene, and its fanin enqueued if one changed beyond fuzzy equality in ANY
+/// scene (the vertex's whole tag group).
+pub fn find_requireds_scenes(incs: &mut [IncTimer], searches: &mut [Search<'_, '_>], down_to_level: Option<i32>) -> Result<(), String> {
+    for inc in incs.iter_mut() {
+        inc.required_visits.clear();
+    }
+    if !incs[0].requireds_exist {
+        for (inc, search) in incs.iter_mut().zip(searches.iter_mut()) {
+            search.find_requireds()?;
+            inc.requireds_exist = true;
+            inc.invalid_requireds.clear();
+            inc.required_queue.clear();
+            inc.store_all(search);
+        }
+        return Ok(());
+    }
+    let indexes: Vec<HashMap<String, usize>> = searches.iter().map(|s| s.graph.pin_index()).collect();
+    let mut seed = BTreeSet::new();
+    for inc in incs.iter_mut() {
+        seed.extend(std::mem::take(&mut inc.invalid_requireds));
+        seed.extend(std::mem::take(&mut inc.required_queue));
+    }
+    let levels = incs[0].levels.clone();
+    let mut by_level = queue_by_level(&levels, seed);
+    while let Some((&lvl, _)) = by_level.iter().next_back() {
+        if down_to_level.is_some_and(|t| lvl < t) {
+            break;
+        }
+        for name in by_level.remove(&lvl).expect("a level") {
+            let mut changed = false;
+            let mut fanin_names: BTreeSet<String> = BTreeSet::new();
+            for k in 0..searches.len() {
+                let Some(&v) = indexes[k].get(&name) else { continue };
+                let search = &mut searches[k];
+                let g = search.graph;
+                let req = search.required_values(v);
+                for (p, r) in search.paths[v].iter_mut().zip(req) {
+                    if !crate::fuzzy::equal(p.required, r) {
+                        changed = true;
+                    }
+                    p.required = r;
+                }
+                if let Some(stored) = incs[k].paths.get_mut(&name) {
+                    for sp in stored.iter_mut() {
+                        if let Some(p) = search.paths[v].iter().find(|p| IncTimer::stag(g, &p.tag) == sp.tag) {
+                            sp.required = p.required;
+                        }
+                    }
+                }
+                for &e in &g.in_edges[v] {
+                    if g.is_check(e) || is_latch_d_to_q(g, e) {
+                        continue;
+                    }
+                    fanin_names.insert(g_name(g, g.edges[e].from));
+                }
+            }
+            for inc in incs.iter_mut() {
+                inc.required_visits.push((name.clone(), changed));
+            }
+            if changed {
+                for n in fanin_names {
+                    by_level.entry(levels.get(&n).copied().unwrap_or(0)).or_default().insert(n);
+                }
+            }
+        }
+    }
+    let rest: BTreeSet<String> = by_level.into_values().flatten().collect();
+    for inc in incs.iter_mut() {
+        inc.required_queue.extend(rest.iter().cloned());
+    }
+    Ok(())
 }
 
 impl IncTimer {
@@ -872,6 +967,38 @@ mod tests {
         assert_eq!(inc.visited[..3], ["b1/X".to_string(), "b2/A".into(), "b2/X".into()]);
         // b2's output slew is unchanged (its load is the same), so b3 is not revisited.
         assert!(!inc.visited.iter().any(|v| v.starts_with("b3")), "{:?}", inc.visited);
+    }
+
+    // Rule (loadSlewChanged over `slewCount()`: every scene's analysis points): one queue serves
+    // every scene, so a load whose slew changed in ANY scene is re-timed in all of them — a scene
+    // timed alone would stop where its own slews did not change.
+    #[test]
+    fn a_load_slew_change_in_one_scene_retimes_every_scene() {
+        let la = libs();
+        // Scene b: `big` has `buf`'s input capacitance, so b1's load does not change there.
+        let lb = vec![Library::read(&parse(&LIB.replace("capacitance : 0.5;", "capacitance : 0.001;")).unwrap()).unwrap()];
+        let (nl, nl2) = (chain("buf"), chain("big"));
+        let par = HashMap::new();
+        let mut incs = vec![IncTimer::default(), IncTimer::default()];
+        let mut gs = vec![Graph::build(&la, &nl).unwrap(), Graph::build(&lb, &nl).unwrap()];
+        find_delays_scenes(&mut incs, &mut gs, &[&par, &par], None).unwrap();
+        let mut alone = incs[1].clone();
+        for (inc, g) in incs.iter_mut().zip(&gs) {
+            inc.export(g);
+        }
+        alone.export(&gs[1]);
+        let mut gs = vec![Graph::build(&la, &nl2).unwrap(), Graph::build(&lb, &nl2).unwrap()];
+        for (inc, g) in incs.iter_mut().zip(gs.iter_mut()) {
+            inc.import(g);
+            inc.invalid_delays.insert("b1/X".into());
+        }
+        find_delays_scenes(&mut incs, &mut gs, &[&par, &par], None).unwrap();
+        assert_eq!(incs[1].visited[..3], ["b1/X".to_string(), "b2/A".into(), "b2/X".into()], "scene b follows scene a's change");
+        let mut gb = Graph::build(&lb, &nl2).unwrap();
+        alone.import(&mut gb);
+        alone.invalid_delays.insert("b1/X".into());
+        alone.find_delays(&mut gb, &par, None).unwrap();
+        assert_eq!(alone.visited, ["b1/X"], "timed alone, scene b stops at b1");
     }
 
     // Rule (annotateDelaySlew, tolerance 0): the relative test, not inequality — and the two
