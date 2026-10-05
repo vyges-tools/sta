@@ -24,6 +24,7 @@ pub mod liberty;
 pub mod liberty_parse;
 pub mod netlist;
 pub mod parasitics;
+pub mod path_enum;
 pub mod sdc;
 pub mod search;
 pub mod table;

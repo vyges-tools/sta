@@ -26,7 +26,7 @@ use crate::liberty::{Role, MAX, MIN};
 use crate::sdc::{hold_required_time, setup_required_time, Sdc};
 
 /// The min/max initial value (`INF` = 1e30).
-const INF: f32 = 1e30;
+pub(crate) const INF: f32 = 1e30;
 
 /// A tag's CRPR clock path: the vertex (its id orders tags) and that path's own tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -49,7 +49,7 @@ pub struct Tag {
 
 impl Tag {
     /// `TagMatchLess(match_crpr_clk_pin = true)` key: the CRPR path compares by its vertex's id.
-    fn key(&self, vertex_id: &[usize]) -> (usize, usize, i64, bool, i64) {
+    pub(crate) fn key(&self, vertex_id: &[usize]) -> (usize, usize, i64, bool, i64) {
         (self.rf, self.mm, self.clk_edge.map_or(-1, |e| e as i64), self.is_clock, self.crpr.map_or(-1, |c| vertex_id[c.vertex] as i64))
     }
 
@@ -59,7 +59,7 @@ impl Tag {
     }
 
     /// Everything but the CRPR clock pin.
-    fn matches_no_crpr(&self, other: &Tag) -> bool {
+    pub(crate) fn matches_no_crpr(&self, other: &Tag) -> bool {
         self.rf == other.rf && self.mm == other.mm && self.clk_edge == other.clk_edge && self.is_clock == other.is_clock
     }
 
@@ -87,9 +87,9 @@ pub struct Path {
 }
 
 /// One arc of an edge as the search walks it.
-struct ArcRef {
-    index: usize,
-    to_rf: usize,
+pub(crate) struct ArcRef {
+    pub(crate) index: usize,
+    pub(crate) to_rf: usize,
 }
 
 /// Paths keyed by tag, in insertion order until sorted.
@@ -123,7 +123,7 @@ pub struct Search<'g, 'a> {
     /// Each vertex's paths, in tag order.
     pub paths: Vec<Vec<Path>>,
     /// Vertex id order (the order vertices were created in), which orders CRPR tags.
-    vertex_id: Vec<usize>,
+    pub(crate) vertex_id: Vec<usize>,
     input_delay: HashMap<String, usize>,
     output_delay: HashMap<String, usize>,
     /// A vertex whose out-edges include a clock-to-Q arc.
@@ -171,19 +171,19 @@ impl<'g, 'a> Search<'g, 'a> {
         Search { graph, sdc, paths: vec![Vec::new(); n], vertex_id, input_delay, output_delay, is_reg_clk, level }
     }
 
-    fn role(&self, e: usize) -> Option<Role> {
+    pub(crate) fn role(&self, e: usize) -> Option<Role> {
         match self.graph.edges[e].kind {
             EdgeKind::Gate { set } => Some(self.graph.arc_set(e, set).role),
             EdgeKind::Wire => None,
         }
     }
 
-    fn is_check(&self, e: usize) -> bool {
+    pub(crate) fn is_check(&self, e: usize) -> bool {
         self.role(e).is_some_and(is_check_role)
     }
 
     /// The (at most two) arcs from `from_rf`, in arc order.
-    fn arcs_from(&self, e: usize, from_rf: usize) -> Vec<ArcRef> {
+    pub(crate) fn arcs_from(&self, e: usize, from_rf: usize) -> Vec<ArcRef> {
         match self.graph.edges[e].kind {
             EdgeKind::Wire => vec![ArcRef { index: from_rf, to_rf: from_rf }],
             EdgeKind::Gate { set } => self.graph.arc_set(e, set).arcs.iter().enumerate().filter(|(_, a)| a.from_rf == from_rf).map(|(k, a)| ArcRef { index: k, to_rf: a.to_rf }).collect(),
@@ -196,7 +196,7 @@ impl<'g, 'a> Search<'g, 'a> {
 
     /// For the roles this subset has: the tag a path takes through
     /// one arc, the arc's delay, and the arrival it arrives with.
-    fn visit_from_path(&self, from_v: usize, from: &Path, e: usize, arc: &ArcRef) -> Option<(Tag, f32, f32)> {
+    pub(crate) fn visit_from_path(&self, from_v: usize, from: &Path, e: usize, arc: &ArcRef) -> Option<(Tag, f32, f32)> {
         let to_v = self.graph.edges[e].to;
         let mm = from.tag.mm;
         let delay = self.arc_delay(e, arc.index, mm);
@@ -520,7 +520,7 @@ impl<'g, 'a> Search<'g, 'a> {
     }
 
     /// The fanin path the arrival came from.
-    fn prev_path(&self, p: &Path) -> Option<(usize, &Path)> {
+    pub fn prev_path(&self, p: &Path) -> Option<(usize, &Path)> {
         let prev = p.prev?;
         self.paths[prev.vertex].iter().find(|q| q.tag.matches(&prev.tag)).map(|q| (prev.vertex, q))
     }
