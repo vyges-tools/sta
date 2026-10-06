@@ -111,6 +111,12 @@ pub struct SdcEnv {
     pub input_slew: HashMap<String, [[Option<f32>; 2]; 2]>,
     /// `set_driving_cell` on an input port (both min and max, rise and fall).
     pub input_drive: HashMap<String, InputDrive>,
+    /// The pins the logic simulation holds constant (`Sim::isConstant`: a signal pin on a power or
+    /// ground net, and what propagates from it), by name, with their values. Delay calculation
+    /// takes no arc FROM one (`DcalcPred::searchFrom`); the search neither leaves nor enters one
+    /// (`SearchPred0`), and on an instance with one it disables conditional arcs and arcs by their
+    /// sense under the constants (`Sim::findDisabledEdges`).
+    pub constants: HashMap<String, bool>,
 }
 
 /// One `set_driving_cell`: the cell (the first library holding it), the port it drives from
@@ -518,6 +524,11 @@ impl<'a> Graph<'a> {
         Ok(())
     }
 
+    /// Whether the simulation holds vertex `v` constant ([`SdcEnv::constants`]).
+    pub fn is_constant(&self, v: usize) -> bool {
+        !self.sdc.constants.is_empty() && self.sdc.constants.contains_key(&self.vertices[v].name)
+    }
+
     /// Every vertex's index by name (the parasitics name their nodes by pin).
     pub fn pin_index(&self) -> HashMap<String, usize> {
         self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect()
@@ -599,6 +610,10 @@ impl<'a> Graph<'a> {
                 return Err("latch D->Q arcs are not modelled".into());
             }
             let from = self.edges[e].from;
+            // `findDriverEdgeDelays`: no arc from a constant pin (`DcalcPred::searchFrom`).
+            if self.is_constant(from) {
+                continue;
+            }
             let ideal_clk_to_q = self.arc_set(e, set).role == Role::RegClkToQ && self.ideal_clock.contains(&from);
             for mm in [MIN, MAX] {
                 for (k, arc) in arcs.iter().enumerate() {

@@ -144,6 +144,176 @@ pub struct Search<'g, 'a> {
     internal_from_break: Vec<bool>,
     internal_to: Vec<bool>,
     internal_to_break: Vec<bool>,
+    /// Per edge, `Sim::isDisabledCond` and `Sim::simTimingSense` on instances with a constant pin.
+    sim: SimEdges,
+}
+
+/// `Sim::functionSense`'s answer for an edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimSense {
+    Unknown,
+    Positive,
+    Negative,
+    NonUnate,
+    None,
+}
+
+/// The edges `Sim::findDisabledEdges` annotates.
+#[derive(Debug, Clone, Default)]
+struct SimEdges {
+    disabled_cond: Vec<bool>,
+    sense: Vec<SimSense>,
+    /// What could not be annotated (too many free inputs to enumerate).
+    error: Option<String>,
+}
+
+/// A function's value with every port given (`value`).
+fn eval_func(e: &crate::func_expr::FuncExpr, value: &dyn Fn(&str) -> bool) -> bool {
+    use crate::func_expr::FuncExpr as F;
+    match e {
+        F::Port(p) => value(p),
+        F::One => true,
+        F::Zero => false,
+        F::Not(a) => !eval_func(a, value),
+        F::And(a, b) => eval_func(a, value) && eval_func(b, value),
+        F::Or(a, b) => eval_func(a, value) || eval_func(b, value),
+        F::Xor(a, b) => eval_func(a, value) != eval_func(b, value),
+    }
+}
+
+fn func_ports(e: &crate::func_expr::FuncExpr, out: &mut Vec<String>) {
+    use crate::func_expr::FuncExpr as F;
+    match e {
+        F::Port(p) => {
+            if !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
+        F::Not(a) => func_ports(a, out),
+        F::And(a, b) | F::Or(a, b) | F::Xor(a, b) => {
+            func_ports(a, out);
+            func_ports(b, out);
+        }
+        F::One | F::Zero => {}
+    }
+}
+
+/// Every assignment of the ports `fixed` leaves free (but `skip`), as a lookup.
+const MAX_FREE: usize = 16;
+
+fn free_ports(e: &crate::func_expr::FuncExpr, fixed: &dyn Fn(&str) -> Option<bool>, skip: Option<&str>) -> Result<Vec<String>, String> {
+    let mut ports = Vec::new();
+    func_ports(e, &mut ports);
+    ports.retain(|p| fixed(p).is_none() && Some(p.as_str()) != skip);
+    if ports.len() > MAX_FREE {
+        return Err(format!("{} free inputs", ports.len()));
+    }
+    Ok(ports)
+}
+
+/// `Sim::evalExpr`: the function's value under the constants — 0 or 1 when every assignment of the
+/// free ports agrees (the BDD is a constant), else unknown.
+fn eval_exact(e: &crate::func_expr::FuncExpr, fixed: &dyn Fn(&str) -> Option<bool>) -> Result<Option<bool>, String> {
+    let free = free_ports(e, fixed, None)?;
+    let mut seen = [false; 2];
+    for bits in 0..1u32 << free.len() {
+        let v = eval_func(e, &|p| free.iter().position(|f| f == p).map_or_else(|| fixed(p).unwrap_or(false), |k| (bits >> k) & 1 == 1));
+        seen[usize::from(v)] = true;
+    }
+    Ok(match seen {
+        [true, false] => Some(false),
+        [false, true] => Some(true),
+        _ => None,
+    })
+}
+
+/// `Sim::functionSense`: increasing and decreasing in `input` over every assignment of the other
+/// free ports (`Cudd_Increasing` / `Cudd_Decreasing`); both — independent — is none.
+fn function_sense(e: &crate::func_expr::FuncExpr, input: &str, fixed: &dyn Fn(&str) -> Option<bool>) -> Result<SimSense, String> {
+    let free = free_ports(e, fixed, Some(input))?;
+    let (mut increasing, mut decreasing) = (true, true);
+    for bits in 0..1u32 << free.len() {
+        let at = |x: bool| eval_func(e, &|p| if p == input { x } else { free.iter().position(|f| f == p).map_or_else(|| fixed(p).unwrap_or(false), |k| (bits >> k) & 1 == 1) });
+        let (lo, hi) = (at(false), at(true));
+        increasing &= !lo || hi;
+        decreasing &= lo || !hi;
+    }
+    Ok(match (increasing, decreasing) {
+        (true, true) => SimSense::None,
+        (true, false) => SimSense::Positive,
+        (false, true) => SimSense::Negative,
+        (false, false) => SimSense::NonUnate,
+    })
+}
+
+/// `Sim::findDisabledEdges` over the instances with a constant pin: per gate edge, its sense
+/// (`functionSense`: none from a constant; the to-port function's sense in the from-port when the
+/// function names it; else unknown) and, unless none, `isDisabledCond` (its `when` evaluates to 0;
+/// a default arc set — no `when` — when another arc set between the same ports evaluates to 1).
+fn sim_edges(graph: &Graph<'_>) -> SimEdges {
+    let n = graph.edges.len();
+    let mut sim = SimEdges { disabled_cond: vec![false; n], sense: vec![SimSense::Unknown; n], error: None };
+    let constants = &graph.sdc.constants;
+    if constants.is_empty() {
+        return sim;
+    }
+    let inst_name = |v: usize| match &graph.vertices[v].conn {
+        crate::netlist::Conn::Inst(i, _) => Some(graph.netlist.insts[*i].0.as_str()),
+        crate::netlist::Conn::Port(_) => None,
+    };
+    let annotated: std::collections::HashSet<&str> = graph.vertices.iter().enumerate().filter(|(_, x)| constants.contains_key(&x.name)).filter_map(|(v, _)| inst_name(v)).collect();
+    for (e, ed) in graph.edges.iter().enumerate() {
+        let EdgeKind::Gate { set } = ed.kind else { continue };
+        let Some(inst) = inst_name(ed.to) else { continue };
+        if !annotated.contains(inst) {
+            continue;
+        }
+        let to = &graph.vertices[ed.to];
+        let (Some(lib), Some(cell_name)) = (to.lib, to.cell.as_deref()) else { continue };
+        let cell = &graph.libs[lib].cells[cell_name];
+        let arc_set = &cell.arc_sets[set];
+        let fixed = |p: &str| constants.get(&format!("{inst}/{p}")).copied();
+        let parse = |f: &str| crate::func_expr::FuncExpr::parse(f).ok();
+        let sense = if graph.is_constant(ed.from) {
+            Ok(SimSense::None)
+        } else {
+            match cell.ports.iter().find(|p| p.name == arc_set.to).and_then(|p| p.function.as_deref()).and_then(parse) {
+                Some(f) => {
+                    let mut ports = Vec::new();
+                    func_ports(&f, &mut ports);
+                    if ports.contains(&arc_set.from) {
+                        function_sense(&f, &arc_set.from, &fixed)
+                    } else {
+                        Ok(SimSense::Unknown)
+                    }
+                }
+                None => Ok(SimSense::Unknown),
+            }
+        };
+        let sense = match sense {
+            Ok(s) => s,
+            Err(why) => {
+                sim.error.get_or_insert(format!("{inst}/{}: {why} under constants", arc_set.to));
+                continue;
+            }
+        };
+        sim.sense[e] = sense;
+        if sense == SimSense::None {
+            continue;
+        }
+        let cond_is = |c: &str, want: bool| -> Result<bool, String> { Ok(parse(c).map(|f| eval_exact(&f, &fixed)).transpose()?.flatten() == Some(want)) };
+        let disabled = match arc_set.cond.as_deref() {
+            Some(c) => cond_is(c, false),
+            None => cell.arc_sets.iter().filter(|o| o.from == arc_set.from && o.to == arc_set.to).filter_map(|o| o.cond.as_deref()).try_fold(false, |d, c| Ok::<bool, String>(d || cond_is(c, true)?)),
+        };
+        match disabled {
+            Ok(d) => sim.disabled_cond[e] = d,
+            Err(why) => {
+                sim.error.get_or_insert(format!("{inst}: a when condition: {why} under constants"));
+            }
+        }
+    }
+    sim
 }
 
 fn is_check_role(r: Role) -> bool {
@@ -204,22 +374,45 @@ impl<'g, 'a> Search<'g, 'a> {
                 }
             }
         }
-        Search { graph, sdc, paths: vec![Vec::new(); n], vertex_id, input_delay, output_delay, is_reg_clk, level, internal_from, internal_from_break, internal_to, internal_to_break }
+        let sim = sim_edges(graph);
+        Search { graph, sdc, paths: vec![Vec::new(); n], vertex_id, input_delay, output_delay, is_reg_clk, level, internal_from, internal_from_break, internal_to, internal_to_break, sim }
     }
 
-    /// `SearchThru::searchTo`: fanin paths are broken at a path delay's internal `-from` pin.
+    /// `SearchThru::searchTo`: fanin paths are broken at a path delay's internal `-from` pin, and
+    /// a constant is never entered (`SearchPred0::searchTo`).
     fn search_to(&self, v: usize) -> bool {
-        !self.internal_from_break[v]
+        !self.internal_from_break[v] && !self.graph.is_constant(v)
+    }
+
+    /// `SearchPred0::searchFrom`: nothing leaves a constant.
+    fn search_from(&self, v: usize) -> bool {
+        !self.graph.is_constant(v)
     }
 
     /// `hasFanin(vertex, search_thru_)`: searched to, over a non-check edge.
     fn has_fanin(&self, v: usize) -> bool {
-        self.search_to(v) && self.graph.in_edges[v].iter().any(|&e| !self.is_check(e))
+        self.search_to(v) && self.graph.in_edges[v].iter().any(|&e| self.search_thru(e) && self.search_from(self.graph.edges[e].from))
+    }
+
+    /// `SearchPred0::searchThru`: not a check, not disabled by a `when` under the constants, not of
+    /// sense none.
+    fn search_thru(&self, e: usize) -> bool {
+        !self.is_check(e) && !self.sim.disabled_cond[e] && self.sim.sense[e] != SimSense::None
+    }
+
+    /// `searchThruTimingSense`: the arc's transitions against the edge's sense under constants.
+    fn search_thru_sense(&self, e: usize, from_rf: usize, to_rf: usize) -> bool {
+        match self.sim.sense[e] {
+            SimSense::Positive => from_rf == to_rf,
+            SimSense::Negative => from_rf != to_rf,
+            SimSense::None => false,
+            SimSense::Unknown | SimSense::NonUnate => true,
+        }
     }
 
     /// `hasFanout(vertex, search_thru_)`: a non-check edge to a vertex searched to.
     pub fn has_fanout(&self, v: usize) -> bool {
-        self.graph.out_edges[v].iter().any(|&e| !self.is_check(e) && self.search_to(self.graph.edges[e].to))
+        self.search_from(v) && self.graph.out_edges[v].iter().any(|&e| self.search_thru(e) && self.search_to(self.graph.edges[e].to))
     }
 
     /// `Search::isEndpoint`: with fanin, and a timing check, or a constrained end (a top output, an
@@ -273,7 +466,7 @@ impl<'g, 'a> Search<'g, 'a> {
     /// one arc, the arc's delay, and the arrival it arrives with.
     pub(crate) fn visit_from_path(&self, from_v: usize, from: &Path, e: usize, arc: &ArcRef) -> Option<(Tag, f32, f32)> {
         let to_v = self.graph.edges[e].to;
-        if !self.search_to(to_v) {
+        if !self.search_from(from_v) || !self.search_to(to_v) || self.sim.disabled_cond[e] || !self.search_thru_sense(e, from.tag.rf, arc.to_rf) {
             return None;
         }
         let mm = from.tag.mm;
@@ -346,6 +539,9 @@ impl<'g, 'a> Search<'g, 'a> {
     /// `-ignore_clock_latency` only with no clock; an internal `-from` to a checked pin only with no
     /// clock; at most 64.
     pub fn constraints_modelled(&self) -> Result<(), String> {
+        if let Some(why) = &self.sim.error {
+            return Err(format!("{why}: not modelled"));
+        }
         // `seedArrivals`: an unclocked register clock pin is seeded as a segment start — not here.
         if self.sdc.clock.is_none() && self.is_reg_clk.iter().any(|&r| r) {
             return Err("registers with no clock: not modelled".into());

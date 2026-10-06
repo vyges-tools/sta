@@ -415,6 +415,27 @@ pub fn find_delays_scenes(incs: &mut [IncTimer], gs: &mut [Graph<'_>], parasitic
                             fanout_names.insert(g_name(g, load));
                         }
                     }
+                    // `visitFanouts` also reaches a GATE fanout of the driver (an output-to-output
+                    // arc, a full adder's CON -> SN). `loadSlewChanged` looks its pin up in the load
+                    // index map, where `operator[]` inserts it at index 0: its slews are compared
+                    // with the previous slews of the net's FIRST load (in the reference's out-edge
+                    // order, which follows edit history) — or, with no loads, it is enqueued.
+                    for &e in g.out_edges[v].iter().filter(|&&e| matches!(g.edges[e].kind, EdgeKind::Gate { .. }) && !g.is_check(e) && !is_latch_d_to_q(g, e)) {
+                        let to = g.edges[e].to;
+                        let now = g.slew[to];
+                        let verdicts: BTreeSet<bool> = prev_load.iter().map(|was| (0..2).any(|rf| (0..2).any(|mm| !crate::fuzzy::equal(now[rf][mm], was[rf][mm])))).collect();
+                        match verdicts.len() {
+                            0 => {
+                                fanout_names.insert(g_name(g, to));
+                            }
+                            1 => {
+                                if verdicts.contains(&true) {
+                                    fanout_names.insert(g_name(g, to));
+                                }
+                            }
+                            _ => return Err(format!("{}: whether gate fanout {} is re-timed depends on the first load's previous slew (edit-history order): not modelled", name, g_name(g, to))),
+                        }
+                    }
                 } else {
                     // A load: its slew comes from its driver; checks at it, then every fanout.
                     g.find_vertex_delays(v, parasitics[k], &indexes[k], None)?;
