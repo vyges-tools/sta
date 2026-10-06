@@ -35,12 +35,15 @@ pub struct PortDelay {
     /// Which `[rf][min/max]` values the constraint sets (`RiseFallMinMax::exists`): a missing
     /// one makes no path end for that transition and min/max.
     pub exists: [[bool; 2]; 2],
+    /// The index of the clock it is relative to (its RISE edge) in [`Sdc::clocks`].
+    pub clock: usize,
 }
 
 impl PortDelay {
-    /// The same value for every transition and min/max (`set_*_delay <value>`).
+    /// The same value for every transition and min/max (`set_*_delay <value>`), relative to the
+    /// first clock.
     pub fn uniform(port: &str, value: f32) -> PortDelay {
-        PortDelay { port: port.into(), delay: [[value; 2]; 2], exists: [[true; 2]; 2] }
+        PortDelay { port: port.into(), delay: [[value; 2]; 2], exists: [[true; 2]; 2], clock: 0 }
     }
 }
 
@@ -132,8 +135,9 @@ impl States {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sdc {
-    /// The one clock, or none (nothing clocked: every path is unclocked).
-    pub clock: Option<Clock>,
+    /// The clocks, in the order they were made (`Clock::index`): a clock edge's index is the
+    /// clock's times 2 plus its transition (`ClockEdge::index`). None: every path is unclocked.
+    pub clocks: Vec<Clock>,
     pub input_delays: Vec<PortDelay>,
     pub output_delays: Vec<PortDelay>,
     /// In the order they were made (their ids). At most 64.
@@ -216,69 +220,135 @@ pub fn sta_to_user(value: f32, scale: f32) -> f64 {
     f64::from(value) / f64::from(scale)
 }
 
-/// The setup required time between two edges of the SAME clock: the target edge the
-/// soonest strictly (fuzzily) after the source edge, as `target time − source cycle start`,
-/// computed in `double` and stored `float`.
-///
-/// Rule: target cycles are walked from the first, source cycles from the first within
-/// each; the first pairing with the smallest delay wins (fuzzily less than the incumbent).
-/// For one clock and edges inside one period this is the target edge of cycle 0 when it is after
-/// the source edge, else of cycle 1.
-pub fn setup_required_time(clock: &Clock, src_rf: usize, tgt_rf: usize) -> f32 {
-    let period = f64::from(clock.period);
-    let src_time = f64::from(clock.edge_time(src_rf));
-    let tgt_edge = f64::from(clock.edge_time(tgt_rf));
-    let mut best: Option<(f64, f64)> = None;
-    for tgt_cycle in 0..=2 {
-        let tgt_time = f64::from(tgt_cycle) * period + tgt_edge;
-        for src_cycle in 0..=1 {
-            let src_cycle_start = f64::from(src_cycle) * period;
-            let src = src_cycle_start + src_time;
-            if crate::fuzzy::greater(tgt_time as f32, src as f32) {
-                let delay = tgt_time - src;
-                if best.is_none_or(|(d, _)| crate::fuzzy::less(delay as f32, d as f32)) {
-                    best = Some((delay, tgt_time - src_cycle_start));
-                }
-            }
-        }
-    }
-    best.map_or(0.0, |(_, r)| r as f32)
+/// The check roles `CycleAccting` keeps that this timer reads.
+pub const ACCT_SETUP: usize = 0;
+pub const ACCT_HOLD: usize = 1;
+pub const ACCT_LATCH_SETUP: usize = 2;
+/// The gated clock hold check: in the same cycle as the setup check.
+pub const ACCT_GCLK_HOLD: usize = 3;
+
+/// `CycleAccting` between a source and a target clock edge: per role ([`ACCT_SETUP`],
+/// [`ACCT_HOLD`], [`ACCT_LATCH_SETUP`]) the required time and the source and target cycles.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Accting {
+    pub required: [f32; 4],
+    pub src_cycle: [i32; 4],
+    pub tgt_cycle: [i32; 4],
 }
 
-/// `CycleAccting` for the latch setup role between two edges of the SAME clock: the target's
-/// OPPOSITE (disable) edge the soonest strictly (fuzzily) after the source edge; the enable time is
-/// the target edge before that disable. Returns `(required, source cycle, target cycle)`:
-/// `enable time − source cycle start` in `double` stored `float`, and the cycles of the pairing.
-///
-/// Rule: target cycles walked from the first, source cycles from the first within each; the first
-/// pairing with the smallest `disable − source` wins (fuzzily less than the incumbent).
-pub fn latch_setup_accting(clock: &Clock, src_rf: usize, tgt_rf: usize) -> (f32, i32, i32) {
-    let period = f64::from(clock.period);
-    let src_time = f64::from(clock.edge_time(src_rf));
-    let tgt_edge = f64::from(clock.edge_time(tgt_rf));
-    let tgt_opp = f64::from(clock.edge_time(1 - tgt_rf));
-    let mut best: Option<(f64, f64, i32, i32)> = None;
-    for tgt_cycle in 0..=2 {
-        let tgt_cycle_start = f64::from(tgt_cycle) * period;
-        let tgt_time = tgt_cycle_start + tgt_edge;
-        let tgt_opp_time = tgt_cycle_start + tgt_opp;
-        for src_cycle in 0..=1 {
-            let src_cycle_start = f64::from(src_cycle) * period;
-            let src = src_cycle_start + src_time;
-            if crate::fuzzy::greater(tgt_opp_time as f32, src as f32) {
-                let delay = tgt_opp_time - src;
-                if best.is_none_or(|(d, ..)| crate::fuzzy::less(delay as f32, d as f32)) {
-                    let (mut latch_tgt_time, mut latch_tgt_cycle) = (tgt_time, tgt_cycle);
-                    if tgt_time > tgt_opp_time {
-                        latch_tgt_time -= period;
-                        latch_tgt_cycle -= 1;
-                    }
-                    best = Some((delay, latch_tgt_time - src_cycle_start, src_cycle, latch_tgt_cycle));
+impl Accting {
+    /// `CycleAccting::sourceTimeOffset − targetTimeOffset` for a role: the cycles times their
+    /// clocks' periods (`float`).
+    pub fn shift(&self, role: usize, src: &Clock, tgt: &Clock) -> f32 {
+        (self.src_cycle[role] as f32 * src.period) - (self.tgt_cycle[role] as f32 * tgt.period)
+    }
+}
+
+/// `CycleAccting::firstCycle`.
+fn first_cycle(time: f32, period: f32) -> i32 {
+    if time < 0.0 {
+        1
+    } else if time < period {
+        0
+    } else {
+        -1
+    }
+}
+
+/// `CycleAccting::findDelays` for edge `src_rf` of `src` launching and edge `tgt_rf` of `tgt`
+/// capturing. Target cycles walked from the first (up to 100, or 1000 and more for a faster
+/// target), source cycles from the first within each; per pairing in `double`: setup — the
+/// target strictly (fuzzily) after the source; latch setup — the target's OPPOSITE edge strictly
+/// after the source, the enable the target edge before it; hold — the target at or before the
+/// source. Each keeps the first pairing with the fuzzily least delay (delays and requireds stored
+/// `float`, every fuzzy test in `float`); the walk ends once both setup and hold are found and the
+/// cycle starts coincide.
+pub fn cycle_accting(src: &Clock, src_rf: usize, tgt: &Clock, tgt_rf: usize) -> Accting {
+    use crate::fuzzy::{equal, greater, less, less_equal};
+    let mut acct = Accting { required: [0.0; 4], src_cycle: [0; 4], tgt_cycle: [0; 4] };
+    let mut delay = [1e30f32; 4];
+    let set = |acct: &mut Accting, delay: &mut [f32; 4], role: usize, sc: i32, tc: i32, d: f64, req: f64| {
+        acct.src_cycle[role] = sc;
+        acct.tgt_cycle[role] = tc;
+        delay[role] = d as f32;
+        acct.required[role] = req as f32;
+    };
+    let (src_edge, tgt_edge) = (src.edge_time(src_rf), tgt.edge_time(tgt_rf));
+    let tgt_opp_time1 = f64::from(tgt.edge_time(1 - tgt_rf));
+    let (tgt_period, src_period) = (f64::from(tgt.period), f64::from(src.period));
+    if !(tgt_period > 0.0 && src_period > 0.0) {
+        return acct;
+    }
+    let tgt_max_cycle = if tgt_period > src_period { 100 } else { ((src_period / tgt_period).ceil() as i32).max(1000) };
+    let (mut tgt_past_src, mut src_past_tgt) = (false, false);
+    let mut tgt_cycle = first_cycle(tgt_edge, tgt.period);
+    while tgt_cycle <= tgt_max_cycle {
+        let tgt_cycle_start = f64::from(tgt_cycle) * tgt_period;
+        let tgt_time = tgt_cycle_start + f64::from(tgt_edge);
+        let tgt_opp_time = tgt_cycle_start + tgt_opp_time1;
+        let mut src_cycle = first_cycle(src_edge, src.period);
+        loop {
+            let src_cycle_start = f64::from(src_cycle) * src_period;
+            let src_time = src_cycle_start + f64::from(src_edge);
+            if tgt_past_src && src_past_tgt && equal(src_cycle_start as f32, tgt_cycle_start as f32) {
+                return acct;
+            }
+            if greater(src_cycle_start as f32, (tgt_cycle_start + tgt_period) as f32) && src_past_tgt {
+                break;
+            }
+            if greater(tgt_time as f32, src_time as f32) {
+                tgt_past_src = true;
+                let d = tgt_time - src_time;
+                if less(d as f32, delay[ACCT_SETUP]) {
+                    set(&mut acct, &mut delay, ACCT_SETUP, src_cycle, tgt_cycle, d, tgt_time - src_cycle_start);
                 }
             }
+            if greater(tgt_opp_time as f32, src_time as f32) {
+                let d = tgt_opp_time - src_time;
+                if less(d as f32, delay[ACCT_LATCH_SETUP]) {
+                    let (mut latch_tgt_time, mut latch_tgt_cycle) = (tgt_time, tgt_cycle);
+                    if tgt_time > tgt_opp_time {
+                        latch_tgt_time -= tgt_period;
+                        latch_tgt_cycle -= 1;
+                    }
+                    set(&mut acct, &mut delay, ACCT_LATCH_SETUP, src_cycle, latch_tgt_cycle, d, latch_tgt_time - src_cycle_start);
+                }
+            }
+            if less_equal(tgt_time as f32, src_time as f32) {
+                let d = src_time - tgt_time;
+                src_past_tgt = true;
+                if less(d as f32, delay[ACCT_HOLD]) {
+                    set(&mut acct, &mut delay, ACCT_HOLD, src_cycle, tgt_cycle, d, tgt_time - src_cycle_start);
+                }
+            }
+            if less_equal(tgt_opp_time as f32, src_time as f32) {
+                let d = src_time - tgt_time;
+                if less(d as f32, delay[ACCT_GCLK_HOLD]) {
+                    set(&mut acct, &mut delay, ACCT_GCLK_HOLD, src_cycle, tgt_cycle, d, tgt_time - src_cycle_start);
+                }
+            }
+            src_cycle += 1;
         }
+        tgt_cycle += 1;
     }
-    best.map_or((0.0, 0, 0), |(_, r, sc, tc)| (r as f32, sc, tc))
+    acct
+}
+
+/// The setup required time between two edges of the SAME clock ([`cycle_accting`]).
+pub fn setup_required_time(clock: &Clock, src_rf: usize, tgt_rf: usize) -> f32 {
+    cycle_accting(clock, src_rf, clock, tgt_rf).required[ACCT_SETUP]
+}
+
+/// The hold required time between two edges of the SAME clock ([`cycle_accting`]).
+pub fn hold_required_time(clock: &Clock, src_rf: usize, tgt_rf: usize) -> f32 {
+    cycle_accting(clock, src_rf, clock, tgt_rf).required[ACCT_HOLD]
+}
+
+/// The latch setup required time and cycles between two edges of the SAME clock
+/// ([`cycle_accting`]): `(required, source cycle, target cycle)`.
+pub fn latch_setup_accting(clock: &Clock, src_rf: usize, tgt_rf: usize) -> (f32, i32, i32) {
+    let a = cycle_accting(clock, src_rf, clock, tgt_rf);
+    (a.required[ACCT_LATCH_SETUP], a.src_cycle[ACCT_LATCH_SETUP], a.tgt_cycle[ACCT_LATCH_SETUP])
 }
 
 /// `ClockEdge::pulseWidth`: from this edge to the opposite one.
@@ -289,33 +359,6 @@ pub fn pulse_width(clock: &Clock, rf: usize) -> f32 {
     } else {
         clock.period - high
     }
-}
-
-/// The hold required time between two edges of the SAME clock: the target edge the nearest at
-/// or (fuzzily) before the source edge, as `target time − source cycle start` (`CycleAccting`,
-/// hold role), computed in `double` and stored `float`.
-///
-/// Rule: target cycles walked from the first, source cycles from the first within each; the
-/// first pairing with the smallest `source − target` wins (fuzzily less than the incumbent).
-pub fn hold_required_time(clock: &Clock, src_rf: usize, tgt_rf: usize) -> f32 {
-    let period = f64::from(clock.period);
-    let src_time = f64::from(clock.edge_time(src_rf));
-    let tgt_edge = f64::from(clock.edge_time(tgt_rf));
-    let mut best: Option<(f64, f64)> = None;
-    for tgt_cycle in 0..=2 {
-        let tgt_time = f64::from(tgt_cycle) * period + tgt_edge;
-        for src_cycle in 0..=2 {
-            let src_cycle_start = f64::from(src_cycle) * period;
-            let src = src_cycle_start + src_time;
-            if crate::fuzzy::less_equal(tgt_time as f32, src as f32) {
-                let delay = src - tgt_time;
-                if best.is_none_or(|(d, _)| crate::fuzzy::less(delay as f32, d as f32)) {
-                    best = Some((delay, tgt_time - src_cycle_start));
-                }
-            }
-        }
-    }
-    best.map_or(0.0, |(_, r)| r as f32)
 }
 
 #[cfg(test)]
@@ -360,7 +403,7 @@ mod tests {
     #[test]
     fn path_delay_to_takes_the_highest_priority_then_the_tighter() {
         let pd = |to_pins: &[&str], to_clock: bool, delay: f32| PathDelay { from_pins: vec!["r1/CLK".into()], from_clock: false, to_pins: to_pins.iter().map(|p| p.to_string()).collect(), to_clock, min_max: MAX, ignore_clk_latency: true, break_path: true, delay };
-        let sdc = Sdc { clock: Some(Clock::new("c", 2.0, "clk", true)), input_delays: Vec::new(), output_delays: Vec::new(), path_delays: vec![pd(&[], true, 1.0), pd(&["r3/D"], false, 3.0), pd(&["r3/D"], false, 2.0)] };
+        let sdc = Sdc { clocks: vec![Clock::new("c", 2.0, "clk", true)], input_delays: Vec::new(), output_delays: Vec::new(), path_delays: vec![pd(&[], true, 1.0), pd(&["r3/D"], false, 3.0), pd(&["r3/D"], false, 2.0)] };
         let all = States(0b111);
         assert_eq!(sdc.path_delay_to(all, "r3/D", true, MAX), Some(2));
         assert_eq!(sdc.path_delay_to(States(0b011), "r3/D", true, MAX), Some(1));
