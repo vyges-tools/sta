@@ -49,6 +49,8 @@ pub struct IncTimer {
     pub delay_queue: BTreeSet<String>,
     pub relevelize_from: BTreeSet<String>,
     pub invalid_check_edges: BTreeSet<EdgeKey>,
+    /// Latch D -> Q edges to re-time (`invalid_latch_edges_`): their D was visited.
+    pub invalid_latch_edges: BTreeSet<EdgeKey>,
     /// Search invalidations raised by delay calculation and by edits.
     pub invalid_arrivals: BTreeSet<String>,
     pub invalid_requireds: BTreeSet<String>,
@@ -65,6 +67,8 @@ pub struct IncTimer {
     next_gen: u64,
     /// The arrival and required queues' pending vertices.
     pub arrival_queue: BTreeSet<String>,
+    /// `pending_arrivals_`: latch outputs postponed to the next full arrival pass.
+    pub pending_arrivals: BTreeSet<String>,
     pub required_queue: BTreeSet<String>,
     /// The last arrival / required visits: `(vertex, changed)` (`VYGAV` / `VYGRV`).
     pub arrival_visits: Vec<(String, bool)>,
@@ -216,6 +220,13 @@ impl IncTimer {
                 self.invalid_check_edges.insert(Self::edge_key(g, e));
             }
         }
+        // `isLatchData`: its D -> Q edges are re-timed after the pass (levelization does not
+        // traverse them).
+        for &e in &g.out_edges[v] {
+            if is_latch_d_to_q(g, e) {
+                self.invalid_latch_edges.insert(Self::edge_key(g, e));
+            }
+        }
     }
 
     pub fn arrival_invalid(&mut self, name: String) {
@@ -348,6 +359,7 @@ pub fn find_delays_scenes(incs: &mut [IncTimer], gs: &mut [Graph<'_>], parasitic
             inc.invalid_delays.clear();
             inc.delay_queue.clear();
             inc.invalid_check_edges.clear();
+            inc.invalid_latch_edges.clear();
         }
         return Ok(());
     }
@@ -463,6 +475,18 @@ pub fn find_delays_scenes(incs: &mut [IncTimer], gs: &mut [Graph<'_>], parasitic
             }
         }
     }
+    // Latch D -> Q edges, after the checks (`invalid_latch_edges_`); a changed delay invalidates
+    // the Q's arrivals (`delayChangedTo`).
+    for ((inc, g), par) in incs.iter_mut().zip(gs.iter_mut()).zip(parasitics) {
+        let index = g.pin_index();
+        for key in std::mem::take(&mut inc.invalid_latch_edges) {
+            if let Some(e) = (0..g.edges.len()).find(|&e| IncTimer::edge_key(g, e) == key) {
+                if g.find_latch_edge_delays(e, par, &index) {
+                    inc.arrival_invalid(g_name(g, g.edges[e].to));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -485,6 +509,7 @@ pub fn find_arrivals_scenes(incs: &mut [IncTimer], searches: &mut [Search<'_, '_
             inc.arrivals_exist = true;
             inc.invalid_arrivals.clear();
             inc.arrival_queue.clear();
+            inc.pending_arrivals.clear();
             inc.store_all(search);
         }
         return Ok(());
@@ -497,78 +522,35 @@ pub fn find_arrivals_scenes(incs: &mut [IncTimer], searches: &mut [Search<'_, '_
     }
     let levels = incs[0].levels.clone();
     let mut by_level = queue_by_level(&levels, seed);
-    while let Some((&lvl, _)) = by_level.iter().next() {
-        if to_level.is_some_and(|t| lvl > t) {
+    // `findAllArrivals(thru_latches)`: a pass, then the postponed latch outputs visited with their
+    // D -> Q fanin, again while any was postponed. A pass to a level leaves them postponed.
+    loop {
+        while let Some((&lvl, _)) = by_level.iter().next() {
+            if to_level.is_some_and(|t| lvl > t) {
+                break;
+            }
+            for name in by_level.remove(&lvl).expect("a level") {
+                // `ArrivalVisitor::visit(vertex)`: a latch output is postponed.
+                if indexes[0].get(&name).is_some_and(|&v| searches[0].is_latch_output(v)) {
+                    for inc in incs.iter_mut() {
+                        inc.pending_arrivals.insert(name.clone());
+                    }
+                    continue;
+                }
+                visit_arrivals(incs, searches, &indexes, &levels, &mut by_level, &name);
+            }
+        }
+        if to_level.is_some() || incs[0].pending_arrivals.is_empty() {
             break;
         }
-        for name in by_level.remove(&lvl).expect("a level") {
-            // Every scene's new paths, then the vertex's verdict.
-            let mut news: Vec<Option<SceneArrivals>> = Vec::with_capacity(searches.len());
-            let mut changed = false;
-            let mut same_group = true;
-            for k in 0..searches.len() {
-                let Some(&v) = indexes[k].get(&name) else {
-                    news.push(None);
-                    continue;
-                };
-                let g = searches[k].graph;
-                let new: Vec<Path> = searches[k].arrival_paths(v);
-                let snew: Vec<SPath> = new.iter().map(|p| incs[k].spath(g, p)).collect();
-                changed |= IncTimer::arrivals_changed(incs[k].paths.get(&name), &snew);
-                // `setVertexArrivals`: the same tag group keeps its array.
-                same_group &= incs[k].paths.get(&name).is_some_and(|o| o.len() == snew.len() && o.iter().all(|p| snew.iter().any(|q| q.tag == p.tag)));
-                news.push(Some((v, new, snew)));
-            }
-            for inc in incs.iter_mut() {
-                inc.arrival_visits.push((name.clone(), changed));
-            }
-            if !changed {
-                continue;
-            }
-            if !same_group {
-                let generation = incs.iter().map(|i| i.next_gen).max().unwrap_or(0) + 1;
-                for inc in incs.iter_mut() {
-                    inc.next_gen = generation;
-                    inc.path_gen.insert(name.clone(), generation);
-                }
-            }
-            let mut fanout_names: BTreeSet<String> = BTreeSet::new();
-            for (k, item) in news.into_iter().enumerate() {
-                let Some((v, new, snew)) = item else { continue };
-                let g = searches[k].graph;
-                for &e in &g.out_edges[v] {
-                    if g.is_check(e) || is_latch_d_to_q(g, e) {
-                        continue;
-                    }
-                    fanout_names.insert(g_name(g, g.edges[e].to));
-                }
-                // A new path's required is 0 (`Path::Path`) until the required visit the change
-                // invalidates — which compares against that 0.
-                let mut stored = snew;
-                for p in stored.iter_mut() {
-                    p.required = 0.0;
-                }
-                searches[k].paths[v] = new.into_iter().map(|mut p| {
-                    p.required = 0.0;
-                    p
-                }).collect();
-                let inc = &mut incs[k];
-                inc.paths.insert(name.clone(), stored);
-                inc.required_invalid(name.clone());
-                // `constrainedRequiredsInvalid`: a clock arrival at a check clock pin changes the
-                // required at the data pins it constrains.
-                let is_clk = searches[k].paths[v].iter().any(|p| p.tag.is_clock);
-                if is_clk && !g.vertices[v].is_driver {
-                    for &e in &g.out_edges[v] {
-                        if g.is_check(e) {
-                            inc.required_invalid(g_name(g, g.edges[e].to));
-                        }
-                    }
-                }
-            }
-            for n in fanout_names {
-                by_level.entry(levels.get(&n).copied().unwrap_or(0)).or_default().insert(n);
-            }
+        // The postponed vertices in vertex id order (`VertexSet`).
+        let mut pending: Vec<String> = std::mem::take(&mut incs[0].pending_arrivals).into_iter().collect();
+        for inc in incs.iter_mut().skip(1) {
+            inc.pending_arrivals.clear();
+        }
+        pending.sort_by_key(|n| indexes[0].get(n).map_or(usize::MAX, |&v| searches[0].vertex_id[v]));
+        for name in pending {
+            visit_arrivals(incs, searches, &indexes, &levels, &mut by_level, &name);
         }
     }
     let rest: BTreeSet<String> = by_level.into_values().flatten().collect();
@@ -576,6 +558,88 @@ pub fn find_arrivals_scenes(incs: &mut [IncTimer], searches: &mut [Search<'_, '_
         inc.arrival_queue.extend(rest.iter().cloned());
     }
     Ok(())
+}
+
+/// `ArrivalVisitor::visit(vertex, with_latch_edges)` over every scene: the new paths; when they
+/// changed, stored and the fanout enqueued — a latch data pin's latch outputs postponed instead.
+fn visit_arrivals(incs: &mut [IncTimer], searches: &mut [Search<'_, '_>], indexes: &[HashMap<String, usize>], levels: &HashMap<String, i32>, by_level: &mut BTreeMap<i32, BTreeSet<String>>, name: &str) {
+    let name = name.to_string();
+    // Every scene's new paths, then the vertex's verdict.
+    let mut news: Vec<Option<SceneArrivals>> = Vec::with_capacity(searches.len());
+    let mut changed = false;
+    let mut same_group = true;
+    for k in 0..searches.len() {
+        let Some(&v) = indexes[k].get(&name) else {
+            news.push(None);
+            continue;
+        };
+        let g = searches[k].graph;
+        let new: Vec<Path> = searches[k].arrival_paths(v);
+        let snew: Vec<SPath> = new.iter().map(|p| incs[k].spath(g, p)).collect();
+        changed |= IncTimer::arrivals_changed(incs[k].paths.get(&name), &snew);
+        // `setVertexArrivals`: the same tag group keeps its array.
+        same_group &= incs[k].paths.get(&name).is_some_and(|o| o.len() == snew.len() && o.iter().all(|p| snew.iter().any(|q| q.tag == p.tag)));
+        news.push(Some((v, new, snew)));
+    }
+    for inc in incs.iter_mut() {
+        inc.arrival_visits.push((name.clone(), changed));
+    }
+    if !changed {
+        return;
+    }
+    if !same_group {
+        let generation = incs.iter().map(|i| i.next_gen).max().unwrap_or(0) + 1;
+        for inc in incs.iter_mut() {
+            inc.next_gen = generation;
+            inc.path_gen.insert(name.clone(), generation);
+        }
+    }
+    let mut fanout_names: BTreeSet<String> = BTreeSet::new();
+    for (k, item) in news.into_iter().enumerate() {
+        let Some((v, new, snew)) = item else { continue };
+        let g = searches[k].graph;
+        for &e in &g.out_edges[v] {
+            if g.is_check(e) || is_latch_d_to_q(g, e) {
+                continue;
+            }
+            fanout_names.insert(g_name(g, g.edges[e].to));
+        }
+        // A new path's required is 0 (`Path::Path`) until the required visit the change
+        // invalidates — which compares against that 0.
+        let mut stored = snew;
+        for p in stored.iter_mut() {
+            p.required = 0.0;
+        }
+        searches[k].paths[v] = new.into_iter().map(|mut p| {
+            p.required = 0.0;
+            p
+        }).collect();
+        let inc = &mut incs[k];
+        inc.paths.insert(name.clone(), stored);
+        inc.required_invalid(name.clone());
+        // `constrainedRequiredsInvalid`: a clock arrival at a check clock pin changes the
+        // required at the data pins it constrains.
+        let is_clk = searches[k].paths[v].iter().any(|p| p.tag.is_clock);
+        if is_clk && !g.vertices[v].is_driver {
+            for &e in &g.out_edges[v] {
+                if g.is_check(e) {
+                    inc.required_invalid(g_name(g, g.edges[e].to));
+                }
+            }
+        }
+    }
+    // `postponeLatchDataOutputs`.
+    if let Some(&v) = indexes[0].get(&name) {
+        for q in searches[0].latch_outputs_of(v) {
+            let q = g_name(searches[0].graph, q);
+            for inc in incs.iter_mut() {
+                inc.pending_arrivals.insert(q.clone());
+            }
+        }
+    }
+    for n in fanout_names {
+        by_level.entry(levels.get(&n).copied().unwrap_or(0)).or_default().insert(n);
+    }
 }
 
 /// `Search::findRequireds(level)` (all with `None`) over every scene at once: ONE queue from the

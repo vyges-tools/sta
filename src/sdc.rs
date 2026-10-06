@@ -245,6 +245,52 @@ pub fn setup_required_time(clock: &Clock, src_rf: usize, tgt_rf: usize) -> f32 {
     best.map_or(0.0, |(_, r)| r as f32)
 }
 
+/// `CycleAccting` for the latch setup role between two edges of the SAME clock: the target's
+/// OPPOSITE (disable) edge the soonest strictly (fuzzily) after the source edge; the enable time is
+/// the target edge before that disable. Returns `(required, source cycle, target cycle)`:
+/// `enable time − source cycle start` in `double` stored `float`, and the cycles of the pairing.
+///
+/// Rule: target cycles walked from the first, source cycles from the first within each; the first
+/// pairing with the smallest `disable − source` wins (fuzzily less than the incumbent).
+pub fn latch_setup_accting(clock: &Clock, src_rf: usize, tgt_rf: usize) -> (f32, i32, i32) {
+    let period = f64::from(clock.period);
+    let src_time = f64::from(clock.edge_time(src_rf));
+    let tgt_edge = f64::from(clock.edge_time(tgt_rf));
+    let tgt_opp = f64::from(clock.edge_time(1 - tgt_rf));
+    let mut best: Option<(f64, f64, i32, i32)> = None;
+    for tgt_cycle in 0..=2 {
+        let tgt_cycle_start = f64::from(tgt_cycle) * period;
+        let tgt_time = tgt_cycle_start + tgt_edge;
+        let tgt_opp_time = tgt_cycle_start + tgt_opp;
+        for src_cycle in 0..=1 {
+            let src_cycle_start = f64::from(src_cycle) * period;
+            let src = src_cycle_start + src_time;
+            if crate::fuzzy::greater(tgt_opp_time as f32, src as f32) {
+                let delay = tgt_opp_time - src;
+                if best.is_none_or(|(d, ..)| crate::fuzzy::less(delay as f32, d as f32)) {
+                    let (mut latch_tgt_time, mut latch_tgt_cycle) = (tgt_time, tgt_cycle);
+                    if tgt_time > tgt_opp_time {
+                        latch_tgt_time -= period;
+                        latch_tgt_cycle -= 1;
+                    }
+                    best = Some((delay, latch_tgt_time - src_cycle_start, src_cycle, latch_tgt_cycle));
+                }
+            }
+        }
+    }
+    best.map_or((0.0, 0, 0), |(_, r, sc, tc)| (r as f32, sc, tc))
+}
+
+/// `ClockEdge::pulseWidth`: from this edge to the opposite one.
+pub fn pulse_width(clock: &Clock, rf: usize) -> f32 {
+    let high = clock.waveform[1] - clock.waveform[0];
+    if rf == crate::liberty::RISE {
+        high
+    } else {
+        clock.period - high
+    }
+}
+
 /// The hold required time between two edges of the SAME clock: the target edge the nearest at
 /// or (fuzzily) before the source edge, as `target time − source cycle start` (`CycleAccting`,
 /// hold role), computed in `double` and stored `float`.

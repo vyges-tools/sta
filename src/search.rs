@@ -149,6 +149,10 @@ pub struct Search<'g, 'a> {
     internal_to_break: Vec<bool>,
     /// Per edge, `Sim::isDisabledCond` and `Sim::simTimingSense` on instances with a constant pin.
     sim: SimEdges,
+    /// Per latch D -> Q edge, the enable vertex and edge (`LibertyCell::latchEnable`).
+    latch_en: HashMap<usize, (usize, usize)>,
+    /// A latch's data pin (`LibertyPort::isLatchData`): it has a D -> Q edge with an enable.
+    latch_data: Vec<bool>,
 }
 
 /// `Sim::functionSense`'s answer for an edge.
@@ -168,6 +172,37 @@ struct SimEdges {
     sense: Vec<SimSense>,
     /// What could not be annotated (too many free inputs to enumerate).
     error: Option<String>,
+}
+
+/// `LibertyCell::makeLatchEnables` → `latchEnable(d_to_q)` for every latch D -> Q edge: the latch
+/// EN -> Q arc set to the same Q (one whose `when` matches the D -> Q's preferred), its from port as
+/// the enable and its edge (`rising_edge` / `falling_edge`); and each such D pin.
+fn latch_enables(graph: &Graph<'_>) -> (HashMap<usize, (usize, usize)>, Vec<bool>) {
+    let mut en = HashMap::new();
+    let mut data = vec![false; graph.vertices.len()];
+    let d_q: Vec<usize> = (0..graph.edges.len()).filter(|&e| matches!(graph.edges[e].kind, EdgeKind::Gate { set } if graph.arc_set(e, set).role == Role::LatchDtoQ)).collect();
+    if d_q.is_empty() {
+        return (en, data);
+    }
+    let index = graph.pin_index();
+    for e in d_q {
+        let EdgeKind::Gate { set } = graph.edges[e].kind else { continue };
+        let to = &graph.vertices[graph.edges[e].to];
+        let (Some(lib), Some(cell_name), crate::netlist::Conn::Inst(i, _)) = (to.lib, to.cell.as_deref(), &to.conn) else { continue };
+        let cell = &graph.libs[lib].cells[cell_name];
+        let dq = graph.arc_set(e, set);
+        let ens: Vec<&crate::liberty::ArcSet> = cell.arc_sets.iter().filter(|a| a.role == Role::LatchEnToQ && a.to == dq.to).collect();
+        let Some(en_to_q) = ens.iter().find(|a| a.cond == dq.cond).or(ens.last()) else { continue };
+        let en_rf = match en_to_q.timing_type.as_str() {
+            "rising_edge" => crate::liberty::RISE,
+            "falling_edge" => crate::liberty::FALL,
+            _ => continue,
+        };
+        let Some(&en_v) = index.get(&format!("{}/{}", graph.netlist.insts[*i].0, en_to_q.from)) else { continue };
+        en.insert(e, (en_v, en_rf));
+        data[graph.edges[e].from] = true;
+    }
+    (en, data)
 }
 
 /// A function's value with every port given (`value`).
@@ -378,7 +413,8 @@ impl<'g, 'a> Search<'g, 'a> {
             }
         }
         let sim = sim_edges(graph);
-        Search { graph, sdc, paths: vec![Vec::new(); n], vertex_id, input_delay, output_delay, is_reg_clk, level, internal_from, internal_from_break, internal_to, internal_to_break, sim }
+        let (latch_en, latch_data) = latch_enables(graph);
+        Search { graph, sdc, paths: vec![Vec::new(); n], vertex_id, input_delay, output_delay, is_reg_clk, level, internal_from, internal_from_break, internal_to, internal_to_break, sim, latch_en, latch_data }
     }
 
     /// `SearchThru::searchTo`: fanin paths are broken at a path delay's internal `-from` pin, and
@@ -425,6 +461,26 @@ impl<'g, 'a> Search<'g, 'a> {
         let constrained = vx.lib.is_none() && (!vx.is_driver || self.output_delay.contains_key(&vx.name));
         let checks = self.graph.in_edges[v].iter().any(|&e| self.is_check(e));
         self.has_fanin(v) && (checks || constrained || !self.has_fanout(v) || self.internal_to[v])
+    }
+
+    /// Whether every searched fanout edge of `v` is a latch D -> Q edge — across which no required
+    /// time propagates (`RequiredVisitor::visitFromToPath`), so an end there takes its slack from
+    /// its own checks alone.
+    pub fn fanout_only_latch_d_to_q(&self, v: usize) -> bool {
+        self.graph.out_edges[v].iter().filter(|&&e| self.search_thru(e) && self.search_to(self.graph.edges[e].to)).all(|&e| self.role(e) == Some(Role::LatchDtoQ))
+    }
+
+    /// `LibertyPort::isLatchOutput`: the Q of a latch D -> Q edge with an enable.
+    pub fn is_latch_output(&self, v: usize) -> bool {
+        self.latch_en.keys().any(|&e| self.graph.edges[e].to == v)
+    }
+
+    /// The latch outputs a latch data pin drives through its D -> Q edges.
+    pub fn latch_outputs_of(&self, v: usize) -> Vec<usize> {
+        let mut out: Vec<usize> = self.latch_en.keys().filter(|&&e| self.graph.edges[e].from == v).map(|&e| self.graph.edges[e].to).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// Whether `v` is a path delay's internal `-to` pin whose fanout the search breaks.
@@ -476,7 +532,8 @@ impl<'g, 'a> Search<'g, 'a> {
         let delay = self.arc_delay(e, arc.index, mm);
         let role = self.role(e);
         match role {
-            Some(Role::RegClkToQ) => {
+            // A latch's EN -> Q launches as a register's CLK -> Q (`genericRole() == regClkToQ`).
+            Some(Role::RegClkToQ | Role::LatchEnToQ) => {
                 // Only clocked clock paths launch, keeping the clock path's CRPR
                 // path — or taking this clock path when it has none.
                 if !from.tag.is_clock || from.tag.clk_edge.is_none() {
@@ -493,7 +550,13 @@ impl<'g, 'a> Search<'g, 'a> {
                 let launch = if self.propagated() { from.arrival } else { self.edge_time(from.tag.clk_edge.unwrap()) };
                 Some((tag, delay, launch + delay))
             }
-            Some(Role::LatchDtoQ | Role::LatchEnToQ) => None,
+            // `Latches::latchOutArrival`: max data paths only, clocked.
+            Some(Role::LatchDtoQ) => {
+                if mm != MAX || from.tag.clk_edge.is_none() {
+                    return None;
+                }
+                self.latch_out_arrival(from_v, from, e, arc)
+            }
             _ if from.tag.is_clock => {
                 // A clock path through a clock-network arc.
                 let to_is_clk = matches!(role, None | Some(Role::Combinational));
@@ -629,7 +692,7 @@ impl<'g, 'a> Search<'g, 'a> {
     /// transition.
     fn visit_fanin_paths(&self, v: usize, bldr: &mut Bldr, no_crpr: &mut NoCrprBldr, has_fanin_one: bool) {
         for &e in self.graph.in_edges[v].iter().rev() {
-            if self.is_check(e) || self.role(e) == Some(Role::LatchDtoQ) {
+            if self.is_check(e) {
                 continue;
             }
             let from_v = self.graph.edges[e].from;
@@ -856,6 +919,14 @@ impl<'g, 'a> Search<'g, 'a> {
                         // `visitCheckEnd`: a path delay completing here overrides the check —
                         // `PathEndPathDelay` with the check's arc as its margin.
                         let tgt_edge = tgt.tag.clk_edge.expect("a clock path has an edge");
+                        // `PathEndLatchCheck`: at a latch's data pin, the check's target is the
+                        // DISABLE path; the required is `latchRequired`'s, the check arc the margin.
+                        if self.latch_data[v] && self.sdc.path_delay_to(path.tag.states, name, true, MAX).is_none() {
+                            let enable = self.latch_other_path(tgt_v, tgt);
+                            let (required, _, _) = self.latch_required(path, tgt_v, enable, Some(tgt), self.arc_delay(e, k, MAX));
+                            Self::required_set(req, i, required, MAX);
+                            continue;
+                        }
                         if let Some(id) = self.sdc.path_delay_to(path.tag.states, name, true, MAX) {
                             let latency = if clock.propagated { (tgt.arrival - clock.edge_time(tgt_edge)) - 0.0 } else { 0.0 };
                             let required = self.path_delay_required(path, id, self.arc_delay(e, k, MAX), latency, self.check_crpr(path, tgt_v, tgt));
@@ -873,6 +944,114 @@ impl<'g, 'a> Search<'g, 'a> {
                 }
             }
         }
+    }
+
+    /// `Latches::latchEnableOtherPath`: at the enable vertex, of the same min/max, the clock path of
+    /// the opposite transition and the opposite clock edge.
+    fn latch_other_path(&self, en_v: usize, p: &Path) -> Option<&Path> {
+        let edge = p.tag.clk_edge?;
+        self.paths[en_v].iter().find(|o| o.tag.is_clock && o.tag.mm == p.tag.mm && o.tag.rf == 1 - p.tag.rf && o.tag.clk_edge == Some(1 - edge))
+    }
+
+    /// `PathEnd::checkTgtClkDelay` with no latency or insertion set: a propagated clock path's
+    /// network delay (its arrival less its edge's time), else 0.
+    fn tgt_clk_delay(&self, p: &Path) -> f32 {
+        match (self.propagated(), p.tag.clk_edge) {
+            (true, Some(e)) => (p.arrival - self.edge_time(e)) - 0.0,
+            _ => 0.0,
+        }
+    }
+
+    /// `Latches::latchRequired` with no exception (no multicycle, no path delay, no uncertainty, no
+    /// borrow limit): `(required, borrow, adjusted data arrival)`. With the enable and disable clock
+    /// paths: the enable's arrival = the latch-setup cycle's required + its network delay + the
+    /// open CRPR; data at or before it needs nothing borrowed; else it borrows, up to the enable's
+    /// pulse width less (the latency and CRPR differences + the margin) — the required then the
+    /// data's arrival, or the enable plus the borrow limit; the data leaves shifted from the data
+    /// clock's cycle to the enable's. With the disable path alone: its clock arrival − the margin.
+    fn latch_required(&self, data: &Path, en_v: usize, enable: Option<&Path>, disable: Option<&Path>, margin: f32) -> (f32, f32, f32) {
+        let data_arrival = data.arrival;
+        match (enable, disable, self.sdc.clock.as_ref(), data.tag.clk_edge) {
+            (Some(en), Some(dis), Some(clock), Some(data_edge)) => {
+                let en_edge = en.tag.clk_edge.expect("a clock path");
+                // `latchBorrowInfo`.
+                let nom_pulse_width = crate::sdc::pulse_width(clock, en_edge);
+                let open_crpr = self.check_crpr(data, en_v, en);
+                let close_crpr = self.check_crpr(data, en_v, dis);
+                let crpr_diff = open_crpr - close_crpr;
+                let open_latency = self.tgt_clk_delay(en);
+                let latency_diff = open_latency - self.tgt_clk_delay(dis);
+                let max_borrow = nom_pulse_width - ((latency_diff + crpr_diff) + margin);
+                let (tgt_clk_time, src_cycle, tgt_cycle) = crate::sdc::latch_setup_accting(clock, data_edge, en_edge);
+                let enable_arrival = ((0.0 + tgt_clk_time + 0.0 + 0.0) + open_latency) + open_crpr;
+                if crate::fuzzy::less_equal(data_arrival, enable_arrival) {
+                    (enable_arrival, 0.0, data_arrival)
+                } else {
+                    let mut borrow = data_arrival - enable_arrival;
+                    let required = if crate::fuzzy::less_equal(borrow, max_borrow) {
+                        data_arrival
+                    } else {
+                        borrow = max_borrow;
+                        enable_arrival + max_borrow
+                    };
+                    let shift = (src_cycle as f32 * clock.period) - (tgt_cycle as f32 * clock.period);
+                    (required, borrow, required + shift)
+                }
+            }
+            (None, Some(dis), ..) => {
+                let disable_arrival = match (self.propagated(), dis.tag.clk_edge) {
+                    (false, Some(e)) => self.edge_time(e),
+                    _ => dis.arrival,
+                };
+                ((0.0 + disable_arrival) - margin, 0.0, data_arrival)
+            }
+            _ => (0.0, 0.0, data_arrival),
+        }
+    }
+
+    /// `Latches::latchSetupMargin`: the setup check into the data pin from the enable whose arcs go
+    /// to the data's transition from the disable's — its delay at the disable path's min/max.
+    fn latch_setup_margin(&self, d_v: usize, data_rf: usize, en_v: usize, disable: Option<&Path>) -> f32 {
+        let Some(dis) = disable else { return 0.0 };
+        for &e in self.graph.in_edges[d_v].iter().rev() {
+            if self.role(e) != Some(Role::Setup) || self.graph.edges[e].from != en_v || self.sim.disabled_cond[e] {
+                continue;
+            }
+            let EdgeKind::Gate { set } = self.graph.edges[e].kind else { continue };
+            for (k, arc) in self.graph.arc_set(e, set).arcs.iter().enumerate() {
+                if arc.to_rf == data_rf && arc.from_rf == dis.tag.rf {
+                    return self.arc_delay(e, k, dis.tag.mm);
+                }
+            }
+        }
+        0.0
+    }
+
+    /// `Latches::latchOutArrival` with the latch enabled: the first enable clock path (of the
+    /// target clock min/max — MIN for a max path); a path delay to the D pin stops it; with data
+    /// arriving while the latch is transparent (borrow > 0) it leaves at the adjusted arrival + the
+    /// D -> Q arc's delay, under the ENABLE's clock edge (its CRPR clock path the enable path when
+    /// propagated), its states from the D pin and from the enable's pin or clock — then `thruTag`.
+    fn latch_out_arrival(&self, from_v: usize, from: &Path, e: usize, arc: &ArcRef) -> Option<(Tag, f32, f32)> {
+        let &(en_v, en_rf) = self.latch_en.get(&e)?;
+        let d_pin = &self.graph.vertices[from_v].name;
+        let en = self.paths[en_v].iter().find(|p| p.tag.mm == MIN && p.tag.rf == en_rf && p.tag.is_clock)?;
+        if self.sdc.path_delay_to(from.tag.states, d_pin, true, MAX).is_some() {
+            return None;
+        }
+        let disable = self.latch_other_path(en_v, en);
+        let margin = self.latch_setup_margin(from_v, from.tag.rf, en_v, disable);
+        let (_, borrow, adjusted) = self.latch_required(from, en_v, Some(en), disable, margin);
+        if !crate::fuzzy::greater(borrow, 0.0) {
+            return None;
+        }
+        let delay = self.arc_delay(e, arc.index, MAX);
+        let crpr = self.propagated().then(|| CrprPath { vertex: en_v, rf: en.tag.rf, mm: en.tag.mm, clk_edge: en.tag.clk_edge.expect("a clock path") });
+        let en_pin = &self.graph.vertices[en_v].name;
+        let states = States(self.sdc.exception_from_states(d_pin, false, MAX).0 | self.sdc.exception_from_states(en_pin, true, MAX).0);
+        let states = self.mutate_states(states, from_v, self.graph.edges[e].to, MAX);
+        let tag = Tag { rf: arc.to_rf, mm: MAX, clk_edge: en.tag.clk_edge, is_clock: false, crpr, states };
+        Some((tag, delay, adjusted + delay))
     }
 
     /// `visitCheckEndUnclked`: each enabled check of the path's min/max role, each arc to its

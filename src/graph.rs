@@ -542,7 +542,46 @@ impl<'a> Graph<'a> {
                 self.find_check_edge_delays(e);
             }
         }
+        // `invalid_latch_edges_`: every latch D -> Q edge, after the checks.
+        for e in 0..self.edges.len() {
+            if matches!(self.edges[e].kind, EdgeKind::Gate { set } if self.arc_set(e, set).role == Role::LatchDtoQ) {
+                self.find_latch_edge_delays(e, parasitics, &index);
+            }
+        }
         Ok(())
+    }
+
+    /// `GraphDelayCalc::findLatchEdgeDelays`: a latch D -> Q edge's arcs at the D slew and the Q
+    /// load — the gate delays only (`annotateDelaySlew` merges no Q slew from them,
+    /// `annotateDelaysSlews` annotates no load). Whether a delay changed (the reference's change
+    /// test, [`crate::incr::gate_delay_changed`]).
+    pub fn find_latch_edge_delays(&mut self, e: usize, parasitics: &HashMap<String, NetParasitics>, index: &HashMap<String, usize>) -> bool {
+        let EdgeKind::Gate { set } = self.edges[e].kind else { return false };
+        let (from, v) = (self.edges[e].from, self.edges[e].to);
+        if self.is_constant(from) {
+            return false;
+        }
+        let Some(drvr_lib) = self.vertices[v].lib else { return false };
+        let arcs = self.arc_set(e, set).arcs.clone();
+        let mut changed = false;
+        for mm in [MIN, MAX] {
+            for (k, arc) in arcs.iter().enumerate() {
+                let Model::Gate(model) = &arc.model else { continue };
+                let rf = arc.to_rf;
+                let in_slew = self.slew[from][arc.from_rf][mm];
+                let (pin_cap, wire_cap, pe) = self.parasitic_load(v, rf, mm, parasitics, index);
+                let l = &self.libs[drvr_lib];
+                let th = Thresholds { vth: l.output_threshold[rf], vl: l.slew_lower_threshold[rf], vh: l.slew_upper_threshold[rf], slew_derate: l.slew_derate };
+                let gate_delay = match &pe {
+                    Some((p, _)) => Dmp::new(model, &th, in_slew, p.c2, p.rpi, p.c1).gate_delay_slew().0,
+                    None => f64::from(model.gate_delay(in_slew, pin_cap + wire_cap).0),
+                };
+                let (prev, new) = (self.delay[e][k][mm], gate_delay as f32);
+                changed |= crate::incr::gate_delay_changed(prev, new);
+                self.delay[e][k][mm] = new;
+            }
+        }
+        changed
     }
 
     /// Whether the simulation holds vertex `v` constant ([`SdcEnv::constants`]).
@@ -627,15 +666,17 @@ impl<'a> Graph<'a> {
         for &e in fanin.iter().rev() {
             let EdgeKind::Gate { set } = self.edges[e].kind else { continue };
             let arcs = self.arc_set(e, set).arcs.clone();
-            if self.arc_set(e, set).role == Role::LatchDtoQ {
-                return Err("latch D->Q arcs are not modelled".into());
-            }
             let from = self.edges[e].from;
             // `findDriverEdgeDelays`: no arc from a constant pin (`DcalcPred::searchFrom`).
             if self.is_constant(from) {
                 continue;
             }
-            let ideal_clk_to_q = self.arc_set(e, set).role == Role::RegClkToQ && self.ideal_clock.contains(&from);
+            let ideal_clk_to_q = matches!(self.arc_set(e, set).role, Role::RegClkToQ | Role::LatchEnToQ) && self.ideal_clock.contains(&from);
+            // `findDriverDelays1` skips a latch D -> Q edge: it is timed on its own
+            // ([`Graph::find_latch_edge_delays`]).
+            if self.arc_set(e, set).role == Role::LatchDtoQ {
+                continue;
+            }
             for mm in [MIN, MAX] {
                 for (k, arc) in arcs.iter().enumerate() {
                     let Model::Gate(model) = &arc.model else { continue };

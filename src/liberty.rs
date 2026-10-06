@@ -865,10 +865,13 @@ impl Library {
             }
         }
         // The output's sequential, through the ports its function names.
-        let seq = function.and_then(|f| {
+        let seq_index = function.and_then(|f| {
             let ids = identifiers(f);
-            cell.sequentials.iter().find(|(outs, _, _)| outs.iter().any(|o| ids.contains(o)))
+            cell.sequentials.iter().position(|(outs, _, _)| outs.iter().any(|o| ids.contains(o)))
         });
+        let seq = seq_index.map(|k| &cell.sequentials[k]);
+        // `seq->isLatch() && seq->data()->hasPort(from)` (the latch's `data_in`).
+        let latch_data = |from: &str| seq_index.is_some_and(|k| !cell.sequentials[k].1 && cell.seqs.get(k).and_then(|q| q.data.as_deref()).is_some_and(|d| identifiers(d).iter().any(|p| p == from)));
         if related.is_empty() {
             return Ok(Vec::new());
         }
@@ -883,6 +886,13 @@ impl Library {
                 ArcSet { from: from.clone(), to: to.to_string(), role, timing_type: timing_type.clone(), cond: cond.clone(), arcs }
             };
             let set = match timing_type.as_str() {
+                // `LibertyBuilder::makeLatchDtoQArcs`: per output transition with a model, from the
+                // same transition (the opposite for negative_unate).
+                "combinational" if latch_data(from) => {
+                    let negative = sense.as_deref() == Some("negative_unate");
+                    let arcs = [RISE, FALL].into_iter().filter_map(|to_rf| models[to_rf].clone().map(|model| Arc { from_rf: if negative { 1 - to_rf } else { to_rf }, to_rf, model })).collect();
+                    ArcSet { from: from.clone(), to: to.to_string(), role: Role::LatchDtoQ, timing_type: timing_type.clone(), cond: cond.clone(), arcs }
+                }
                 "combinational" | "combinational_rise" | "combinational_fall" => {
                     let (to_rise, to_fall) = match timing_type.as_str() {
                         "combinational_rise" => (true, false),
