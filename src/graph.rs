@@ -97,6 +97,11 @@ pub struct Graph<'a> {
     /// slew, 0 (`edgeFromSlew`, `checkEdgeClkSlew`); every other edge reads the graph's slew.
     /// Empty unless a caller sets it — a propagated clock has none.
     pub ideal_clock: std::collections::HashSet<usize>,
+    /// Per instance, the library and cell whose arc sets its OUTPUT-to-output edges still carry:
+    /// `replaceEquivCellBefore` swaps the arc sets of the edges leaving an instance's INPUT pins
+    /// only, so after an equivalent-arcs replacement an edge from one output to another (a half
+    /// adder's CON -> SN) keeps the cell it was made with. See [`Graph::set_stale_out_arcs`].
+    pub stale_out_arcs: HashMap<String, (usize, String)>,
 }
 
 /// The SDC loads and drives delay calculation reads (`Sdc::connectedCap`, `seedDrvrSlew`).
@@ -247,7 +252,7 @@ impl<'a> Graph<'a> {
                 EdgeKind::Wire => vec![[0.0f32; 2]; 2],
             })
             .collect();
-        Ok(Graph { libs, netlist, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), ideal_clock: std::collections::HashSet::new() })
+        Ok(Graph { libs, netlist, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), ideal_clock: std::collections::HashSet::new(), stale_out_arcs: HashMap::new() })
     }
 
     pub fn is_check(&self, e: usize) -> bool {
@@ -259,7 +264,23 @@ impl<'a> Graph<'a> {
 
     pub(crate) fn arc_set(&self, e: usize, set: usize) -> &crate::liberty::ArcSet {
         let v = &self.vertices[self.edges[e].to];
+        if !self.stale_out_arcs.is_empty() {
+            let from = &self.vertices[self.edges[e].from];
+            if let (Conn::Inst(fi, _), Conn::Inst(ti, _)) = (&from.conn, &v.conn) {
+                if fi == ti && from.is_driver {
+                    if let Some((lib, name)) = self.stale_out_arcs.get(&self.netlist.insts[*ti].0) {
+                        return &cell(self.libs, *lib, name).arc_sets[set];
+                    }
+                }
+            }
+        }
         &cell(self.libs, v.lib.unwrap(), v.cell.as_deref().unwrap()).arc_sets[set]
+    }
+
+    /// [`Graph::stale_out_arcs`] from instance → cell name, each cell found in the graph's libraries
+    /// (the first holding it); an instance whose cell is in none is left with its own.
+    pub fn set_stale_out_arcs(&mut self, cells: &std::collections::BTreeMap<String, String>) {
+        self.stale_out_arcs = cells.iter().filter_map(|(inst, name)| self.libs.iter().position(|l| l.cells.contains_key(name)).map(|lib| (inst.clone(), (lib, name.clone())))).collect();
     }
 
     /// `Levelize::findLevels` on an acyclic graph: a root — no searched-through edge into it —

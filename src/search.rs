@@ -28,6 +28,9 @@ use crate::sdc::{hold_required_time, setup_required_time, Sdc, States};
 /// The min/max initial value (`INF` = 1e30).
 pub(crate) const INF: f32 = 1e30;
 
+/// A slack with no path: [`INF`].
+pub const INF_SLACK: f32 = INF;
+
 /// A tag's CRPR clock path: the vertex (its id orders tags) and that path's own tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CrprPath {
