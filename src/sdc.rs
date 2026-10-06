@@ -132,7 +132,8 @@ impl States {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sdc {
-    pub clock: Clock,
+    /// The one clock, or none (nothing clocked: every path is unclocked).
+    pub clock: Option<Clock>,
     pub input_delays: Vec<PortDelay>,
     pub output_delays: Vec<PortDelay>,
     /// In the order they were made (their ids). At most 64.
@@ -313,7 +314,7 @@ mod tests {
     #[test]
     fn path_delay_to_takes_the_highest_priority_then_the_tighter() {
         let pd = |to_pins: &[&str], to_clock: bool, delay: f32| PathDelay { from_pins: vec!["r1/CLK".into()], from_clock: false, to_pins: to_pins.iter().map(|p| p.to_string()).collect(), to_clock, min_max: MAX, ignore_clk_latency: true, break_path: true, delay };
-        let sdc = Sdc { clock: Clock::new("c", 2.0, "clk", true), input_delays: Vec::new(), output_delays: Vec::new(), path_delays: vec![pd(&[], true, 1.0), pd(&["r3/D"], false, 3.0), pd(&["r3/D"], false, 2.0)] };
+        let sdc = Sdc { clock: Some(Clock::new("c", 2.0, "clk", true)), input_delays: Vec::new(), output_delays: Vec::new(), path_delays: vec![pd(&[], true, 1.0), pd(&["r3/D"], false, 3.0), pd(&["r3/D"], false, 2.0)] };
         let all = States(0b111);
         assert_eq!(sdc.path_delay_to(all, "r3/D", true, MAX), Some(2));
         assert_eq!(sdc.path_delay_to(States(0b011), "r3/D", true, MAX), Some(1));

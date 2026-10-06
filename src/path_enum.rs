@@ -217,7 +217,7 @@ impl Enum<'_, '_, '_> {
 /// (`(insertion + edge time) + latency`, both 0 here); any other path at its arrival.
 fn clk_path_arrival(s: &Search<'_, '_>, v: usize, p: &Path) -> f32 {
     match p.tag.clk_edge {
-        Some(edge) if s.is_reg_clk(v) && p.tag.is_clock && !s.sdc.clock.propagated => (0.0 + s.sdc.clock.edge_time(edge)) + 0.0,
+        Some(edge) if s.is_reg_clk(v) && p.tag.is_clock && !s.propagated() => (0.0 + s.edge_time(edge)) + 0.0,
         _ => p.arrival,
     }
 }
@@ -299,7 +299,7 @@ mod tests {
             nets: vec![net("clk", vec![Conn::Port(0)]), net("a", vec![i("A"), Conn::Port(1)]), net("b", vec![i("B"), Conn::Port(2)]), net("y", vec![i("Y"), Conn::Port(3)])],
         };
         let sdc = Sdc {
-            clock: Clock::new("c", 1e-9, "clk", false),
+            clock: Some(Clock::new("c", 1e-9, "clk", false)),
             input_delays: vec![PortDelay::uniform("a", 0.2e-9), PortDelay::uniform("b", 0.2e-9)],
             output_delays: vec![PortDelay::uniform("y", 0.2e-9)],
             path_delays: Vec::new(),
