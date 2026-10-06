@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use crate::graph::{EdgeKind, Graph};
 use crate::liberty::{Role, MAX, MIN};
-use crate::sdc::{hold_required_time, setup_required_time, Sdc};
+use crate::sdc::{hold_required_time, setup_required_time, Sdc, States};
 
 /// The min/max initial value (`INF` = 1e30).
 pub(crate) const INF: f32 = 1e30;
@@ -37,6 +37,9 @@ pub struct CrprPath {
     pub clk_edge: usize,
 }
 
+/// [`Tag::key`]: transition, min/max, clock edge, is-clock, CRPR vertex id, states.
+pub(crate) type TagKey = (usize, usize, i64, bool, i64, (u32, u64));
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Tag {
     pub rf: usize,
@@ -45,25 +48,29 @@ pub struct Tag {
     pub clk_edge: Option<usize>,
     pub is_clock: bool,
     pub crpr: Option<CrprPath>,
+    /// The path delays the path is under (`Tag::states`).
+    pub states: States,
 }
 
 impl Tag {
-    /// `TagMatchLess(match_crpr_clk_pin = true)` key: the CRPR path compares by its vertex's id.
-    pub(crate) fn key(&self, vertex_id: &[usize]) -> (usize, usize, i64, bool, i64) {
-        (self.rf, self.mm, self.clk_edge.map_or(-1, |e| e as i64), self.is_clock, self.crpr.map_or(-1, |c| vertex_id[c.vertex] as i64))
+    /// `TagMatchLess(match_crpr_clk_pin = true)` key: the CRPR path compares by its vertex's id;
+    /// the exception states last (`Tag::stateCmp`).
+    pub(crate) fn key(&self, vertex_id: &[usize]) -> TagKey {
+        (self.rf, self.mm, self.clk_edge.map_or(-1, |e| e as i64), self.is_clock, self.crpr.map_or(-1, |c| vertex_id[c.vertex] as i64), self.states.key())
     }
 
-    /// Tags equal, the CRPR clock vertex included.
+    /// Tags equal, the CRPR clock vertex and the states included.
     fn matches(&self, other: &Tag) -> bool {
-        self.rf == other.rf && self.mm == other.mm && self.clk_edge == other.clk_edge && self.is_clock == other.is_clock && self.crpr.map(|c| c.vertex) == other.crpr.map(|c| c.vertex)
+        self.rf == other.rf && self.mm == other.mm && self.clk_edge == other.clk_edge && self.is_clock == other.is_clock && self.crpr.map(|c| c.vertex) == other.crpr.map(|c| c.vertex) && self.states == other.states
     }
 
-    /// Everything but the CRPR clock pin.
+    /// Everything but the CRPR clock pin (`Tag::matchNoCrpr`: the states included).
     pub(crate) fn matches_no_crpr(&self, other: &Tag) -> bool {
-        self.rf == other.rf && self.mm == other.mm && self.clk_edge == other.clk_edge && self.is_clock == other.is_clock
+        self.rf == other.rf && self.mm == other.mm && self.clk_edge == other.clk_edge && self.is_clock == other.is_clock && self.states == other.states
     }
 
-    /// Transition, clock edge, is-clock — NOT min/max.
+    /// Transition, clock edge, is-clock — NOT min/max, and not the states: `stateEqualCrpr`
+    /// compares loop states only, and there are none here.
     fn matches_crpr(&self, other: &Tag) -> bool {
         self.rf == other.rf && self.clk_edge == other.clk_edge && self.is_clock == other.is_clock
     }
@@ -209,7 +216,11 @@ impl<'g, 'a> Search<'g, 'a> {
                     return None;
                 }
                 let crpr = from.tag.crpr.or(Some(CrprPath { vertex: from_v, rf: from.tag.rf, mm, clk_edge: from.tag.clk_edge.unwrap() }));
-                let tag = Tag { rf: arc.to_rf, mm, clk_edge: from.tag.clk_edge, is_clock: false, crpr };
+                // `fromRegClkTag`: the states of the path delays from the clock pin (or the
+                // clock), then `thruTag` over the clock-to-Q edge.
+                let states = self.sdc.exception_from_states(&self.graph.vertices[from_v].name, true, mm);
+                let states = self.mutate_states(states, from_v, to_v, mm);
+                let tag = Tag { rf: arc.to_rf, mm, clk_edge: from.tag.clk_edge, is_clock: false, crpr, states };
                 // `clkPathArrival`: an IDEAL clock launches at its edge (no insertion or latency
                 // set), whatever the clock network's delays.
                 let launch = if self.sdc.clock.propagated { from.arrival } else { self.sdc.clock.edge_time(from.tag.clk_edge.unwrap()) };
@@ -227,15 +238,69 @@ impl<'g, 'a> Search<'g, 'a> {
                 } else {
                     from.tag.crpr
                 };
-                let tag = Tag { rf: arc.to_rf, mm, clk_edge: from.tag.clk_edge, is_clock: to_is_clk, crpr };
+                let states = self.mutate_states(from.tag.states, from_v, to_v, mm);
+                let tag = Tag { rf: arc.to_rf, mm, clk_edge: from.tag.clk_edge, is_clock: to_is_clk, crpr, states };
                 Some((tag, delay, from.arrival + delay))
             }
             _ => {
-                // A data path keeps its tag.
-                let tag = Tag { rf: arc.to_rf, ..from.tag };
+                // A data path keeps its tag, its states mutated.
+                let states = self.mutate_states(from.tag.states, from_v, to_v, mm);
+                let tag = Tag { rf: arc.to_rf, states, ..from.tag };
                 Some((tag, delay, from.arrival + delay))
             }
         }
+    }
+
+    /// `Search::mutateTag`'s states over an edge `from_v` → `to_v` (no `-through`, no false paths):
+    /// unchanged unless a path delay completes at `to_v`; then, every state but those complete at
+    /// `from_v` — so a path delay's tag is dropped on the edge LEAVING its `-to` pin only when
+    /// that edge's own `to` completes one too (the reference's two passes test different pins).
+    fn mutate_states(&self, states: States, from_v: usize, to_v: usize, mm: usize) -> States {
+        if states == States::NONE {
+            return states;
+        }
+        let to_pin = &self.graph.vertices[to_v].name;
+        if !states.ids().any(|id| self.sdc.is_complete_to_pin(id, to_pin, mm)) {
+            return states;
+        }
+        let from_pin = &self.graph.vertices[from_v].name;
+        States(states.ids().filter(|&id| !self.sdc.is_complete_to_pin(id, from_pin, mm)).fold(0, |m, id| m | 1 << id))
+    }
+
+    /// Whether every path delay is of the form this search models, else what is not: from
+    /// register clock pins (`isExceptionStartpoint`) or the clock, to pins with a timing check
+    /// (`hasLibertyCheckTo` — never internal) or the clock (no output delays); a max delay only
+    /// `-ignore_clock_latency`; at most 64.
+    pub fn path_delays_modelled(&self) -> Result<(), String> {
+        if self.sdc.path_delays.len() > 64 {
+            return Err(format!("{} path delays: not modelled (64 are)", self.sdc.path_delays.len()));
+        }
+        let find = |pin: &str| self.graph.vertices.iter().position(|x| x.name == pin);
+        for pd in &self.sdc.path_delays {
+            let cmd = if pd.min_max == MAX { "set_max_delay" } else { "set_min_delay" };
+            if pd.min_max == MAX && !pd.ignore_clk_latency {
+                return Err("set_max_delay without -ignore_clock_latency: not modelled".into());
+            }
+            if (pd.from_pins.is_empty() && !pd.from_clock) || (pd.to_pins.is_empty() && !pd.to_clock) || (pd.from_clock && !pd.from_pins.is_empty()) || (pd.to_clock && !pd.to_pins.is_empty()) {
+                return Err(format!("{cmd} without -from / -to, or -from / -to both pins and the clock: not modelled"));
+            }
+            // A path delay ending at an output delay (`visitOutputDelayEnd1`) is not modelled.
+            if pd.to_clock && !self.sdc.output_delays.is_empty() {
+                return Err(format!("{cmd} -to the clock with output delays: not modelled"));
+            }
+            for pin in &pd.from_pins {
+                if !find(pin).is_some_and(|v| self.is_reg_clk[v]) {
+                    return Err(format!("{cmd} -from {pin} (not a register clock pin): not modelled"));
+                }
+            }
+            for pin in &pd.to_pins {
+                let check = find(pin).is_some_and(|v| self.graph.in_edges[v].iter().any(|&e| matches!(self.role(e), Some(Role::Setup | Role::Hold))));
+                if !check {
+                    return Err(format!("{cmd} -to {pin} (no timing check): not modelled"));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Every vertex in level order.
@@ -342,8 +407,11 @@ impl<'g, 'a> Search<'g, 'a> {
             // Per min/max and transition, the edge of that transition at
             // `insertion + edge time`.
             for mm in [MIN, MAX] {
+                // `seedClkArrival` → `exceptionFromClkStates`: the path delays from the clock's
+                // pin or from the clock ride on its clock tags too.
+                let states = self.sdc.exception_from_states(name, true, mm);
                 for rf in [0, 1] {
-                    let tag = Tag { rf, mm, clk_edge: Some(rf), is_clock: true, crpr: None };
+                    let tag = Tag { rf, mm, clk_edge: Some(rf), is_clock: true, crpr: None, states };
                     set_arrival(bldr, tag, 0.0 + clock.edge_time(rf));
                 }
             }
@@ -351,8 +419,10 @@ impl<'g, 'a> Search<'g, 'a> {
             // The clock's rise edge + the delay.
             for mm in [MIN, MAX] {
                 let clk_arrival = clock.edge_time(0);
+                // `inputDelayTag` → `exceptionFromStates(pin, clk)`: from the port, or its clock.
+                let states = self.sdc.exception_from_states(name, true, mm);
                 for rf in [0, 1] {
-                    let tag = Tag { rf, mm, clk_edge: Some(0), is_clock: false, crpr: None };
+                    let tag = Tag { rf, mm, clk_edge: Some(0), is_clock: false, crpr: None, states };
                     set_arrival(bldr, tag, clk_arrival + self.sdc.input_delays[d].delay[rf][mm]);
                 }
             }
@@ -461,7 +531,15 @@ impl<'g, 'a> Search<'g, 'a> {
                         if tgt.tag.mm != MIN || tgt.tag.rf != arc.from_rf || !tgt.tag.is_clock {
                             continue;
                         }
+                        // `visitCheckEnd`: a path delay completing here overrides the check —
+                        // `PathEndPathDelay` with the check's arc as its margin.
                         let tgt_edge = tgt.tag.clk_edge.expect("a clock path has an edge");
+                        if let Some(id) = self.sdc.path_delay_to(path.tag.states, name, true, MAX) {
+                            let latency = if clock.propagated { (tgt.arrival - clock.edge_time(tgt_edge)) - 0.0 } else { 0.0 };
+                            let required = self.path_delay_required(path, id, self.arc_delay(e, k, MAX), latency, self.check_crpr(path, tgt_v, tgt));
+                            Self::required_set(req, i, required, MAX);
+                            continue;
+                        }
                         // The check's required time.
                         // An ideal clock's target has no network latency (`targetClkDelay`).
                         let latency = if clock.propagated { (tgt.arrival - clock.edge_time(tgt_edge)) - 0.0 } else { 0.0 };
@@ -473,6 +551,49 @@ impl<'g, 'a> Search<'g, 'a> {
                 }
             }
         }
+    }
+
+    /// `PathEndPathDelay::requiredTime` at a check, `latency` the target clock path's network
+    /// delay (`targetClkDelay`), `crpr` the check's credit. Under `-ignore_clock_latency`: the
+    /// source clock path's arrival + the delay; else the target clock arrival WITHOUT its edge
+    /// time (`targetClkArrivalNoCrpr`: delay + uncertainty) + the check's CRPR (negated for
+    /// hold, `checkCrpr`) + the delay − the source offset (−the source edge's time, which the
+    /// arrival includes and the delay does not). Then less a max path's margin, plus a min's.
+    fn path_delay_required(&self, path: &Path, id: usize, margin: f32, latency: f32, crpr: f32) -> f32 {
+        let pd = &self.sdc.path_delays[id];
+        let with_delay = if pd.ignore_clk_latency {
+            self.path_clk_path_arrival(path) + pd.delay
+        } else {
+            let check_crpr = if path.tag.mm == MAX { crpr } else { 0.0 - crpr };
+            let tgt_clk_arrival = (latency + 0.0) + check_crpr;
+            let src_clk_offset = path.tag.clk_edge.map_or(0.0, |e| -self.sdc.clock.edge_time(e));
+            (tgt_clk_arrival + pd.delay) - src_clk_offset
+        };
+        if path.tag.mm == MAX {
+            with_delay - margin
+        } else {
+            with_delay + margin
+        }
+    }
+
+    /// `Search::pathClkPathArrival`: a propagated clock's source clock path arrival — back along
+    /// the path to its first clock path, or to the path a clock-to-Q edge left (`clkPathArrival`:
+    /// its arrival); else (ideal, or none) the clock edge's time (no latency set).
+    fn path_clk_path_arrival(&self, path: &Path) -> f32 {
+        if self.sdc.clock.propagated {
+            let mut p = path;
+            loop {
+                if p.tag.is_clock {
+                    return p.arrival;
+                }
+                let Some((_, prev)) = self.prev_path(p) else { break };
+                if p.prev.is_some_and(|pr| matches!(self.role(pr.edge), Some(Role::RegClkToQ | Role::LatchEnToQ))) {
+                    return prev.arrival;
+                }
+                p = prev;
+            }
+        }
+        path.tag.clk_edge.map_or(0.0, |e| self.sdc.clock.edge_time(e) + 0.0)
     }
 
     /// A min path's ends (`PathEndOutputDelay` / `PathEndCheck` under the hold role): the
@@ -505,6 +626,12 @@ impl<'g, 'a> Search<'g, 'a> {
                     }
                     let tgt_edge = tgt.tag.clk_edge.expect("a clock path has an edge");
                     let latency = if clock.propagated { (tgt.arrival - clock.edge_time(tgt_edge)) - 0.0 } else { 0.0 };
+                    // `visitCheckEnd`: a path delay completing here overrides the check.
+                    if let Some(id) = self.sdc.path_delay_to(path.tag.states, &self.graph.vertices[v].name, true, MIN) {
+                        let required = self.path_delay_required(path, id, self.arc_delay(e, k, MIN), latency, self.check_crpr(path, tgt_v, tgt));
+                        Self::required_set(req, i, required, MIN);
+                        continue;
+                    }
                     let tgt_clk_arrival = (0.0 + latency) + hold_required_time(clock, src_edge, tgt_edge);
                     let margin = self.arc_delay(e, k, MIN);
                     let crpr = self.check_crpr(path, tgt_v, tgt);
@@ -662,12 +789,19 @@ mod tests {
             clock: Clock::new("c", 1e-9, "clk", true),
             input_delays: vec![PortDelay::uniform("in", 0.2e-9)],
             output_delays: vec![PortDelay::uniform("out", 0.2e-9)],
+            path_delays: Vec::new(),
         };
         (libs, netlist, sdc)
     }
 
     fn timed<R>(f: impl FnOnce(&Search, &dyn Fn(&str) -> usize) -> R) -> R {
-        let (libs, netlist, sdc) = design();
+        timed_with(|_| {}, f)
+    }
+
+    /// [`timed`] with the constraints edited first.
+    fn timed_with<R>(edit: impl FnOnce(&mut Sdc), f: impl FnOnce(&Search, &dyn Fn(&str) -> usize) -> R) -> R {
+        let (libs, netlist, mut sdc) = design();
+        edit(&mut sdc);
         let mut g = Graph::build(&libs, &netlist).unwrap();
         g.find_delays(&HashMap::new(), None).unwrap();
         let mut s = Search::in_graph_order(&g, &sdc);
@@ -796,5 +930,92 @@ mod tests {
             assert_eq!(s.net_slack(&[dv]), s.vertex_slack(dv));
             assert_eq!(s.net_slack(&[]), INF);
         });
+    }
+
+    /// `set_max_delay -ignore_clock_latency -from f1/CLK -to f2/D <d>`.
+    fn max_delay_f1_f2(d: f32) -> crate::sdc::PathDelay {
+        crate::sdc::PathDelay { from_pins: vec!["f1/CLK".into()], from_clock: false, to_pins: vec!["f2/D".into()], to_clock: false, min_max: MAX, ignore_clk_latency: true, break_path: true, delay: d }
+    }
+
+    /// Rules (`fromRegClkTag` → `exceptionFromStates`; `PathEndPathDelay::requiredTime`): a path
+    /// delay `-from` a register clock pin puts its state on the MAX paths that pin launches (its
+    /// min/max only); at the `-to` pin's setup check the path-delay end overrides the check, with
+    /// required = the SOURCE clock path's arrival (propagated, `-ignore_clock_latency`) + the
+    /// delay − the setup margin, and no CRPR. The input's path to f1/D carries no state.
+    #[test]
+    fn a_max_delay_from_a_clock_pin_overrides_the_setup_check() {
+        let d = 0.3e-9f32;
+        timed_with(
+            |sdc| sdc.path_delays.push(max_delay_f1_f2(d)),
+            |s, v| {
+                assert!(s.path_delays_modelled().is_ok());
+                for p in &s.paths[v("f1/Q")] {
+                    assert_eq!(p.tag.states, if p.tag.mm == MAX { States(1) } else { States::NONE });
+                }
+                assert!(s.paths[v("f1/D")].iter().all(|p| p.tag.states == States::NONE));
+                let (dv, ckv) = (v("f2/D"), v("f2/CLK"));
+                let e = *s.graph.in_edges[dv].iter().find(|&&e| s.role(e) == Some(Role::Setup) && s.graph.edges[e].from == ckv).unwrap();
+                for rf in [RISE, FALL] {
+                    let p = path(s, dv, rf, false);
+                    let q = s.prev_path(&p).unwrap().1;
+                    let src = s.prev_path(q).unwrap().1;
+                    assert!(src.tag.is_clock);
+                    let k = s.arcs_from(e, RISE).iter().position(|a| a.to_rf == rf).unwrap();
+                    assert_eq!(p.required, (src.arrival + d) - s.graph.delay[e][k][MAX]);
+                }
+            },
+        );
+    }
+
+    /// Rules (`seedClkArrival` / `fromRegClkTag` → the `-from` clock's states;
+    /// `PathEndPathDelay::requiredTime` without `-ignore_clock_latency`, hold role): `set_min_delay
+    /// -from clk -to clk` rides the min clock tags and the min paths the registers launch; at a hold
+    /// check it overrides the check with required = (target clock latency − CRPR) + the delay −
+    /// (−source edge time) + the hold margin — no target edge time.
+    #[test]
+    fn a_min_delay_between_clocks_overrides_the_hold_check() {
+        let d = 0.8e-9f32;
+        let pd = crate::sdc::PathDelay { from_pins: Vec::new(), from_clock: true, to_pins: Vec::new(), to_clock: true, min_max: MIN, ignore_clk_latency: false, break_path: true, delay: d };
+        let (libs, netlist, mut sdc) = design();
+        sdc.output_delays.clear();
+        sdc.path_delays.push(pd);
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        g.find_delays(&HashMap::new(), None).unwrap();
+        let mut s = Search::in_graph_order(&g, &sdc);
+        assert!(s.path_delays_modelled().is_ok());
+        s.find_arrivals().unwrap();
+        s.find_requireds().unwrap();
+        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        for p in s.paths[v("b1/X")].iter().chain(&s.paths[v("f1/Q")]) {
+            assert_eq!(p.tag.states, if p.tag.mm == MIN { States(1) } else { States::NONE });
+        }
+        let (dv, ckv) = (v("f2/D"), v("f2/CLK"));
+        let e = *s.graph.in_edges[dv].iter().find(|&&e| s.role(e) == Some(Role::Hold)).unwrap();
+        for rf in [RISE, FALL] {
+            let p = *s.paths[dv].iter().find(|p| p.tag.rf == rf && p.tag.mm == MIN && p.tag.clk_edge == Some(RISE) && p.tag.states == States(1)).unwrap();
+            let k = s.arcs_from(e, RISE).iter().position(|a| a.to_rf == rf).unwrap();
+            let tgt = s.paths[ckv].iter().find(|t| t.tag.mm == MAX && t.tag.rf == RISE && t.tag.is_clock).unwrap();
+            let latency = (tgt.arrival - sdc.clock.edge_time(RISE)) - 0.0;
+            let crpr = s.check_crpr(&p, ckv, tgt);
+            let expect = (((latency + 0.0) + (0.0 - crpr)) + d) - -sdc.clock.edge_time(RISE) + s.graph.delay[e][k][MIN];
+            assert_eq!(p.required, expect);
+        }
+    }
+
+    /// The modelled forms only: a `-from` that is not a register clock pin, and `set_min_delay`,
+    /// are refused rather than timed wrong.
+    #[test]
+    fn unmodelled_path_delays_are_refused() {
+        let modelled = |pd: crate::sdc::PathDelay| {
+            let (libs, netlist, mut sdc) = design();
+            sdc.path_delays.push(pd);
+            let g = Graph::build(&libs, &netlist).unwrap();
+            Search::in_graph_order(&g, &sdc).path_delays_modelled()
+        };
+        assert!(modelled(max_delay_f1_f2(1e-9)).is_ok());
+        assert!(modelled(crate::sdc::PathDelay { from_pins: vec!["f1/Q".into()], ..max_delay_f1_f2(1e-9) }).is_err());
+        assert!(modelled(crate::sdc::PathDelay { to_pins: vec!["f2/Q".into()], ..max_delay_f1_f2(1e-9) }).is_err());
+        assert!(modelled(crate::sdc::PathDelay { to_pins: Vec::new(), to_clock: true, ..max_delay_f1_f2(1e-9) }).is_err());
+        assert!(modelled(crate::sdc::PathDelay { ignore_clk_latency: false, ..max_delay_f1_f2(1e-9) }).is_err());
     }
 }

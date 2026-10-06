@@ -21,7 +21,7 @@ use std::cmp::Ordering;
 use crate::fuzzy;
 use crate::graph::EdgeKind;
 use crate::liberty::{Role, MAX};
-use crate::search::{Path, Search, Tag};
+use crate::search::{Path, Search, Tag, TagKey};
 
 /// One pin of an enumerated path.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -95,7 +95,7 @@ pub fn cmp_ends(s: &Search<'_, '_>, a: &PathEnd, b: &PathEnd) -> Ordering {
 }
 
 /// The proxy for `TagIndex` (see [`cmp_ends`]).
-fn tag_order(s: &Search<'_, '_>, t: &Tag) -> (usize, (usize, usize, i64, bool, i64)) {
+fn tag_order(s: &Search<'_, '_>, t: &Tag) -> (usize, TagKey) {
     (t.rf, t.key(&s.vertex_id))
 }
 
@@ -302,6 +302,7 @@ mod tests {
             clock: Clock::new("c", 1e-9, "clk", false),
             input_delays: vec![PortDelay::uniform("a", 0.2e-9), PortDelay::uniform("b", 0.2e-9)],
             output_delays: vec![PortDelay::uniform("y", 0.2e-9)],
+            path_delays: Vec::new(),
         };
         let mut g = Graph::build(&libs, &netlist).unwrap();
         g.find_delays(&HashMap::new(), None).unwrap();

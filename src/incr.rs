@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::graph::{EdgeKind, Graph, NetParasitics};
 use crate::liberty::Role;
+use crate::sdc::States;
 use crate::search::{CrprPath, Path, Prev, Search, Tag};
 
 /// A gate edge by its ends and its arc set (cell, set index); a wire edge by its ends.
@@ -88,6 +89,7 @@ pub struct STag {
     pub clk_edge: Option<usize>,
     pub is_clock: bool,
     pub crpr: Option<(String, usize, usize, usize)>,
+    pub states: States,
 }
 
 /// Where a stored path came from — what the reference compares by pointer: the fanin vertex's
@@ -237,7 +239,7 @@ impl IncTimer {
 
 impl IncTimer {
     fn stag(g: &Graph<'_>, t: &Tag) -> STag {
-        STag { rf: t.rf, mm: t.mm, clk_edge: t.clk_edge, is_clock: t.is_clock, crpr: t.crpr.map(|c| (g_name(g, c.vertex), c.rf, c.mm, c.clk_edge)) }
+        STag { rf: t.rf, mm: t.mm, clk_edge: t.clk_edge, is_clock: t.is_clock, crpr: t.crpr.map(|c| (g_name(g, c.vertex), c.rf, c.mm, c.clk_edge)), states: t.states }
     }
 
     fn tag(index: &HashMap<String, usize>, t: &STag) -> Option<Tag> {
@@ -245,7 +247,7 @@ impl IncTimer {
             None => None,
             Some((n, rf, mm, clk_edge)) => Some(CrprPath { vertex: *index.get(n)?, rf: *rf, mm: *mm, clk_edge: *clk_edge }),
         };
-        Some(Tag { rf: t.rf, mm: t.mm, clk_edge: t.clk_edge, is_clock: t.is_clock, crpr })
+        Some(Tag { rf: t.rf, mm: t.mm, clk_edge: t.clk_edge, is_clock: t.is_clock, crpr, states: t.states })
     }
 
     fn gen_of(&self, name: &str) -> u64 {
