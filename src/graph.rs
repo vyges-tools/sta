@@ -262,7 +262,9 @@ impl<'a> Graph<'a> {
         }
     }
 
-    pub(crate) fn arc_set(&self, e: usize, set: usize) -> &crate::liberty::ArcSet {
+    /// The arc set of a gate edge as the graph holds it: an output-to-output edge of an instance
+    /// replaced by an equivalent-arcs cell keeps its OLD cell's set ([`Graph::stale_out_arcs`]).
+    pub fn arc_set(&self, e: usize, set: usize) -> &crate::liberty::ArcSet {
         let v = &self.vertices[self.edges[e].to];
         if !self.stale_out_arcs.is_empty() {
             let from = &self.vertices[self.edges[e].from];
@@ -498,6 +500,14 @@ impl<'a> Graph<'a> {
         };
         let load = |i: usize| index.get(&names[i]).is_some_and(|&v| !self.vertices[v].is_driver);
         Some((reduce_to_pi_elmore(&np.network, d, &NodePins { pin_cap: &cap, is_load: &load }), names.clone()))
+    }
+
+    /// `ArcDelayCalc::findParasitic(drvr_pin, rf, scene, min_max)`: the driver net's reduced pi model
+    /// `(c2, rpi, c1)` as the delay calculator finds it — no `parasiticLoad` rule applied (a net
+    /// `set_load`, a pi model under the pin cap): `None` without parasitics for the net.
+    pub fn reduced_pi(&self, drvr: usize, rf: usize, mm: usize, parasitics: &HashMap<String, NetParasitics>) -> Option<(f32, f32, f32)> {
+        let index = self.pin_index();
+        self.reduced(drvr, rf, mm, parasitics, &index).map(|(p, _)| (p.c2, p.rpi, p.c1))
     }
 
     /// `GraphDelayCalc::loadCap(drvr_pin, rf, scene, max, pin_cap, wire_cap)` for one transition,
