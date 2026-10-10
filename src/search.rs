@@ -727,11 +727,13 @@ impl<'g, 'a> Search<'g, 'a> {
             // A latch's EN -> Q launches as a register's CLK -> Q (`genericRole() == regClkToQ`).
             Some(Role::RegClkToQ | Role::LatchEnToQ) => {
                 // Only clocked clock paths launch, keeping the clock path's CRPR
-                // path — or taking this clock path when it has none.
+                // path — or taking this clock path when it has none. ⛔ `ClkInfo` keeps a CRPR
+                // path only for a PROPAGATED clock (`crpr_clk_path_(is_propagated ? … :
+                // nullptr)`): under an ideal clock every register's launch shares one tag.
                 if !from.tag.is_clock || from.tag.clk_edge.is_none() {
                     return None;
                 }
-                let crpr = from.tag.crpr.or(Some(CrprPath { vertex: from_v, rf: from.tag.rf, mm, clk_edge: from.tag.clk_edge.unwrap() }));
+                let crpr = from.tag.crpr.or(Some(CrprPath { vertex: from_v, rf: from.tag.rf, mm, clk_edge: from.tag.clk_edge.unwrap() })).filter(|c| self.propagated(c.clk_edge));
                 // `fromRegClkTag`: the states of the path delays from the clock pin (or the
                 // clock), then `thruTag` over the clock-to-Q edge.
                 let states = self.sdc.exception_from_states(&self.graph.vertices[from_v].name, true, mm);
@@ -755,11 +757,14 @@ impl<'g, 'a> Search<'g, 'a> {
                 let opp = self.arc_delay(e, arc.index, 1 - mm);
                 let min_max_eq = crate::fuzzy::equal(delay, opp);
                 let from_is_reg_clk = self.is_reg_clk[from_v];
+                // `thruClkInfo`: the CRPR path set here is dropped again by `ClkInfo` for a clock
+                // that is not propagated.
                 let crpr = if (!to_is_clk && !from_is_reg_clk) || (self.is_reg_clk[to_v] && min_max_eq) {
                     Some(CrprPath { vertex: from_v, rf: from.tag.rf, mm, clk_edge: from.tag.clk_edge.unwrap() })
                 } else {
                     from.tag.crpr
-                };
+                }
+                .filter(|c| self.propagated(c.clk_edge));
                 let states = self.mutate_states(from.tag.states, from_v, to_v, mm);
                 let tag = Tag { rf: arc.to_rf, mm, clk_edge: from.tag.clk_edge, is_clock: to_is_clk, crpr, states };
                 Some((tag, delay, from.arrival + delay))
@@ -1558,6 +1563,21 @@ mod tests {
             assert_eq!(q.tag.crpr.map(|c| c.vertex), Some(v("b1/X")));
             assert_eq!(q.tag.clk_edge, Some(RISE));
         });
+    }
+
+    /// Rule: `ClkInfo` keeps a CRPR clock path only for a PROPAGATED clock
+    /// (`crpr_clk_path_(is_propagated ? crpr_clk_path : nullptr)`) — under an ideal clock neither
+    /// the clock tag nor the launched data tag carries one, so every register's launch shares a
+    /// tag (one merged arrival, one fuzzy change test, where per-register tags left ~1 fs drift).
+    #[test]
+    fn an_ideal_clock_carries_no_crpr_path() {
+        timed_with(
+            |sdc| sdc.clocks[0].propagated = false,
+            |s, v| {
+                assert_eq!(path(s, v("f1/CLK"), RISE, true).tag.crpr, None);
+                assert_eq!(path(s, v("f1/Q"), RISE, false).tag.crpr, None);
+            },
+        );
     }
 
     /// Arrivals are float sums along the path: clock edge + buffer + clock-to-Q; an input's is

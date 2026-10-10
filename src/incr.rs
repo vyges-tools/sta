@@ -73,6 +73,10 @@ pub struct IncTimer {
     /// The last arrival / required visits: `(vertex, changed)` (`VYGAV` / `VYGRV`).
     pub arrival_visits: Vec<(String, bool)>,
     pub required_visits: Vec<(String, bool)>,
+    /// A diagnostic (`VYGES_STA_ARRIVAL_VALUES` set): each visited vertex's new paths beside the
+    /// stored arrival of their tag, `vertex|rf|mm|clk|old|new` (float bits, hex; `-` when the tag
+    /// is new) — the instrumented reference's `VYGAA` lines.
+    pub arrival_values: Vec<String>,
     /// Each instance's cell and each top port's direction (input: true), kept by the events.
     pub cells: HashMap<String, String>,
     pub port_input: HashMap<String, bool>,
@@ -502,6 +506,7 @@ type SceneArrivals = (usize, Vec<Path>, Vec<SPath>);
 pub fn find_arrivals_scenes(incs: &mut [IncTimer], searches: &mut [Search<'_, '_>], to_level: Option<i32>) -> Result<(), String> {
     for inc in incs.iter_mut() {
         inc.arrival_visits.clear();
+        inc.arrival_values.clear();
     }
     if !incs[0].arrivals_exist {
         for (inc, search) in incs.iter_mut().zip(searches.iter_mut()) {
@@ -560,6 +565,11 @@ pub fn find_arrivals_scenes(incs: &mut [IncTimer], searches: &mut [Search<'_, '_
     Ok(())
 }
 
+fn arrival_values_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VYGES_STA_ARRIVAL_VALUES").is_some())
+}
+
 /// `ArrivalVisitor::visit(vertex, with_latch_edges)` over every scene: the new paths; when they
 /// changed, stored and the fanout enqueued — a latch data pin's latch outputs postponed instead.
 fn visit_arrivals(incs: &mut [IncTimer], searches: &mut [Search<'_, '_>], indexes: &[HashMap<String, usize>], levels: &HashMap<String, i32>, by_level: &mut BTreeMap<i32, BTreeSet<String>>, name: &str) {
@@ -577,6 +587,14 @@ fn visit_arrivals(incs: &mut [IncTimer], searches: &mut [Search<'_, '_>], indexe
         let new: Vec<Path> = searches[k].arrival_paths(v);
         let snew: Vec<SPath> = new.iter().map(|p| incs[k].spath(g, p)).collect();
         changed |= IncTimer::arrivals_changed(incs[k].paths.get(&name), &snew);
+        if arrival_values_on() {
+            let stored = incs[k].paths.get(&name);
+            for p in &snew {
+                let old = stored.and_then(|o| o.iter().find(|q| q.tag == p.tag)).map_or_else(|| "-".to_string(), |q| format!("{:08x}", q.arrival.to_bits()));
+                let line = format!("{name}|{}|{}|{}|{old}|{:08x}", p.tag.rf, p.tag.mm, u8::from(p.tag.is_clock), p.arrival.to_bits());
+                incs[k].arrival_values.push(line);
+            }
+        }
         // `setVertexArrivals`: the same tag group keeps its array.
         same_group &= incs[k].paths.get(&name).is_some_and(|o| o.len() == snew.len() && o.iter().all(|p| snew.iter().any(|q| q.tag == p.tag)));
         news.push(Some((v, new, snew)));
