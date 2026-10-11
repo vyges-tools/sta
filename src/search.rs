@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use crate::graph::{EdgeKind, Graph};
 use crate::liberty::{Role, MAX, MIN};
-use crate::sdc::{Sdc, States, ACCT_HOLD, ACCT_LATCH_SETUP, ACCT_SETUP};
+use crate::sdc::{PortDelay, Sdc, States, ACCT_HOLD, ACCT_LATCH_SETUP, ACCT_SETUP};
 
 /// The min/max initial value (`INF` = 1e30).
 pub(crate) const INF: f32 = 1e30;
@@ -134,8 +134,11 @@ pub struct Search<'g, 'a> {
     pub paths: Vec<Vec<Path>>,
     /// Vertex id order (the order vertices were created in), which orders CRPR tags.
     pub(crate) vertex_id: Vec<usize>,
-    input_delay: HashMap<String, usize>,
-    output_delay: HashMap<String, usize>,
+    /// Each port's input delays, one per clock (indices into [`Sdc::input_delays`]), in the
+    /// order they were made.
+    input_delay: HashMap<String, Vec<usize>>,
+    /// Each port's output delays, one per clock, likewise.
+    output_delay: HashMap<String, Vec<usize>>,
     /// A vertex whose out-edges include a clock-to-Q arc.
     is_reg_clk: Vec<bool>,
     /// `Levelize`: roots 0, else the longest fanin level + 1 over non-check edges.
@@ -459,8 +462,8 @@ impl<'g, 'a> Search<'g, 'a> {
                 }
             }
         }
-        let input_delay = sdc.input_delays.iter().enumerate().map(|(i, d)| (d.port.clone(), i)).collect();
-        let output_delay = sdc.output_delays.iter().enumerate().map(|(i, d)| (d.port.clone(), i)).collect();
+        let input_delay = port_delays(&sdc.input_delays);
+        let output_delay = port_delays(&sdc.output_delays);
         let mut level = vec![0usize; n];
         if let Ok(order) = graph.topo_order() {
             for v in order {
@@ -978,19 +981,29 @@ impl<'g, 'a> Search<'g, 'a> {
                     }
                 }
             }
-        } else if let Some(&d) = self.input_delay.get(name).filter(|&&d| self.sdc.input_delays[d].clock < self.sdc.clocks.len()) {
-            // Its clock's rise edge + the delay.
-            let edge = 2 * self.sdc.input_delays[d].clock;
-            for mm in [MIN, MAX] {
-                let clk_arrival = self.edge_time(edge);
-                // `inputDelayTag` → `exceptionFromStates(pin, clk)`: from the port, or its clock.
-                let states = self.sdc.exception_from_states(name, true, mm);
-                for rf in [0, 1] {
-                    let tag = Tag { rf, mm, clk_edge: Some(edge), is_clock: false, crpr: None, states };
-                    set_arrival(bldr, tag, clk_arrival + self.sdc.input_delays[d].delay[rf][mm]);
+        }
+        let delays: Vec<usize> = self.input_delay.get(name).map(|l| l.iter().copied().filter(|&d| self.sdc.input_delays[d].clock < self.sdc.clocks.len()).collect()).unwrap_or_default();
+        if !delays.is_empty() {
+            // `seedInputArrival1`: an arrival per input delay, one per clock — but none for a
+            // delay relative to a clock defined on the pin itself (its arrival there is the
+            // clock's own). Each at its clock's rise edge + the delay.
+            for d in delays {
+                let clock = self.sdc.input_delays[d].clock;
+                if sources.contains(&clock) {
+                    continue;
+                }
+                let edge = 2 * clock;
+                for mm in [MIN, MAX] {
+                    let clk_arrival = self.edge_time(edge);
+                    // `inputDelayTag` → `exceptionFromStates(pin, clk)`: from the port, or its clock.
+                    let states = self.sdc.exception_from_states(name, true, mm);
+                    for rf in [0, 1] {
+                        let tag = Tag { rf, mm, clk_edge: Some(edge), is_clock: false, crpr: None, states };
+                        set_arrival(bldr, tag, clk_arrival + self.sdc.input_delays[d].delay[rf][mm]);
+                    }
                 }
             }
-        } else if self.graph.vertices[v].is_driver {
+        } else if sources.is_empty() && self.graph.vertices[v].is_driver {
             // `seedInputDelayArrival(input_delay = null)` → `inputDelayTag` with no clock edge:
             // the states of the path delays from the port alone.
             for mm in [MIN, MAX] {
@@ -1072,7 +1085,7 @@ impl<'g, 'a> Search<'g, 'a> {
     /// setup for a max path, hold for a min path.
     fn visit_path_ends(&self, v: usize, req: &mut [f32]) {
         let name = &self.graph.vertices[v].name;
-        let od = if self.graph.vertices[v].lib.is_none() { self.output_delay.get(name).copied() } else { None };
+        let ods: &[usize] = if self.graph.vertices[v].lib.is_none() { self.output_delay.get(name).map_or(&[], Vec::as_slice) } else { &[] };
         let checks = self.graph.in_edges[v].iter().any(|&e| self.is_check(e));
         let gated = self.gated.get(&v).copied();
         for (i, path) in self.paths[v].iter().enumerate() {
@@ -1084,7 +1097,7 @@ impl<'g, 'a> Search<'g, 'a> {
             }
             // `visitClkedPathEnds`: no output delay and no check — a path delay `-to` the pin
             // (`pathDelayTo`, no target clock), whatever the path's clock.
-            if od.is_none() && !checks {
+            if ods.is_empty() && !checks {
                 if let Some(id) = self.sdc.path_delay_to(path.tag.states, name, false, path.tag.mm) {
                     Self::required_set(req, i, self.path_delay_required(path, id, 0.0, 0.0, 0.0), path.tag.mm);
                 }
@@ -1093,22 +1106,25 @@ impl<'g, 'a> Search<'g, 'a> {
             let Some(src_edge) = path.tag.clk_edge else {
                 // An unclocked path at a check (`visitCheckEndUnclked`): a path delay `-to` the
                 // pin with the check's arc as margin and no target clock path.
-                if od.is_none() {
+                if ods.is_empty() {
                     self.unclocked_check_ends(v, i, path, req);
                 }
                 continue;
             };
             if path.tag.mm == MIN {
-                self.hold_path_ends(v, od, i, path, src_edge, req);
+                self.hold_path_ends(v, ods, i, path, src_edge, req);
                 continue;
             }
-            if let Some(d) = od {
-                // Target clock time (the delay's rise edge) − the delay; none when the delay
-                // sets no max value for this transition.
-                if self.sdc.output_delays[d].exists[path.tag.rf][MAX] {
-                    let tgt_time = self.accting(src_edge, 2 * self.sdc.output_delays[d].clock).required[ACCT_SETUP];
-                    let margin = self.sdc.output_delays[d].delay[path.tag.rf][MAX];
-                    Self::required_set(req, i, (tgt_time + (0.0 + 0.0)) - margin, MAX);
+            if !ods.is_empty() {
+                // `visitOutputDelayEnd`: an end per output delay (one per clock). Target clock
+                // time (the delay's rise edge) − the delay; none when the delay sets no max
+                // value for this transition.
+                for &d in ods {
+                    if self.sdc.output_delays[d].exists[path.tag.rf][MAX] {
+                        let tgt_time = self.accting(src_edge, 2 * self.sdc.output_delays[d].clock).required[ACCT_SETUP];
+                        let margin = self.sdc.output_delays[d].delay[path.tag.rf][MAX];
+                        Self::required_set(req, i, (tgt_time + (0.0 + 0.0)) - margin, MAX);
+                    }
                 }
                 continue;
             }
@@ -1334,12 +1350,14 @@ impl<'g, 'a> Search<'g, 'a> {
     /// output delay's hold end, `target + −min delay`; else each hold check, against the LATE
     /// (max) target clock path (`tgtClkEarlyLate`), `(target + margin) − crpr`. The target time is
     /// the hold cycle accounting's.
-    fn hold_path_ends(&self, v: usize, od: Option<usize>, i: usize, path: &Path, src_edge: usize, req: &mut [f32]) {
-        if let Some(d) = od {
-            if self.sdc.output_delays[d].exists[path.tag.rf][MIN] {
-                let tgt_time = self.accting(src_edge, 2 * self.sdc.output_delays[d].clock).required[ACCT_HOLD];
-                let margin = -self.sdc.output_delays[d].delay[path.tag.rf][MIN];
-                Self::required_set(req, i, (tgt_time + (0.0 + 0.0)) + margin, MIN);
+    fn hold_path_ends(&self, v: usize, ods: &[usize], i: usize, path: &Path, src_edge: usize, req: &mut [f32]) {
+        if !ods.is_empty() {
+            for &d in ods {
+                if self.sdc.output_delays[d].exists[path.tag.rf][MIN] {
+                    let tgt_time = self.accting(src_edge, 2 * self.sdc.output_delays[d].clock).required[ACCT_HOLD];
+                    let margin = -self.sdc.output_delays[d].delay[path.tag.rf][MIN];
+                    Self::required_set(req, i, (tgt_time + (0.0 + 0.0)) + margin, MIN);
+                }
             }
             return;
         }
@@ -1472,6 +1490,21 @@ fn set_arrival(bldr: &mut Bldr, tag: Tag, arrival: f32) {
         Some(i) => bldr.paths[i] = path,
         None => bldr.paths.push(path),
     }
+}
+
+/// Each port's delays, one per clock in the order first made (`Sdc::findInputDelay` keys a delay
+/// by pin and clock edge). A later entry for the same port and clock replaces the earlier one in
+/// its place, as `setInputDelay` without `-add_delay` overwrites the delay it finds.
+fn port_delays(list: &[PortDelay]) -> HashMap<String, Vec<usize>> {
+    let mut map: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, d) in list.iter().enumerate() {
+        let on = map.entry(d.port.clone()).or_default();
+        match on.iter().position(|&k| list[k].clock == d.clock) {
+            Some(k) => on[k] = i,
+            None => on.push(i),
+        }
+    }
+    map
 }
 
 #[cfg(test)]
@@ -1607,6 +1640,88 @@ mod tests {
         assert_eq!(path(&s, v("f1/Q"), RISE, false).arrival, 0.0 + 0.3f32 * 1e-9, "launched at the edge");
         let d = path(&s, v("f2/D"), RISE, false);
         assert_eq!(d.required, (0.0 + 1e-9f32) - 0.05e-9, "captured at the edge, less the setup");
+    }
+
+    /// A second, virtual clock `v` (rising 0.3 ns into the same 1 ns period).
+    fn with_virtual_clock(sdc: &mut Sdc) {
+        let mut v = Clock::new("v", 1e-9, "", false);
+        v.waveform = [0.3e-9, 0.8e-9];
+        sdc.clocks.push(v);
+    }
+
+    /// Rule (`seedInputArrival1`): a port with input delays on two clocks gets an arrival per
+    /// delay, each tagged with its own clock's edge — not one delay replacing the other.
+    #[test]
+    fn input_delays_on_two_clocks_seed_an_arrival_each() {
+        timed_with(
+            |sdc| {
+                with_virtual_clock(sdc);
+                sdc.input_delays.push(PortDelay { clock: 1, ..PortDelay::uniform("in", 0.1e-9) });
+            },
+            |s, v| {
+                let edges = |rf| s.paths[v("f1/D")].iter().filter(|p| p.tag.mm == MAX && p.tag.rf == rf).map(|p| (p.tag.clk_edge, p.arrival)).collect::<Vec<_>>();
+                assert_eq!(edges(RISE), [(Some(0), 0.0 + 0.2e-9f32), (Some(2), 0.3e-9f32 + 0.1e-9)]);
+            },
+        );
+    }
+
+    /// Rule (`visitOutputDelayEnd`): a port with output delays on two clocks ends a path once per
+    /// delay; the path's required is the tighter of the two ends.
+    #[test]
+    fn output_delays_on_two_clocks_end_a_path_each() {
+        let req = |delays: &'static [(usize, f32)]| {
+            timed_with(
+                move |sdc| {
+                    with_virtual_clock(sdc);
+                    sdc.output_delays = delays.iter().map(|&(clock, d)| PortDelay { clock, ..PortDelay::uniform("out", d) }).collect();
+                },
+                |s, v| path(s, v("out"), RISE, false).required,
+            )
+        };
+        let (c, vr) = (req(&[(0, 0.2e-9)]), req(&[(1, 0.4e-9)]));
+        assert!(vr < c, "the virtual clock's end is the tighter: {vr} vs {c}");
+        assert_eq!(req(&[(0, 0.2e-9), (1, 0.4e-9)]), vr);
+        assert_eq!(req(&[(1, 0.4e-9), (0, 0.2e-9)]), vr);
+        // The hold ends likewise: a min path's required is the larger of the two.
+        let hold = |delays: &'static [(usize, f32)]| {
+            timed_with(
+                move |sdc| {
+                    with_virtual_clock(sdc);
+                    sdc.output_delays = delays.iter().map(|&(clock, d)| PortDelay { clock, ..PortDelay::uniform("out", d) }).collect();
+                },
+                |s, v| s.paths[v("out")].iter().find(|p| p.tag.rf == RISE && p.tag.mm == MIN && !p.tag.is_clock).unwrap().required,
+            )
+        };
+        let (hc, hv) = (hold(&[(0, 0.2e-9)]), hold(&[(1, 0.4e-9)]));
+        assert_ne!(hc, hv);
+        assert_eq!(hold(&[(0, 0.2e-9), (1, 0.4e-9)]), hc.max(hv));
+        assert_eq!(hold(&[(1, 0.4e-9), (0, 0.2e-9)]), hc.max(hv));
+    }
+
+    /// Rule (`findInputDelay` keys a delay by pin and clock edge; `setInputDelay` without
+    /// `-add_delay` overwrites the one it finds): a second entry for the same port and clock
+    /// replaces the first in its place.
+    #[test]
+    fn a_second_delay_on_the_same_clock_replaces_the_first() {
+        let list = [PortDelay::uniform("a", 1.0), PortDelay { clock: 1, ..PortDelay::uniform("a", 2.0) }, PortDelay::uniform("a", 3.0)];
+        assert_eq!(port_delays(&list)["a"], [2, 1]);
+    }
+
+    /// Rule (`seedInputArrival1`): an input delay on a clock's own source port seeds no arrival
+    /// for that clock, but one relative to another clock does, beside the clock arrivals.
+    #[test]
+    fn an_input_delay_on_a_clock_port_seeds_only_other_clocks() {
+        let data = |clock: usize| {
+            timed_with(
+                move |sdc| {
+                    with_virtual_clock(sdc);
+                    sdc.input_delays.push(PortDelay { clock, ..PortDelay::uniform("clk", 0.1e-9) });
+                },
+                |s, v| s.paths[v("clk")].iter().filter(|p| !p.tag.is_clock).map(|p| p.tag.clk_edge).collect::<Vec<_>>(),
+            )
+        };
+        assert!(data(0).is_empty());
+        assert_eq!(data(1), [Some(2); 4]);
     }
 
     /// Rule: ((min capture clock arrival − edge time) +
