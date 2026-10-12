@@ -209,6 +209,33 @@ impl Cell {
             0.0
         }
     }
+
+    /// `LibertyPort::intrinsicDelay(sta)`: the largest POSITIVE arc intrinsic delay over the
+    /// non-check arc sets into `port`, every transition; 0 when none is positive. An arc's
+    /// intrinsic delay is `TimingArc::intrinsicDelay` — its gate model's delay at input slew 0 and
+    /// load 0, no pvt (`gateDelay(nullptr, 0.0, 0.0, …)`).
+    pub fn intrinsic_delay(&self, port: &str) -> f32 {
+        let mut max_delay = f32::MIN;
+        let mut found = false;
+        for set in self.arc_sets.iter().filter(|s| s.to == port && !s.role.is_timing_check()) {
+            for arc in &set.arcs {
+                if let Model::Gate(m) = &arc.model {
+                    let (delay, _) = m.gate_delay(0.0, 0.0);
+                    if delay > 0.0 {
+                        if delay > max_delay {
+                            max_delay = delay;
+                        }
+                        found = true;
+                    }
+                }
+            }
+        }
+        if found {
+            max_delay
+        } else {
+            0.0
+        }
+}
 }
 
 /// `isInverter`: buffer ports whose output function is the input inverted (`!A`, `A'`), and
@@ -1137,6 +1164,23 @@ mod tests {
         // rise: 3 ns / 2 pF; fall: 5 ns / 2 pF — the max.
         assert_eq!(lib.cells["BUF"].drive_resistance("Z"), (5.0 * 1e-9f32) / (2.0 * 1e-12f32));
         assert_eq!(lib.cells["BUF"].drive_resistance("A"), 0.0);
+    }
+
+    // Rule (LibertyPort::intrinsicDelay): each arc's delay at input slew 0 and load 0, the largest
+    // positive one over the arcs into the port; 0 when none.
+    #[test]
+    fn intrinsic_delay_is_the_largest_arc_delay_at_zero_slew_and_load() {
+        let text = r#"library (l) { time_unit : "1ns" ; capacitive_load_unit (1, pf) ;
+            lu_table_template (t) { variable_1 : input_net_transition ; variable_2 : total_output_net_capacitance ;
+              index_1 ("0, 1") ; index_2 ("0, 2") ; }
+            cell (BUF) { pin (A) { direction : input ; }
+              pin (Z) { direction : output ; function : "A" ;
+                timing () { related_pin : "A" ; timing_sense : positive_unate ;
+                  cell_rise (t) { values ("2, 3", "5, 9") ; }
+                  cell_fall (t) { values ("4, 5", "5, 9") ; } } } } }"#;
+        let lib = Library::read(&parse(text).unwrap()).unwrap();
+        assert_eq!(lib.cells["BUF"].intrinsic_delay("Z"), 4.0 * 1e-9f32, "fall at (0, 0) is the larger");
+        assert_eq!(lib.cells["BUF"].intrinsic_delay("A"), 0.0);
     }
 
     // Rules (LibertyReader::makeSequentials): ff then latch; clock / data from clocked_on /
