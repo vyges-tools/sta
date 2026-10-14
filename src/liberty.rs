@@ -72,6 +72,8 @@ pub struct Port {
     pub max_fanout: Option<f32>,
     /// `three_state` (the tristate enable function), as text.
     pub three_state: Option<String>,
+    /// `clock_gate_clock_pin : true` (`isClockGateClock`).
+    pub is_clock_gate_clock: bool,
 }
 
 impl Port {
@@ -636,7 +638,8 @@ impl Library {
         let fanout_load = pg.attr_float("fanout_load");
         let max_fanout = pg.attr_float("max_fanout");
         let three_state = pg.attr_text("three_state");
-        Port { name: name.to_string(), direction, is_clock, capacitance, function, max_transition, max_capacitance, fanout_load, max_fanout, three_state }
+        let is_clock_gate_clock = pg.attr_text("clock_gate_clock_pin").is_some_and(|c| c.eq_ignore_ascii_case("true"));
+        Port { name: name.to_string(), direction, is_clock, capacitance, function, max_transition, max_capacitance, fanout_load, max_fanout, three_state, is_clock_gate_clock }
     }
 }
 
@@ -845,7 +848,7 @@ impl Cell {
     }
 }
 
-fn identifiers(expr: &str) -> Vec<String> {
+pub fn identifiers(expr: &str) -> Vec<String> {
     expr.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '[' || c == ']')).filter(|t| !t.is_empty()).map(String::from).collect()
 }
 
