@@ -67,6 +67,13 @@ pub struct NetParasitics {
     /// network, and keeps only the pi model; a later `set_load` on a port changes the pin cap the
     /// delay calculation compares the pi model against, never the pi model itself.
     pub port_pin_caps: Option<HashMap<String, [[Option<f32>; 2]; 2]>>,
+    /// A pi model and Elmore delays SET on the net rather than reduced from `network`
+    /// (`Sta::makePiElmore` + `setElmore`): `elmore` indexes `node_names`. When present it is the
+    /// net's parasitic as the delay calculator finds it, unchanged by any pin capacitance.
+    pub pi: Option<crate::parasitics::PiElmore>,
+    /// The set pi model is for RISING transitions only (`makePiElmore(pin, RiseFall::rise(), …)`):
+    /// a falling transition finds no parasitic for the net at all.
+    pub pi_rise_only: bool,
 }
 
 pub struct Graph<'a> {
@@ -92,6 +99,10 @@ pub struct Graph<'a> {
     pub slew_annotated: HashMap<usize, f32>,
     /// The SDC environment the delay calculation reads; empty unless a caller sets it.
     pub sdc: SdcEnv,
+    /// Per vertex, the (library, cell) its pin capacitance is read from instead of its own — a
+    /// master swapped under a timer whose graph keeps the old arcs (a scratch characterization
+    /// timer that is not notified of `swapMaster`).
+    pub pin_cap_cell: HashMap<usize, (usize, String)>,
     /// Vertices on an IDEAL clock's network (`ClkNetwork::isIdealClock`). A register's clock-to-Q
     /// edge and a timing check read their clock-side slew from such a vertex as the ideal clock
     /// slew, 0 (`edgeFromSlew`, `checkEdgeClkSlew`); every other edge reads the graph's slew.
@@ -252,7 +263,7 @@ impl<'a> Graph<'a> {
                 EdgeKind::Wire => vec![[0.0f32; 2]; 2],
             })
             .collect();
-        Ok(Graph { libs, netlist, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), ideal_clock: std::collections::HashSet::new(), stale_out_arcs: HashMap::new() })
+        Ok(Graph { libs, netlist, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), stale_out_arcs: HashMap::new() })
     }
 
     pub fn is_check(&self, e: usize) -> bool {
@@ -323,7 +334,7 @@ impl<'a> Graph<'a> {
     }
 
     /// Topological order over the propagating edges (every edge but timing checks).
-    pub(crate) fn topo_order(&self) -> Result<Vec<usize>, String> {
+    pub fn topo_order(&self) -> Result<Vec<usize>, String> {
         let n = self.vertices.len();
         let mut indeg = vec![0usize; n];
         for (e, ed) in self.edges.iter().enumerate() {
@@ -426,6 +437,11 @@ impl<'a> Graph<'a> {
     /// A pin's capacitance as `Sdc::pinCaps` and `ReduceToPi::pinCapacitance` read it: an
     /// instance pin's liberty port capacitance; a top-level port's `set_load -pin_load` (0 without).
     fn pin_cap(&self, v: usize, rf: usize, mm: usize) -> f32 {
+        // A cell swapped in the database the timer was not told about: its pins' capacitances are
+        // read through the network (the new master's), its arcs stay the graph's.
+        if let (Some((l, c)), Some(p)) = (self.pin_cap_cell.get(&v), &self.vertices[v].port) {
+            return cell(self.libs, *l, c).port(p).map_or(0.0, |p| p.capacitance(rf, mm));
+        }
         match (&self.vertices[v].lib, &self.vertices[v].cell, &self.vertices[v].port) {
             (Some(l), Some(c), Some(p)) => cell(self.libs, *l, c).port(p).map_or(0.0, |p| p.capacitance(rf, mm)),
             _ => match self.vertices[v].conn {
@@ -492,6 +508,12 @@ impl<'a> Graph<'a> {
         let np = parasitics.get(&self.netlist.nets[n].name)?;
         let d = np.node_names.iter().position(|x| x == &self.vertices[drvr].name)?;
         let names = &np.node_names;
+        if let Some(p) = &np.pi {
+            if np.pi_rise_only && rf == FALL {
+                return None;
+            }
+            return Some((p.clone(), names.clone()));
+        }
         let cap = |i: usize| {
             index.get(&names[i]).map_or(0.0, |&v| match (&np.port_pin_caps, &self.vertices[v].conn) {
                 (Some(m), Conn::Port(_)) => m.get(&names[i]).and_then(|c| c[rf][mm]).unwrap_or(0.0),
@@ -639,10 +661,15 @@ impl<'a> Graph<'a> {
             // An input port (`seedNoDrvrCellSlew` / `seedNoDrvrSlew`): its slew is the
             // `set_input_transition`, else 0; its loads by the input-port delay at that slew
             // over the `parasiticLoad` pi model — a load with no Elmore delay takes the slew.
+            // An ANNOTATED port slew (`setAnnotatedSlew` on the driver vertex) is kept as the
+            // driver's slew and COPIED to every load (`annotateLoadDelays`: "Copy the driver slew
+            // to the load if it is annotated"); the wire delay is still the input-port delay at the
+            // seeded slew — `default_slew`, 0, without a `set_input_transition`.
+            let annotated = self.slew_annotated.get(&v).copied();
             for rf in [RISE, FALL] {
                 for mm in [MIN, MAX] {
                     let in_slew = self.sdc.input_slew.get(&self.vertices[v].name).and_then(|s| s[rf][mm]).unwrap_or(0.0);
-                    self.slew[v][rf][mm] = in_slew;
+                    self.slew[v][rf][mm] = annotated.unwrap_or(in_slew);
                     let (_, _, pe) = self.parasitic_load(v, rf, mm, parasitics, index);
                     for &e in &wires {
                         let load = self.edges[e].to;
@@ -656,7 +683,7 @@ impl<'a> Graph<'a> {
                             (wire_delay, load_slew) = dspf_wire_delay_slew(f64::from(in_slew), el, &th);
                         }
                         threshold_adjust(ll == 0, &self.lib_thresholds(0, rf), &self.lib_thresholds(ll, rf), rf == RISE, &mut wire_delay, &mut load_slew);
-                        self.slew[load][rf][mm] = load_slew as f32;
+                        self.slew[load][rf][mm] = annotated.unwrap_or(load_slew as f32);
                         self.delay[e][rf][mm] = wire_delay as f32;
                     }
                 }
@@ -915,7 +942,7 @@ mod tests {
         let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
         let nl = chain();
         let net = Network { node_caps: vec![0.05e-15, 0.05e-15], resistors: vec![(0, 1, 5.0)] };
-        let np = |caps| NetParasitics { node_names: vec!["u2/Y".into(), "y".into()], network: net.clone(), port_pin_caps: caps };
+        let np = |caps| NetParasitics { node_names: vec!["u2/Y".into(), "y".into()], network: net.clone(), port_pin_caps: caps, pi: None, pi_rise_only: false };
         let mut g = Graph::build(&libs, &nl).unwrap();
         g.sdc.port_pin_cap.insert("y".into(), [[Some(2e-12); 2]; 2]);
         let u2y = g.vertices.iter().position(|v| v.name == "u2/Y").unwrap();
