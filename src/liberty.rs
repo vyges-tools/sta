@@ -1045,6 +1045,21 @@ mod tests {
         assert_eq!(c.port("q[1]").unwrap().function.as_deref(), Some("in[3]"), "offset 0 of in");
     }
 
+    // Rule (the lexer): a bus subscript's range is one token with its name — `pin (d[1:0])` inside
+    // a bus names those bits (the OpenRAM macros write every bus this way), its attributes on each.
+    #[test]
+    fn a_pin_group_naming_a_bit_range_sets_those_bits() {
+        let lib = r#"library (b) { time_unit : "1ns"; capacitive_load_unit (1, pf);
+          type (b2) { base_type : array; data_type : bit; bit_width : 2; bit_from : 1; bit_to : 0; }
+          cell (m) {
+            bus (d) { bus_type : b2; direction : input; capacitance : 0.001;
+              pin (d[1:0]) { capacitance : 0.005; } } } }"#;
+        let l = Library::read(&parse(lib).unwrap()).unwrap();
+        let c = &l.cells["m"];
+        assert_eq!(c.port("d[1]").unwrap().capacitance[RISE][MAX], 0.005e-12);
+        assert_eq!(c.port("d[0]").unwrap().capacitance[RISE][MAX], 0.005e-12);
+    }
+
     // Rules (makeTimingArcs): related_pin bus -> bus is one to one, aligned at the LAST bits when
     // the sizes differ; one -> bus is every bit; related_bus_pins is the cross product, from bits outer.
     #[test]

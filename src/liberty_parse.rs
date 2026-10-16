@@ -188,6 +188,12 @@ fn tokenize(text: &str) -> Result<Vec<(Tok, usize)>, String> {
             i += 1;
             while i < c.len() {
                 let d = c[i];
+                // A bus subscript's range is one token with its name (`din0[31:0]`, as the
+                // reference's lexer reads it): a `:` inside an open `[` does not end the word.
+                if d == ':' && c[start..i].iter().rposition(|&x| x == '[').is_some_and(|k| !c[start + k..i].contains(&']')) {
+                    i += 1;
+                    continue;
+                }
                 if d == ' ' || d == '\t' || d == '\r' || d == '\n' || (PUNCT.contains(d) && d != '+') || d == '"' {
                     break;
                 }
