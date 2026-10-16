@@ -151,6 +151,20 @@ impl IncTimer {
         self.delays = (0..g.edges.len()).map(|e| (Self::edge_key(g, e), g.delay[e].clone())).collect();
     }
 
+    /// What re-timing vertex `v` can change, back into the state: its slews, its in- and out-edges'
+    /// delays, and the slews at its fanout (a driver sets its loads'). Keeps the state current
+    /// after a visit without exporting the whole graph.
+    pub fn export_around(&mut self, g: &Graph<'_>, v: usize) {
+        self.slews.insert(g.vertices[v].name.clone(), g.slew[v]);
+        for &e in g.in_edges[v].iter().chain(g.out_edges[v].iter()) {
+            self.delays.insert(Self::edge_key(g, e), g.delay[e].clone());
+        }
+        for &e in &g.out_edges[v] {
+            let to = g.edges[e].to;
+            self.slews.insert(g.vertices[to].name.clone(), g.slew[to]);
+        }
+    }
+
     /// `Levelize::searchThru`: every edge but timing checks, latch D->Q and set/clear arcs.
     fn search_thru(g: &Graph<'_>, e: usize) -> bool {
         match g.edges[e].kind {
@@ -166,6 +180,11 @@ impl IncTimer {
             let l = g.levels()?;
             self.levels = (0..g.vertices.len()).map(|v| (g.vertices[v].name.clone(), l[v] * LEVEL_SPACE)).collect();
             self.relevelize_from.clear();
+            return Ok(());
+        }
+        // Nothing to relevelize from: every level stays (a new vertex reads 0 either way, as an
+        // absent one does), so nothing is invalid — and the whole map need not be rebuilt.
+        if self.relevelize_from.is_empty() {
             return Ok(());
         }
         let index = g.pin_index();
@@ -388,77 +407,7 @@ pub fn find_delays_scenes(incs: &mut [IncTimer], gs: &mut [Graph<'_>], parasitic
         }
         let names = by_level.remove(&lvl).expect("a level");
         for name in names {
-            let mut fanout_names: BTreeSet<String> = BTreeSet::new();
-            for k in 0..gs.len() {
-                let Some(&v) = indexes[k].get(&name) else { continue };
-                let (inc, g) = (&mut incs[k], &mut gs[k]);
-                inc.visited.push(name.clone());
-                let fanout: Vec<usize> = g.out_edges[v].iter().copied().filter(|&e| !g.is_check(e) && !is_latch_d_to_q(g, e)).map(|e| g.edges[e].to).collect();
-                let is_root = level_of(&name) == 0;
-                if is_root {
-                    // `seedRootSlew`, then every fanout.
-                    g.find_vertex_delays(v, parasitics[k], &indexes[k], None)?;
-                    fanout_names.extend(fanout.iter().map(|&to| g_name(g, to)));
-                } else if g.vertices[v].is_driver {
-                    let wires: Vec<usize> = g.out_edges[v].iter().copied().filter(|&e| matches!(g.edges[e].kind, EdgeKind::Wire)).collect();
-                    let prev_load: Vec<[[f32; 2]; 2]> = wires.iter().map(|&w| g.slew[g.edges[w].to]).collect();
-                    let gates: Vec<usize> = g.in_edges[v].iter().copied().filter(|&e| !g.is_check(e) && !is_latch_d_to_q(g, e) && matches!(g.edges[e].kind, EdgeKind::Gate { .. })).collect();
-                    let prev_gate: Vec<Vec<[f32; 2]>> = gates.iter().map(|&e| g.delay[e].clone()).collect();
-                    g.find_vertex_delays(v, parasitics[k], &indexes[k], None)?;
-                    // The observer: a changed gate delay ([`gate_delay_changed`]), every load's
-                    // wire delay.
-                    let mut changed = false;
-                    for (j, &e) in gates.iter().enumerate() {
-                        let differs = g.delay[e].iter().zip(&prev_gate[j]).any(|(new, prev)| (0..2).any(|mm| gate_delay_changed(prev[mm], new[mm])));
-                        if differs {
-                            changed = true;
-                            inc.required_invalid(g_name(g, g.edges[e].from));
-                            inc.required_invalid(name.clone());
-                        }
-                    }
-                    if changed {
-                        inc.arrival_invalid(name.clone());
-                    }
-                    for (j, &w) in wires.iter().enumerate() {
-                        let load = g.edges[w].to;
-                        inc.arrival_invalid(g_name(g, load));
-                        // `loadSlewChanged`: any of the slews beyond fuzzy equality — in this
-                        // scene; a load any scene enqueues is visited in every scene.
-                        let now = g.slew[load];
-                        let was = prev_load[j];
-                        let differs = (0..2).any(|rf| (0..2).any(|mm| !crate::fuzzy::equal(now[rf][mm], was[rf][mm])));
-                        if differs {
-                            fanout_names.insert(g_name(g, load));
-                        }
-                    }
-                    // `visitFanouts` also reaches a GATE fanout of the driver (an output-to-output
-                    // arc, a full adder's CON -> SN). `loadSlewChanged` looks its pin up in the load
-                    // index map, where `operator[]` inserts it at index 0: its slews are compared
-                    // with the previous slews of the net's FIRST load (in the reference's out-edge
-                    // order, which follows edit history) — or, with no loads, it is enqueued.
-                    for &e in g.out_edges[v].iter().filter(|&&e| matches!(g.edges[e].kind, EdgeKind::Gate { .. }) && !g.is_check(e) && !is_latch_d_to_q(g, e)) {
-                        let to = g.edges[e].to;
-                        let now = g.slew[to];
-                        let verdicts: BTreeSet<bool> = prev_load.iter().map(|was| (0..2).any(|rf| (0..2).any(|mm| !crate::fuzzy::equal(now[rf][mm], was[rf][mm])))).collect();
-                        match verdicts.len() {
-                            0 => {
-                                fanout_names.insert(g_name(g, to));
-                            }
-                            1 => {
-                                if verdicts.contains(&true) {
-                                    fanout_names.insert(g_name(g, to));
-                                }
-                            }
-                            _ => return Err(format!("{}: whether gate fanout {} is re-timed depends on the first load's previous slew (edit-history order): not modelled", name, g_name(g, to))),
-                        }
-                    }
-                } else {
-                    // A load: its slew comes from its driver; checks at it, then every fanout.
-                    g.find_vertex_delays(v, parasitics[k], &indexes[k], None)?;
-                    inc.enqueue_check_edges(g, v);
-                    fanout_names.extend(fanout.iter().map(|&to| g_name(g, to)));
-                }
-            }
+            let fanout_names = visit_vertex(incs, gs, &indexes, parasitics, &name, level_of(&name) == 0)?;
             for n in fanout_names {
                 enqueue(n, &mut by_level);
             }
@@ -475,6 +424,7 @@ pub fn find_delays_scenes(incs: &mut [IncTimer], gs: &mut [Graph<'_>], parasitic
         for key in std::mem::take(&mut inc.invalid_check_edges) {
             if let Some(e) = (0..g.edges.len()).find(|&e| IncTimer::edge_key(g, e) == key) {
                 g.find_check_edge_delays(e);
+                inc.delays.insert(key.clone(), g.delay[e].clone());
                 inc.required_invalid(g_name(g, g.edges[e].to));
             }
         }
@@ -485,11 +435,110 @@ pub fn find_delays_scenes(incs: &mut [IncTimer], gs: &mut [Graph<'_>], parasitic
         let index = g.pin_index();
         for key in std::mem::take(&mut inc.invalid_latch_edges) {
             if let Some(e) = (0..g.edges.len()).find(|&e| IncTimer::edge_key(g, e) == key) {
-                if g.find_latch_edge_delays(e, par, &index) {
+                let changed = g.find_latch_edge_delays(e, par, &index);
+                inc.delays.insert(key.clone(), g.delay[e].clone());
+                if changed {
                     inc.arrival_invalid(g_name(g, g.edges[e].to));
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// One vertex re-timed in every scene, as the queue visits it (`FindVertexDelays::visit`): a root
+/// seeds its slews and enqueues every fanout; a driver is recomputed whole and enqueues each load
+/// whose slew changed beyond fuzzy equality (`loadSlewChanged`); a load is re-timed, enqueues its
+/// checks, then every fanout. Returns the fanouts to enqueue.
+fn visit_vertex(incs: &mut [IncTimer], gs: &mut [Graph<'_>], indexes: &[HashMap<String, usize>], parasitics: &[&HashMap<String, NetParasitics>], name: &str, is_root: bool) -> Result<BTreeSet<String>, String> {
+    let mut fanout_names: BTreeSet<String> = BTreeSet::new();
+    for k in 0..gs.len() {
+        let Some(&v) = indexes[k].get(name) else { continue };
+        let (inc, g) = (&mut incs[k], &mut gs[k]);
+        inc.visited.push(name.to_string());
+        let fanout: Vec<usize> = g.out_edges[v].iter().copied().filter(|&e| !g.is_check(e) && !is_latch_d_to_q(g, e)).map(|e| g.edges[e].to).collect();
+        if is_root {
+            // `seedRootSlew`, then every fanout.
+            g.find_vertex_delays(v, parasitics[k], &indexes[k], None)?;
+            inc.export_around(g, v);
+            fanout_names.extend(fanout.iter().map(|&to| g_name(g, to)));
+        } else if g.vertices[v].is_driver {
+            let wires: Vec<usize> = g.out_edges[v].iter().copied().filter(|&e| matches!(g.edges[e].kind, EdgeKind::Wire)).collect();
+            let prev_load: Vec<[[f32; 2]; 2]> = wires.iter().map(|&w| g.slew[g.edges[w].to]).collect();
+            let gates: Vec<usize> = g.in_edges[v].iter().copied().filter(|&e| !g.is_check(e) && !is_latch_d_to_q(g, e) && matches!(g.edges[e].kind, EdgeKind::Gate { .. })).collect();
+            let prev_gate: Vec<Vec<[f32; 2]>> = gates.iter().map(|&e| g.delay[e].clone()).collect();
+            g.find_vertex_delays(v, parasitics[k], &indexes[k], None)?;
+            inc.export_around(g, v);
+            // The observer: a changed gate delay ([`gate_delay_changed`]), every load's
+            // wire delay.
+            let mut changed = false;
+            for (j, &e) in gates.iter().enumerate() {
+                let differs = g.delay[e].iter().zip(&prev_gate[j]).any(|(new, prev)| (0..2).any(|mm| gate_delay_changed(prev[mm], new[mm])));
+                if differs {
+                    changed = true;
+                    inc.required_invalid(g_name(g, g.edges[e].from));
+                    inc.required_invalid(name.to_string());
+                }
+            }
+            if changed {
+                inc.arrival_invalid(name.to_string());
+            }
+            for (j, &w) in wires.iter().enumerate() {
+                let load = g.edges[w].to;
+                inc.arrival_invalid(g_name(g, load));
+                // `loadSlewChanged`: any of the slews beyond fuzzy equality — in this
+                // scene; a load any scene enqueues is visited in every scene.
+                let now = g.slew[load];
+                let was = prev_load[j];
+                let differs = (0..2).any(|rf| (0..2).any(|mm| !crate::fuzzy::equal(now[rf][mm], was[rf][mm])));
+                if differs {
+                    fanout_names.insert(g_name(g, load));
+                }
+            }
+            // `visitFanouts` also reaches a GATE fanout of the driver (an output-to-output
+            // arc, a full adder's CON -> SN). `loadSlewChanged` looks its pin up in the load
+            // index map, where `operator[]` inserts it at index 0: its slews are compared
+            // with the previous slews of the net's FIRST load (in the reference's out-edge
+            // order, which follows edit history) — or, with no loads, it is enqueued.
+            for &e in g.out_edges[v].iter().filter(|&&e| matches!(g.edges[e].kind, EdgeKind::Gate { .. }) && !g.is_check(e) && !is_latch_d_to_q(g, e)) {
+                let to = g.edges[e].to;
+                let now = g.slew[to];
+                let verdicts: BTreeSet<bool> = prev_load.iter().map(|was| (0..2).any(|rf| (0..2).any(|mm| !crate::fuzzy::equal(now[rf][mm], was[rf][mm])))).collect();
+                match verdicts.len() {
+                    0 => {
+                        fanout_names.insert(g_name(g, to));
+                    }
+                    1 => {
+                        if verdicts.contains(&true) {
+                            fanout_names.insert(g_name(g, to));
+                        }
+                    }
+                    _ => return Err(format!("{}: whether gate fanout {} is re-timed depends on the first load's previous slew (edit-history order): not modelled", name, g_name(g, to))),
+                }
+            }
+        } else {
+            // A load: its slew comes from its driver; checks at it, then every fanout.
+            g.find_vertex_delays(v, parasitics[k], &indexes[k], None)?;
+            inc.export_around(g, v);
+            inc.enqueue_check_edges(g, v);
+            fanout_names.extend(fanout.iter().map(|&to| g_name(g, to)));
+        }
+    }
+    Ok(fanout_names)
+}
+
+/// `GraphDelayCalc::findDelays(drvr)`: ONE vertex re-timed (`findVertexDelay`) in every scene,
+/// from the slews the graphs hold — no queue is run. The fanouts it would enqueue stay queued for
+/// the next `findDelays(level)`; nothing else is recomputed.
+pub fn find_vertex_delay_scenes(incs: &mut [IncTimer], gs: &mut [Graph<'_>], parasitics: &[&HashMap<String, NetParasitics>], name: &str) -> Result<(), String> {
+    for (inc, g) in incs.iter_mut().zip(gs.iter()) {
+        inc.relevelize(g)?;
+    }
+    let indexes: Vec<HashMap<String, usize>> = gs.iter().map(|g| g.pin_index()).collect();
+    let is_root = incs[0].levels.get(name).copied().unwrap_or(0) == 0;
+    let fanout = visit_vertex(incs, gs, &indexes, parasitics, name, is_root)?;
+    for inc in incs.iter_mut() {
+        inc.delay_queue.extend(fanout.iter().cloned());
     }
     Ok(())
 }

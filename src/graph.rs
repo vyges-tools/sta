@@ -426,7 +426,10 @@ impl<'a> Graph<'a> {
                         };
                         let ll = self.threshold_library(load);
                         threshold_adjust(ll == li, &self.lib_thresholds(li, rf), &self.lib_thresholds(ll, rf), rf == RISE, &mut wire_delay, &mut load_slew);
-                        self.slew[load][rf][mm] = load_slew as f32;
+                        self.slew[load][rf][mm] = match self.slew_annotated.get(&load) {
+                            Some(&a) if mm == MAX => a,
+                            _ => load_slew as f32,
+                        };
                         self.delay[w][rf][mm] = wire_delay as f32 + load_delay;
                     }
                 }
@@ -693,7 +696,11 @@ impl<'a> Graph<'a> {
                             (wire_delay, load_slew) = dspf_wire_delay_slew(f64::from(in_slew), el, &th);
                         }
                         threshold_adjust(ll == 0, &self.lib_thresholds(0, rf), &self.lib_thresholds(ll, rf), rf == RISE, &mut wire_delay, &mut load_slew);
-                        self.slew[load][rf][mm] = annotated.unwrap_or(load_slew as f32);
+                        // A load's own annotation stands (`annotateLoadDelays`), as from a cell driver.
+                        self.slew[load][rf][mm] = match self.slew_annotated.get(&load) {
+                            Some(&a) if mm == MAX => a,
+                            _ => annotated.unwrap_or(load_slew as f32),
+                        };
                         self.delay[e][rf][mm] = wire_delay as f32;
                     }
                 }
@@ -702,8 +709,16 @@ impl<'a> Graph<'a> {
         }
         // Driver delays: init, then every arc of every in-edge.
         let drvr_lib = self.vertices[v].lib.expect("an instance driver");
+        // `annotateLoadDelays` merges into a load only where its slew is not annotated: an annotated
+        // load (`setAnnotatedSlew`, max rise and fall) keeps its annotation through its driver's
+        // timing, not just after its own visit.
         for &e in &wires {
-            self.slew[self.edges[e].to] = [[INIT[MIN], INIT[MAX]], [INIT[MIN], INIT[MAX]]];
+            let load = self.edges[e].to;
+            self.slew[load] = [[INIT[MIN], INIT[MAX]], [INIT[MIN], INIT[MAX]]];
+            if let Some(&a) = self.slew_annotated.get(&load) {
+                self.slew[load][RISE][MAX] = a;
+                self.slew[load][FALL][MAX] = a;
+            }
             self.delay[e] = vec![[INIT[MIN], INIT[MAX]]; 2];
         }
         self.slew[v] = [[INIT[MIN], INIT[MAX]], [INIT[MIN], INIT[MAX]]];
@@ -780,7 +795,7 @@ impl<'a> Graph<'a> {
                         }
                         let ll = self.threshold_library(load);
                         threshold_adjust(ll == drvr_lib, &self.lib_thresholds(drvr_lib, rf), &self.lib_thresholds(ll, rf), rf == RISE, &mut wire_delay, &mut load_slew);
-                        if worse(mm, load_slew as f32, self.slew[load][rf][mm]) {
+                        if worse(mm, load_slew as f32, self.slew[load][rf][mm]) && !(mm == MAX && self.slew_annotated.contains_key(&load)) {
                             self.slew[load][rf][mm] = load_slew as f32;
                         }
                         if worse(mm, wire_delay as f32, self.delay[w][rf][mm]) {
@@ -796,7 +811,10 @@ impl<'a> Graph<'a> {
                     self.slew[v][rf][mm] = INIT[mm];
                     for &w in &wires {
                         self.delay[w][rf][mm] = 0.0;
-                        self.slew[self.edges[w].to][rf][mm] = 0.0;
+                        let load = self.edges[w].to;
+                        if !(mm == MAX && self.slew_annotated.contains_key(&load)) {
+                            self.slew[load][rf][mm] = 0.0;
+                        }
                     }
                 }
             }
@@ -903,6 +921,18 @@ mod tests {
         g.slew_annotated.insert(u2a, 2.0e-9);
         g.find_delays(&HashMap::new(), None).unwrap();
         assert_eq!([g.slew[u2a][RISE][MAX], g.slew[u2a][FALL][MAX]], [2.0e-9, 2.0e-9]);
+        // `annotateLoadDelays` never merges into it: re-timing the DRIVER alone (as
+        // `findDelays(drvr)` does, the load not visited) keeps the annotation; min is computed.
+        let u1y = g.vertices.iter().position(|v| v.name == "u1/Y").unwrap();
+        let index = g.pin_index();
+        g.find_vertex_delays(u1y, &HashMap::new(), &index, None).unwrap();
+        assert_eq!([g.slew[u2a][RISE][MAX], g.slew[u2a][FALL][MAX]], [2.0e-9, 2.0e-9]);
+        assert_eq!(g.slew[u2a][RISE][MIN], 1.000_000_5f32 * 1e-9, "only max is annotated");
+        // The same from an input port driving the load (its own path through the port's drive).
+        let (a, u1a) = (g.vertices.iter().position(|v| v.name == "a" && v.is_driver).unwrap(), g.vertices.iter().position(|v| v.name == "u1/A").unwrap());
+        g.slew_annotated.insert(u1a, 3.0e-9);
+        g.find_vertex_delays(a, &HashMap::new(), &index, None).unwrap();
+        assert_eq!([g.slew[u1a][RISE][MAX], g.slew[u1a][FALL][MAX]], [3.0e-9, 3.0e-9], "kept from a port driver too");
     }
 
     /// Rules (Sdc::connectedCap, parasiticLoad): a net `set_load` is keyed by its DRIVER pin and
