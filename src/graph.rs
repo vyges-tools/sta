@@ -113,7 +113,13 @@ pub struct Graph<'a> {
     /// only, so after an equivalent-arcs replacement an edge from one output to another (a half
     /// adder's CON -> SN) keeps the cell it was made with. See [`Graph::set_stale_out_arcs`].
     pub stale_out_arcs: HashMap<String, (usize, String)>,
+    /// Every vertex's index by name, built on first use: the vertices never change once the graph
+    /// is built, and [`Graph::load_cap`] and its kin are called per driver by a repair loop.
+    index_cache: std::sync::OnceLock<HashMap<String, usize>>,
 }
+
+/// [`Graph::parasitic_load`]: `(pin_cap, wire_cap, the pi model and its node names)`.
+type ParasiticLoad = (f32, f32, Option<(crate::parasitics::PiElmore, Vec<String>)>);
 
 /// The SDC loads and drives delay calculation reads (`Sdc::connectedCap`, `seedDrvrSlew`).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -263,7 +269,7 @@ impl<'a> Graph<'a> {
                 EdgeKind::Wire => vec![[0.0f32; 2]; 2],
             })
             .collect();
-        Ok(Graph { libs, netlist, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), stale_out_arcs: HashMap::new() })
+        Ok(Graph { libs, netlist, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), stale_out_arcs: HashMap::new(), index_cache: std::sync::OnceLock::new() })
     }
 
     pub fn is_check(&self, e: usize) -> bool {
@@ -472,7 +478,7 @@ impl<'a> Graph<'a> {
     /// (`drvrPinHasWireCap`: set_load net has precedence over parasitics; the gate is lumped at
     /// the SDC's load). Otherwise a pi model at least the pin cap adds `pi − pin`; a smaller one is
     /// dropped. `(pin_cap, wire_cap, the pi model)`.
-    fn parasitic_load(&self, drvr: usize, rf: usize, mm: usize, parasitics: &HashMap<String, NetParasitics>, index: &HashMap<String, usize>) -> (f32, f32, Option<(crate::parasitics::PiElmore, Vec<String>)>) {
+    fn parasitic_load(&self, drvr: usize, rf: usize, mm: usize, parasitics: &HashMap<String, NetParasitics>, index: &HashMap<String, usize>) -> ParasiticLoad {
         let (pin_cap, mut wire_cap, has_net_load) = self.connected_cap(drvr, rf, mm, index);
         let mut parasitic = if self.sdc.net_wire_cap.contains_key(&self.vertices[drvr].name) { None } else { self.reduced(drvr, rf, mm, parasitics, index) };
         if !has_net_load {
@@ -528,16 +534,15 @@ impl<'a> Graph<'a> {
     /// `(c2, rpi, c1)` as the delay calculator finds it — no `parasiticLoad` rule applied (a net
     /// `set_load`, a pi model under the pin cap): `None` without parasitics for the net.
     pub fn reduced_pi(&self, drvr: usize, rf: usize, mm: usize, parasitics: &HashMap<String, NetParasitics>) -> Option<(f32, f32, f32)> {
-        let index = self.pin_index();
-        self.reduced(drvr, rf, mm, parasitics, &index).map(|(p, _)| (p.c2, p.rpi, p.c1))
+        self.reduced(drvr, rf, mm, parasitics, self.index()).map(|(p, _)| (p.c2, p.rpi, p.c1))
     }
 
     /// `GraphDelayCalc::loadCap(drvr_pin, rf, scene, max, pin_cap, wire_cap)` for one transition,
     /// and whether the driver has a reduced pi model at all (`findPiElmore`).
     pub fn load_cap_parts(&self, drvr: usize, parasitics: &HashMap<String, NetParasitics>, rf: usize) -> (f32, f32, bool) {
-        let index: HashMap<String, usize> = self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect();
-        let (pin_cap, wire_cap, _) = self.parasitic_load(drvr, rf, MAX, parasitics, &index);
-        (pin_cap, wire_cap, self.reduced(drvr, rf, MAX, parasitics, &index).is_some())
+        let index = self.index();
+        let (pin_cap, wire_cap, _) = self.parasitic_load(drvr, rf, MAX, parasitics, index);
+        (pin_cap, wire_cap, self.reduced(drvr, rf, MAX, parasitics, index).is_some())
     }
 
     /// `GraphDelayCalc::loadCap(drvr_pin, scene, max)`: over rise then fall, the larger of
@@ -546,10 +551,10 @@ impl<'a> Graph<'a> {
     /// that, the total MINUS the pin cap (so the sum is `pin + (pi − pin)` in float, not the pi
     /// total); a smaller pi model is ignored (wire cap 0); a net `set_load` replaces the pi model.
     pub fn load_cap(&self, drvr: usize, parasitics: &HashMap<String, NetParasitics>) -> f32 {
-        let index: HashMap<String, usize> = self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect();
+        let index = self.index();
         let mut load_cap = -1e30f32;
         for rf in [RISE, FALL] {
-            let (pin_cap, wire_cap, _) = self.parasitic_load(drvr, rf, MAX, parasitics, &index);
+            let (pin_cap, wire_cap, _) = self.parasitic_load(drvr, rf, MAX, parasitics, index);
             let cap = pin_cap + wire_cap;
             if cap > load_cap {
                 load_cap = cap;
@@ -564,7 +569,7 @@ impl<'a> Graph<'a> {
     pub fn find_delays(&mut self, parasitics: &HashMap<String, NetParasitics>, mut trace: Option<&mut Vec<String>>) -> Result<(), String> {
         let order = self.topo_order()?;
         self.clamped.clear();
-        let index = self.pin_index();
+        let index = self.index().clone();
         for &v in &order {
             self.find_vertex_delays(v, parasitics, &index, trace.as_deref_mut())?;
         }
@@ -623,7 +628,12 @@ impl<'a> Graph<'a> {
 
     /// Every vertex's index by name (the parasitics name their nodes by pin).
     pub fn pin_index(&self) -> HashMap<String, usize> {
-        self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect()
+        self.index().clone()
+    }
+
+    /// [`Graph::pin_index`], built once and borrowed.
+    pub fn index(&self) -> &HashMap<String, usize> {
+        self.index_cache.get_or_init(|| self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect())
     }
 
     /// One vertex of the delay calculation (`findVertexDelay`): a load takes its root slew, its
@@ -698,6 +708,9 @@ impl<'a> Graph<'a> {
         }
         self.slew[v] = [[INIT[MIN], INIT[MAX]], [INIT[MIN], INIT[MAX]]];
         let mut exists = [false; 2];
+        // `parasiticLoad` depends on the driver, the transition and min/max only, not on the arc:
+        // reduced once per pair, on first use, rather than once per arc.
+        let mut loads: [[Option<ParasiticLoad>; 2]; 2] = Default::default();
         // Edges are PREPENDED to a vertex's in-edge list, so they are visited newest first —
         // the reverse of the cell's arc-set order.
         for &e in fanin.iter().rev() {
@@ -719,7 +732,10 @@ impl<'a> Graph<'a> {
                     let Model::Gate(model) = &arc.model else { continue };
                     let rf = arc.to_rf;
                     let in_slew = if ideal_clk_to_q { 0.0 } else { self.slew[from][arc.from_rf][mm] };
-                    let (pin_cap, wire_cap, pe) = self.parasitic_load(v, rf, mm, parasitics, index);
+                    if loads[rf][mm].is_none() {
+                        loads[rf][mm] = Some(self.parasitic_load(v, rf, mm, parasitics, index));
+                    }
+                    let (pin_cap, wire_cap, pe) = loads[rf][mm].as_ref().expect("set above");
                     let load_cap = pin_cap + wire_cap;
                     let l = &self.libs[drvr_lib];
                     let th = Thresholds { vth: l.output_threshold[rf], vl: l.slew_lower_threshold[rf], vh: l.slew_upper_threshold[rf], slew_derate: l.slew_derate };
