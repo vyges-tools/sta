@@ -443,7 +443,7 @@ pub fn find_delays_scenes(incs: &mut [IncTimer], gs: &mut [Graph<'_>], parasitic
         }
         return Ok(());
     }
-    let indexes: Vec<HashMap<String, usize>> = gs.iter().map(|g| g.pin_index()).collect();
+    let indexes: Vec<std::sync::Arc<HashMap<String, usize>>> = gs.iter().map(|g| g.pin_index()).collect();
     // `seedInvalidDelays`: every scene's invalid vertices (alike: one netlist's edits).
     let mut seed = BTreeSet::new();
     for inc in incs.iter_mut() {
@@ -507,7 +507,7 @@ pub fn find_delays_scenes(incs: &mut [IncTimer], gs: &mut [Graph<'_>], parasitic
 /// seeds its slews and enqueues every fanout; a driver is recomputed whole and enqueues each load
 /// whose slew changed beyond fuzzy equality (`loadSlewChanged`); a load is re-timed, enqueues its
 /// checks, then every fanout. Returns the fanouts to enqueue.
-fn visit_vertex(incs: &mut [IncTimer], gs: &mut [Graph<'_>], indexes: &[HashMap<String, usize>], parasitics: &[&HashMap<String, NetParasitics>], name: &str, is_root: bool) -> Result<BTreeSet<String>, String> {
+fn visit_vertex(incs: &mut [IncTimer], gs: &mut [Graph<'_>], indexes: &[std::sync::Arc<HashMap<String, usize>>], parasitics: &[&HashMap<String, NetParasitics>], name: &str, is_root: bool) -> Result<BTreeSet<String>, String> {
     let mut fanout_names: BTreeSet<String> = BTreeSet::new();
     for k in 0..gs.len() {
         let Some(&v) = indexes[k].get(name) else { continue };
@@ -591,7 +591,7 @@ pub fn find_vertex_delay_scenes(incs: &mut [IncTimer], gs: &mut [Graph<'_>], par
     for (inc, g) in incs.iter_mut().zip(gs.iter()) {
         inc.relevelize(g)?;
     }
-    let indexes: Vec<HashMap<String, usize>> = gs.iter().map(|g| g.pin_index()).collect();
+    let indexes: Vec<std::sync::Arc<HashMap<String, usize>>> = gs.iter().map(|g| g.pin_index()).collect();
     let is_root = incs[0].levels.get(name).copied().unwrap_or(0) == 0;
     let fanout = visit_vertex(incs, gs, &indexes, parasitics, name, is_root)?;
     for inc in incs.iter_mut() {
@@ -625,7 +625,7 @@ pub fn find_arrivals_scenes(incs: &mut [IncTimer], searches: &mut [Search<'_, '_
         }
         return Ok(());
     }
-    let indexes: Vec<HashMap<String, usize>> = searches.iter().map(|s| s.graph.pin_index()).collect();
+    let indexes: Vec<std::sync::Arc<HashMap<String, usize>>> = searches.iter().map(|s| s.graph.pin_index()).collect();
     let mut seed = BTreeSet::new();
     for inc in incs.iter_mut() {
         seed.extend(std::mem::take(&mut inc.invalid_arrivals));
@@ -678,7 +678,7 @@ fn arrival_values_on() -> bool {
 
 /// `ArrivalVisitor::visit(vertex, with_latch_edges)` over every scene: the new paths; when they
 /// changed, stored and the fanout enqueued — a latch data pin's latch outputs postponed instead.
-fn visit_arrivals(incs: &mut [IncTimer], searches: &mut [Search<'_, '_>], indexes: &[HashMap<String, usize>], levels: &HashMap<String, i32>, by_level: &mut BTreeMap<i32, BTreeSet<String>>, name: &str) {
+fn visit_arrivals(incs: &mut [IncTimer], searches: &mut [Search<'_, '_>], indexes: &[std::sync::Arc<HashMap<String, usize>>], levels: &HashMap<String, i32>, by_level: &mut BTreeMap<i32, BTreeSet<String>>, name: &str) {
     let name = name.to_string();
     // Every scene's new paths, then the vertex's verdict.
     let mut news: Vec<Option<SceneArrivals>> = Vec::with_capacity(searches.len());
@@ -784,7 +784,7 @@ pub fn find_requireds_scenes(incs: &mut [IncTimer], searches: &mut [Search<'_, '
         }
         return Ok(());
     }
-    let indexes: Vec<HashMap<String, usize>> = searches.iter().map(|s| s.graph.pin_index()).collect();
+    let indexes: Vec<std::sync::Arc<HashMap<String, usize>>> = searches.iter().map(|s| s.graph.pin_index()).collect();
     let mut seed = BTreeSet::new();
     for inc in incs.iter_mut() {
         seed.extend(std::mem::take(&mut inc.invalid_requireds));

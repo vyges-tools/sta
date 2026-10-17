@@ -115,7 +115,8 @@ pub struct Graph<'a> {
     pub stale_out_arcs: HashMap<String, (usize, String)>,
     /// Every vertex's index by name, built on first use: the vertices never change once the graph
     /// is built, and [`Graph::load_cap`] and its kin are called per driver by a repair loop.
-    index_cache: std::sync::OnceLock<HashMap<String, usize>>,
+    /// Shared, so a caller holding it ([`Graph::pin_index`]) does not copy every name.
+    index_cache: std::sync::OnceLock<std::sync::Arc<HashMap<String, usize>>>,
 }
 
 /// [`Graph::parasitic_load`]: `(pin_cap, wire_cap, the pi model and its node names)`.
@@ -781,13 +782,13 @@ impl<'a> Graph<'a> {
     }
 
     /// Every vertex's index by name (the parasitics name their nodes by pin).
-    pub fn pin_index(&self) -> HashMap<String, usize> {
-        self.index().clone()
+    pub fn pin_index(&self) -> std::sync::Arc<HashMap<String, usize>> {
+        self.index_cache.get_or_init(|| std::sync::Arc::new(self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect())).clone()
     }
 
     /// [`Graph::pin_index`], built once and borrowed.
     pub fn index(&self) -> &HashMap<String, usize> {
-        self.index_cache.get_or_init(|| self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect())
+        self.index_cache.get_or_init(|| std::sync::Arc::new(self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect()))
     }
 
     /// One vertex of the delay calculation (`findVertexDelay`): a load takes its root slew, its
