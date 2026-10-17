@@ -478,7 +478,9 @@ impl<'g, 'a> Search<'g, 'a> {
         }
         let (mut internal_from, mut internal_from_break, mut internal_to, mut internal_to_break) = (vec![false; n], vec![false; n], vec![false; n], vec![false; n]);
         if !sdc.path_delays.is_empty() {
-            let index: HashMap<&str, usize> = graph.vertices.iter().enumerate().map(|(i, x)| (x.name.as_str(), i)).collect();
+            // the graph's own name index (built once; the last vertex of a repeated name, as a
+            // collect here would keep)
+            let index = graph.index();
             let has_check = |v: usize| graph.in_edges[v].iter().any(|&e| matches!(graph.edges[e].kind, EdgeKind::Gate { set } if is_check_role(graph.arc_set(e, set).role)));
             for pd in &sdc.path_delays {
                 // `recordPathDelayInternalFrom`: not `isExceptionStartpoint`.

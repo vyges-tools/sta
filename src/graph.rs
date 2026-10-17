@@ -348,7 +348,7 @@ impl<'a> Graph<'a> {
         let mut reused_from: Vec<Option<usize>> = Vec::new();
         let mut cursor = 0usize;
         let mut by_inst: Option<HashMap<String, usize>> = None;
-        let mut vertices = Vec::new();
+        let mut vertices = Vec::with_capacity(old.len().max(netlist.ports.len() + 4 * netlist.insts.len()));
         let mut base = vec![0usize; netlist.insts.len()];
         for (i, (name, cname)) in netlist.insts.iter().enumerate() {
             let Some(t) = tpl(i) else { continue };

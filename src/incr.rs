@@ -283,7 +283,21 @@ impl IncTimer {
                 }
             }
         }
-        self.levels = (0..g.vertices.len()).map(|v| (g.vertices[v].name.clone(), level[v])).collect();
+        // The map every vertex's level makes, updated in place rather than made again: each
+        // vertex's level (a new one inserted, a later one of a repeated name last), then any name no
+        // longer in the graph dropped.
+        for (v, &l) in level.iter().enumerate() {
+            let name = &g.vertices[v].name;
+            match self.levels.get_mut(name.as_str()) {
+                Some(x) => *x = l,
+                None => {
+                    self.levels.insert(name.clone(), l);
+                }
+            }
+        }
+        if self.levels.len() != g.vertices.len() {
+            self.levels.retain(|k, _| index.contains_key(k.as_str()));
+        }
         Ok(())
     }
 
