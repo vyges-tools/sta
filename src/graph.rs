@@ -158,7 +158,51 @@ fn cell<'a>(libs: &'a [Library], lib: usize, name: &str) -> &'a Cell {
     &libs[lib].cells[name]
 }
 
+/// A recycled graph's allocations, kept for the next build on this thread ([`Graph::recycle`]).
+#[derive(Default)]
+struct Spare {
+    vertices: Vec<Vertex>,
+    edges: Vec<Edge>,
+    in_edges: Vec<Vec<usize>>,
+    out_edges: Vec<Vec<usize>>,
+    delay: Vec<Vec<[f32; 2]>>,
+    index: Option<std::sync::Arc<HashMap<String, usize>>>,
+}
+
+/// How many recycled graphs a thread keeps.
+const MAX_SPARES: usize = 4;
+
+thread_local! {
+    static SPARES: std::cell::RefCell<Vec<Spare>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The largest recycled graph on this thread, if any.
+fn take_spare() -> Option<Spare> {
+    SPARES.with(|p| {
+        let mut p = p.borrow_mut();
+        let k = (0..p.len()).max_by_key(|&k| p[k].vertices.len())?;
+        Some(p.swap_remove(k))
+    })
+}
+
 impl<'a> Graph<'a> {
+    /// Done with this graph: its vertices, edge lists and name index are kept for the next build
+    /// on this thread, which takes an instance's vertices from them unchanged where it can and
+    /// updates the index rather than making it again. A loop that rebuilds the graph after each
+    /// edit (a repair) pays for what the edit changed, not for every pin's name. The next graph is
+    /// the one a fresh build makes (`VYGES_STA_CHECK_BUILD=1` checks it).
+    pub fn recycle(self) {
+        let Graph { vertices, edges, in_edges, out_edges, delay, index_cache, .. } = self;
+        let mut ic = index_cache;
+        let spare = Spare { vertices, edges, in_edges, out_edges, delay, index: ic.take() };
+        SPARES.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.len() < MAX_SPARES {
+                p.push(spare);
+            }
+        });
+    }
+
     /// Vertices for every signal pin of every instance and every port, gate edges for every arc
     /// set between two of an instance's vertices, wire edges from each driver to each load of a
     /// net.
@@ -179,6 +223,12 @@ impl<'a> Graph<'a> {
                 let by_name = Graph::build_by_name(libs, netlist, pins)?;
                 if g.shape() != by_name.shape() {
                     return Err("the template build differs from the by-name build".into());
+                }
+                // a name index carried from a recycled graph must be the one a fresh build makes
+                if let Some(ix) = g.index_cache.get() {
+                    if ix.len() != g.vertices.len() || g.vertices.iter().enumerate().any(|(i, v)| ix.get(&v.name) != Some(&i)) {
+                        return Err("the recycled name index differs from a fresh one".into());
+                    }
                 }
                 Ok(g)
             }
@@ -265,29 +315,121 @@ impl<'a> Graph<'a> {
             inst_tpl.push(templates[cname.as_str()].as_ref().map(|_| cname.as_str()));
         }
         let tpl = |i: usize| inst_tpl[i].and_then(|c| templates[c].as_ref());
+        // A recycled graph's allocations (`Graph::recycle`): an instance found there with the same
+        // cell and pins takes its vertices as they are (moved, its index updated), every other
+        // vertex is made. The result is the graph a fresh build makes, vertex for vertex.
+        let mut spare = take_spare();
+        let mut old: Vec<Option<Vertex>> = spare.as_mut().map(|s| std::mem::take(&mut s.vertices).into_iter().map(Some).collect()).unwrap_or_default();
+        // The spare's instance vertex blocks `(start, len)` in its order, and its port vertices.
+        let mut blocks: Vec<(usize, usize)> = Vec::new();
+        let mut old_ports: Vec<usize> = Vec::new();
+        let mut k = 0;
+        while k < old.len() {
+            match old[k].as_ref().map(|v| &v.conn) {
+                Some(Conn::Inst(oi, _)) => {
+                    let (oi, start) = (*oi, k);
+                    while k < old.len() && matches!(old[k].as_ref().map(|v| &v.conn), Some(Conn::Inst(o, _)) if *o == oi) {
+                        k += 1;
+                    }
+                    blocks.push((start, k - start));
+                }
+                _ => {
+                    old_ports.push(k);
+                    k += 1;
+                }
+            }
+        }
+        // The instance a block's vertices belong to: its first vertex's name less `/port`.
+        fn block_inst(old: &[Option<Vertex>], (start, _): (usize, usize)) -> Option<&str> {
+            let v = old[start].as_ref()?;
+            let p = v.port.as_deref()?;
+            v.name.len().checked_sub(p.len() + 1).and_then(|n| v.name.get(..n))
+        }
+        let mut reused_from: Vec<Option<usize>> = Vec::new();
+        let mut cursor = 0usize;
+        let mut by_inst: Option<HashMap<String, usize>> = None;
         let mut vertices = Vec::new();
         let mut base = vec![0usize; netlist.insts.len()];
         for (i, (name, cname)) in netlist.insts.iter().enumerate() {
             let Some(t) = tpl(i) else { continue };
             base[i] = vertices.len();
-            for &(port, is_driver) in &t.verts {
-                vertices.push(Vertex { name: format!("{name}/{port}"), conn: Conn::Inst(i, port.to_string()), is_driver, lib: Some(t.lib), cell: Some(cname.clone()), port: Some(port.to_string()) });
+            // The spare's block for this instance: next in order, else (an instance removed or
+            // moved) looked up by name.
+            let found = if cursor >= blocks.len() {
+                None
+            } else if block_inst(&old, blocks[cursor]) == Some(name.as_str()) {
+                Some(cursor)
+            } else {
+                let map = by_inst.get_or_insert_with(|| blocks.iter().enumerate().filter_map(|(b, &blk)| block_inst(&old, blk).map(|n| (n.to_string(), b))).collect());
+                map.get(name.as_str()).copied().filter(|&b| old[blocks[b].0].is_some())
+            };
+            let fits = found.is_some_and(|b| {
+                let (start, len) = blocks[b];
+                len == t.verts.len()
+                    && t.verts.iter().enumerate().all(|(j, &(port, is_driver))| {
+                        old[start + j].as_ref().is_some_and(|v| v.port.as_deref() == Some(port) && v.is_driver == is_driver && v.lib == Some(t.lib) && v.cell.as_deref() == Some(cname.as_str()))
+                    })
+            });
+            if let Some(b) = found {
+                cursor = b + 1;
+            }
+            match found.filter(|_| fits) {
+                Some(b) => {
+                    let (start, len) = blocks[b];
+                    for (k, slot) in old.iter_mut().enumerate().skip(start).take(len) {
+                        let mut v = slot.take().expect("a fitting block");
+                        if let Conn::Inst(ii, _) = &mut v.conn {
+                            *ii = i;
+                        }
+                        reused_from.push(Some(k));
+                        vertices.push(v);
+                    }
+                }
+                None => {
+                    for &(port, is_driver) in &t.verts {
+                        vertices.push(Vertex { name: format!("{name}/{port}"), conn: Conn::Inst(i, port.to_string()), is_driver, lib: Some(t.lib), cell: Some(cname.clone()), port: Some(port.to_string()) });
+                        reused_from.push(None);
+                    }
+                }
             }
         }
         let port_base = vertices.len();
+        let mut pc = 0usize;
         for (i, (name, dir)) in netlist.ports.iter().enumerate() {
             if *dir == PortDir::Inout {
                 return None;
             }
-            vertices.push(Vertex { name: name.clone(), conn: Conn::Port(i), is_driver: *dir == PortDir::Input, lib: None, cell: None, port: None });
+            let is_driver = *dir == PortDir::Input;
+            let reuse = old_ports.get(pc).copied().filter(|&k| old[k].as_ref().is_some_and(|v| v.name == *name && v.is_driver == is_driver && v.lib.is_none()));
+            match reuse {
+                Some(k) => {
+                    let mut v = old[k].take().expect("a matching port");
+                    v.conn = Conn::Port(i);
+                    reused_from.push(Some(k));
+                    vertices.push(v);
+                    pc += 1;
+                }
+                None => {
+                    vertices.push(Vertex { name: name.clone(), conn: Conn::Port(i), is_driver, lib: None, cell: None, port: None });
+                    reused_from.push(None);
+                }
+            }
         }
-        let mut edges = Vec::new();
+        let mut delay_pool: Vec<Vec<[f32; 2]>> = spare.as_mut().map(|s| std::mem::take(&mut s.delay)).unwrap_or_default();
+        let mut row = |n: usize| {
+            let mut d = delay_pool.pop().unwrap_or_default();
+            d.clear();
+            d.resize(n, [0.0f32; 2]);
+            d
+        };
+        let mut edges = spare.as_mut().map(|s| std::mem::take(&mut s.edges)).unwrap_or_default();
+        edges.clear();
         let mut delay = Vec::new();
         for (i, &b) in base.iter().enumerate() {
             let Some(t) = tpl(i) else { continue };
             for &(f, to, set, arcs) in &t.edges {
                 edges.push(Edge { from: b + f, to: b + to, kind: EdgeKind::Gate { set } });
-                delay.push(vec![[0.0f32; 2]; arcs]);
+                delay.push(row(arcs));
             }
         }
         let mut vertex_net = vec![None; vertices.len()];
@@ -308,17 +450,43 @@ impl<'a> Graph<'a> {
             }
             for &l in vs.iter().filter(|&&v| !vertices[v].is_driver) {
                 edges.push(Edge { from: d, to: l, kind: EdgeKind::Wire });
-                delay.push(vec![[0.0f32; 2]; 2]);
+                delay.push(row(2));
             }
         }
-        let mut in_edges = vec![Vec::new(); vertices.len()];
-        let mut out_edges = vec![Vec::new(); vertices.len()];
+        let n = vertices.len();
+        let (mut in_edges, mut out_edges) = spare.as_mut().map(|s| (std::mem::take(&mut s.in_edges), std::mem::take(&mut s.out_edges))).unwrap_or_default();
+        for lists in [&mut in_edges, &mut out_edges] {
+            lists.truncate(n);
+            lists.iter_mut().for_each(Vec::clear);
+            lists.resize_with(n, Vec::new);
+        }
         for (e, ed) in edges.iter().enumerate() {
             in_edges[ed.to].push(e);
             out_edges[ed.from].push(e);
         }
-        let n = vertices.len();
-        Some(Graph { libs, netlist, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), stale_out_arcs: HashMap::new(), index_cache: std::sync::OnceLock::new() })
+        // The spare's name index, made this graph's: a vertex left behind is removed first (a
+        // remade instance's vertices carry the same names), then each moved or made one set.
+        let index_cache = std::sync::OnceLock::new();
+        if let Some(mut map) = spare.and_then(|s| s.index).and_then(|a| std::sync::Arc::try_unwrap(a).ok()) {
+            for v in old.iter().flatten() {
+                map.remove(v.name.as_str());
+            }
+            for (p, (v, from)) in vertices.iter().zip(&reused_from).enumerate() {
+                match from {
+                    Some(q) if *q == p => {}
+                    _ => match map.get_mut(v.name.as_str()) {
+                        Some(x) => *x = p,
+                        None => {
+                            map.insert(v.name.clone(), p);
+                        }
+                    },
+                }
+            }
+            if map.len() == n {
+                let _ = index_cache.set(std::sync::Arc::new(map));
+            }
+        }
+        Some(Graph { libs, netlist, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), stale_out_arcs: HashMap::new(), index_cache })
     }
 
     /// [`Graph::build_with_pins`] with each pin found by its name.
@@ -1302,5 +1470,56 @@ mod tests {
         // There the port takes the pin's name, and the by-name build's answer stands.
         assert_eq!(Graph::build(&libs, &slash).err(), Graph::build_by_name(&libs, &slash, None).err());
         assert!(Graph::build(&libs, &slash).is_err());
+    }
+
+    /// A graph built from a recycled one's allocations is the graph a fresh build makes — vertex
+    /// for vertex, edge for edge, with the same name index — whether the edit appended an
+    /// instance (a buffer), removed one ahead of others, or changed one's cell.
+    #[test]
+    fn a_recycled_build_is_a_fresh_build() {
+        let lib = LIB.replace("cell (and2) {", r#"cell (buf) { pin (A) { direction : input; capacitance : 0.001; }
+            pin (Y) { direction : output; function : "A";
+              timing () { related_pin : "A"; timing_sense : positive_unate;
+                cell_rise (scalar) { values ("0.1"); } rise_transition (scalar) { values ("1.0"); }
+                cell_fall (scalar) { values ("0.1"); } fall_transition (scalar) { values ("1.0"); } } } }
+          cell (and2x) { pin (A) { direction : input; capacitance : 0.002; } pin (B) { direction : input; capacitance : 0.002; }
+            pin (Y) { direction : output; function : "A&B"; } }
+          cell (and2) {"#);
+        let libs = [Library::read(&crate::liberty_parse::parse(&lib).unwrap()).unwrap()];
+        let pin = |i: usize, p: &str| Conn::Inst(i, p.into());
+        let fresh = |nl: &Netlist| {
+            SPARES.with(|p| p.borrow_mut().clear());
+            let g = Graph::build(&libs, nl).unwrap();
+            (g.shape(), g.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect::<HashMap<_, _>>())
+        };
+        let check = |nl: &Netlist, prev: Graph<'_>| {
+            let want = fresh(nl);
+            prev.index();
+            prev.recycle();
+            let g = Graph::build(&libs, nl).unwrap();
+            assert!(g.index_cache.get().is_some(), "the index came with the spare");
+            assert_eq!((g.shape(), g.index().clone()), want);
+        };
+        // a buffer appended between u1 and u2
+        let nl1 = chain();
+        let mut nl2 = chain();
+        nl2.insts.push(("b1".into(), "buf".into()));
+        nl2.nets[2] = Net { name: "n1".into(), pins: vec![pin(0, "Y"), pin(2, "A")] };
+        nl2.nets.push(Net { name: "n2".into(), pins: vec![pin(2, "Y"), pin(1, "A")] });
+        check(&nl2, Graph::build(&libs, &nl1).unwrap());
+        // u1 removed (every later instance moves up) and u2's cell changed
+        let nl3 = Netlist {
+            insts: vec![("u2".into(), "and2x".into()), ("b1".into(), "buf".into())],
+            ports: nl2.ports.clone(),
+            nets: vec![
+                Net { name: "n2".into(), pins: vec![pin(1, "Y"), pin(0, "A")] },
+                Net { name: "c".into(), pins: vec![pin(0, "B"), Conn::Port(2)] },
+                Net { name: "y".into(), pins: vec![pin(0, "Y"), Conn::Port(3)] },
+                Net { name: "a".into(), pins: vec![pin(1, "A"), Conn::Port(0)] },
+            ],
+        };
+        check(&nl3, Graph::build(&libs, &nl2).unwrap());
+        // and back: a recycled graph larger than the next
+        check(&nl1, Graph::build(&libs, &nl3).unwrap());
     }
 }
