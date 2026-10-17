@@ -34,6 +34,37 @@ pub enum EdgeKey {
     Wire { from: String, to: String },
 }
 
+/// An edge's delays: gate arcs `[arc][min/max]`, wire edges `[rf][min/max]`.
+type EdgeDelays = Vec<[f32; 2]>;
+
+/// An [`EdgeKey`] without its to-vertex.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EdgeTail {
+    Gate { from: String, cell: String, set: usize },
+    Wire { from: String },
+}
+
+impl EdgeTail {
+    fn of(g: &Graph<'_>, e: usize) -> EdgeTail {
+        let ed = &g.edges[e];
+        let from = g.vertices[ed.from].name.clone();
+        match ed.kind {
+            EdgeKind::Gate { set } => EdgeTail::Gate { from, cell: g.vertices[ed.to].cell.clone().unwrap_or_default(), set },
+            EdgeKind::Wire => EdgeTail::Wire { from },
+        }
+    }
+
+    /// Is this edge `e` of `g` (whose to-vertex was matched already)?
+    fn is(&self, g: &Graph<'_>, e: usize) -> bool {
+        let ed = &g.edges[e];
+        match (self, &ed.kind) {
+            (EdgeTail::Gate { from, cell, set }, EdgeKind::Gate { set: s }) => set == s && *from == g.vertices[ed.from].name && cell == g.vertices[ed.to].cell.as_deref().unwrap_or(""),
+            (EdgeTail::Wire { from }, EdgeKind::Wire) => *from == g.vertices[ed.from].name,
+            _ => false,
+        }
+    }
+}
+
 /// The full levelization's spacing; incremental relevelization steps by 1 between.
 pub const LEVEL_SPACE: i32 = 10;
 
@@ -42,7 +73,9 @@ pub struct IncTimer {
     /// Each vertex's level.
     pub levels: HashMap<String, i32>,
     slews: HashMap<String, [[f32; 2]; 2]>,
-    delays: HashMap<EdgeKey, Vec<[f32; 2]>>,
+    /// Each edge's delays by its [`EdgeKey`], held as to-vertex → the rest of the key, so an edge of
+    /// a graph is found without making its key (a graph is imported whole after every edit).
+    delays: HashMap<String, Vec<(EdgeTail, EdgeDelays)>>,
     /// Vertices whose delays are invalid (`invalid_delays_`) and the delay queue's pending
     /// vertices (`iter_`), by name.
     pub invalid_delays: BTreeSet<String>,
@@ -137,7 +170,7 @@ impl IncTimer {
             g.slew[v] = self.slews.get(&g.vertices[v].name).copied().unwrap_or([[0.0; 2]; 2]);
         }
         for e in 0..g.edges.len() {
-            if let Some(d) = self.delays.get(&Self::edge_key(g, e)) {
+            if let Some(d) = self.delay_of(g, e) {
                 if d.len() == g.delay[e].len() {
                     g.delay[e] = d.clone();
                 }
@@ -145,10 +178,34 @@ impl IncTimer {
         }
     }
 
+    /// The stored delays of edge `e` of `g`.
+    fn delay_of(&self, g: &Graph<'_>, e: usize) -> Option<&Vec<[f32; 2]>> {
+        let to = g.vertices[g.edges[e].to].name.as_str();
+        self.delays.get(to)?.iter().find(|(t, _)| t.is(g, e)).map(|(_, d)| d)
+    }
+
+    /// Store `g`'s delays of edge `e`, replacing what its key held.
+    fn store_delay(&mut self, g: &Graph<'_>, e: usize) {
+        let to = &g.vertices[g.edges[e].to].name;
+        let d = g.delay[e].clone();
+        match self.delays.get_mut(to.as_str()) {
+            Some(bucket) => match bucket.iter_mut().find(|(t, _)| t.is(g, e)) {
+                Some(slot) => slot.1 = d,
+                None => bucket.push((EdgeTail::of(g, e), d)),
+            },
+            None => {
+                self.delays.insert(to.clone(), vec![(EdgeTail::of(g, e), d)]);
+            }
+        }
+    }
+
     /// The graph's slews and delays back into the state.
     pub fn export(&mut self, g: &Graph<'_>) {
         self.slews = (0..g.vertices.len()).map(|v| (g.vertices[v].name.clone(), g.slew[v])).collect();
-        self.delays = (0..g.edges.len()).map(|e| (Self::edge_key(g, e), g.delay[e].clone())).collect();
+        self.delays.clear();
+        for e in 0..g.edges.len() {
+            self.store_delay(g, e);
+        }
     }
 
     /// What re-timing vertex `v` can change, back into the state: its slews, its in- and out-edges'
@@ -157,7 +214,7 @@ impl IncTimer {
     pub fn export_around(&mut self, g: &Graph<'_>, v: usize) {
         self.slews.insert(g.vertices[v].name.clone(), g.slew[v]);
         for &e in g.in_edges[v].iter().chain(g.out_edges[v].iter()) {
-            self.delays.insert(Self::edge_key(g, e), g.delay[e].clone());
+            self.store_delay(g, e);
         }
         for &e in &g.out_edges[v] {
             let to = g.edges[e].to;
@@ -424,7 +481,7 @@ pub fn find_delays_scenes(incs: &mut [IncTimer], gs: &mut [Graph<'_>], parasitic
         for key in std::mem::take(&mut inc.invalid_check_edges) {
             if let Some(e) = (0..g.edges.len()).find(|&e| IncTimer::edge_key(g, e) == key) {
                 g.find_check_edge_delays(e);
-                inc.delays.insert(key.clone(), g.delay[e].clone());
+                inc.store_delay(g, e);
                 inc.required_invalid(g_name(g, g.edges[e].to));
             }
         }
@@ -436,7 +493,7 @@ pub fn find_delays_scenes(incs: &mut [IncTimer], gs: &mut [Graph<'_>], parasitic
         for key in std::mem::take(&mut inc.invalid_latch_edges) {
             if let Some(e) = (0..g.edges.len()).find(|&e| IncTimer::edge_key(g, e) == key) {
                 let changed = g.find_latch_edge_delays(e, par, &index);
-                inc.delays.insert(key.clone(), g.delay[e].clone());
+                inc.store_delay(g, e);
                 if changed {
                     inc.arrival_invalid(g_name(g, g.edges[e].to));
                 }

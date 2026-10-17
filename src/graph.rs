@@ -171,6 +171,157 @@ impl<'a> Graph<'a> {
     /// the instance's pins). A bidirect pin is two
     /// vertices — a driver (arcs INTO it) and a load (arcs FROM it); one on a net is not modelled.
     pub fn build_with_pins(libs: &'a [Library], netlist: &'a Netlist, pins: Option<&HashMap<String, Vec<String>>>) -> Result<Graph<'a>, String> {
+        static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        match Graph::build_by_cell(libs, netlist, pins) {
+            // `VYGES_STA_CHECK_BUILD=1`: every template build is checked against the by-name one.
+            Some(g) if *CHECK.get_or_init(|| std::env::var_os("VYGES_STA_CHECK_BUILD").is_some()) => {
+                let by_name = Graph::build_by_name(libs, netlist, pins)?;
+                if g.shape() != by_name.shape() {
+                    return Err("the template build differs from the by-name build".into());
+                }
+                Ok(g)
+            }
+            Some(g) => Ok(g),
+            None => Graph::build_by_name(libs, netlist, pins),
+        }
+    }
+
+    /// The graph's structure as comparable text: every vertex, edge, edge list, net and delay row
+    /// count.
+    fn shape(&self) -> String {
+        format!("{:?}|{:?}|{:?}|{:?}|{:?}|{:?}", self.vertices, self.edges, self.in_edges, self.out_edges, self.vertex_net, self.delay.iter().map(Vec::len).collect::<Vec<_>>())
+    }
+
+    /// [`Graph::build_with_pins`] from one template per cell: the vertices an instance of it makes
+    /// and the gate edges between them, laid out from the instance's first vertex — so a net's
+    /// pin is found by its instance and port, not by its name. The same graph as
+    /// [`Graph::build_by_name`] whenever a pin's name is its alone, which is checked: `None`
+    /// (build by name) when an instance or port name repeats, a port or liberty port name holds a
+    /// `/` (an instance pin's name could then be another's), or a cell has a bidirect pin.
+    fn build_by_cell(libs: &'a [Library], netlist: &'a Netlist, pins: Option<&HashMap<String, Vec<String>>>) -> Option<Graph<'a>> {
+        /// One cell's instance layout: per vertex its port, whether it drives, and its delay-row
+        /// count's source; the first vertex of each port; the gate edges `(from, to, set, arcs)`.
+        struct Template<'l> {
+            lib: usize,
+            verts: Vec<(&'l str, bool)>,
+            first: HashMap<&'l str, usize>,
+            edges: Vec<(usize, usize, usize, usize)>,
+        }
+        let mut names = std::collections::HashSet::with_capacity(netlist.insts.len() + netlist.ports.len());
+        if netlist.ports.iter().any(|(n, _)| n.contains('/') || !names.insert(n.as_str())) {
+            return None;
+        }
+        names.clear();
+        if !netlist.insts.iter().all(|(n, _)| names.insert(n.as_str())) {
+            return None;
+        }
+        let mut templates: HashMap<&str, Option<Template<'a>>> = HashMap::new();
+        let mut inst_tpl: Vec<Option<&str>> = Vec::with_capacity(netlist.insts.len());
+        for (_, cname) in &netlist.insts {
+            if !templates.contains_key(cname.as_str()) {
+                let t = match libs.iter().position(|l| l.cells.contains_key(cname)) {
+                    // A physical-only cell (tap, fill, decap) has no liberty cell and nothing to time.
+                    None => None,
+                    Some(lib) => {
+                        let c = cell(libs, lib, cname);
+                        let has = pins.and_then(|m| m.get(cname));
+                        let mut t = Template { lib, verts: Vec::new(), first: HashMap::new(), edges: Vec::new() };
+                        // The vertex an arc set goes TO and the one it comes FROM: the same for
+                        // every pin but a bidirect one, which is refused here.
+                        let mut at: HashMap<&str, usize> = HashMap::new();
+                        for p in &c.ports {
+                            if has.is_some_and(|h| !h.contains(&p.name)) {
+                                continue;
+                            }
+                            let is_driver = match p.direction {
+                                Direction::Input => false,
+                                Direction::Output | Direction::Tristate => true,
+                                Direction::Bidirect => return None,
+                                _ => continue,
+                            };
+                            if p.name.contains('/') {
+                                return None;
+                            }
+                            let v = t.verts.len();
+                            t.first.entry(p.name.as_str()).or_insert(v);
+                            at.insert(p.name.as_str(), v);
+                            t.verts.push((p.name.as_str(), is_driver));
+                        }
+                        for (k, set) in c.arc_sets.iter().enumerate() {
+                            let tristate = matches!(set.role, Role::TristateEnable | Role::TristateDisable);
+                            if set.role == Role::Other || (set.arcs.is_empty() && !tristate) {
+                                continue;
+                            }
+                            if let (Some(&f), Some(&to)) = (at.get(set.from.as_str()), at.get(set.to.as_str())) {
+                                t.edges.push((f, to, k, set.arcs.len()));
+                            }
+                        }
+                        Some(t)
+                    }
+                };
+                templates.insert(cname.as_str(), t);
+            }
+            inst_tpl.push(templates[cname.as_str()].as_ref().map(|_| cname.as_str()));
+        }
+        let tpl = |i: usize| inst_tpl[i].and_then(|c| templates[c].as_ref());
+        let mut vertices = Vec::new();
+        let mut base = vec![0usize; netlist.insts.len()];
+        for (i, (name, cname)) in netlist.insts.iter().enumerate() {
+            let Some(t) = tpl(i) else { continue };
+            base[i] = vertices.len();
+            for &(port, is_driver) in &t.verts {
+                vertices.push(Vertex { name: format!("{name}/{port}"), conn: Conn::Inst(i, port.to_string()), is_driver, lib: Some(t.lib), cell: Some(cname.clone()), port: Some(port.to_string()) });
+            }
+        }
+        let port_base = vertices.len();
+        for (i, (name, dir)) in netlist.ports.iter().enumerate() {
+            if *dir == PortDir::Inout {
+                return None;
+            }
+            vertices.push(Vertex { name: name.clone(), conn: Conn::Port(i), is_driver: *dir == PortDir::Input, lib: None, cell: None, port: None });
+        }
+        let mut edges = Vec::new();
+        let mut delay = Vec::new();
+        for (i, &b) in base.iter().enumerate() {
+            let Some(t) = tpl(i) else { continue };
+            for &(f, to, set, arcs) in &t.edges {
+                edges.push(Edge { from: b + f, to: b + to, kind: EdgeKind::Gate { set } });
+                delay.push(vec![[0.0f32; 2]; arcs]);
+            }
+        }
+        let mut vertex_net = vec![None; vertices.len()];
+        let mut vs = Vec::new();
+        for (n, net) in netlist.nets.iter().enumerate() {
+            vs.clear();
+            vs.extend(net.pins.iter().filter_map(|c| match c {
+                Conn::Inst(i, p) => tpl(*i).and_then(|t| t.first.get(p.as_str())).map(|&l| base[*i] + l),
+                Conn::Port(i) => Some(port_base + i),
+            }));
+            for &v in &vs {
+                vertex_net[v] = Some(n);
+            }
+            let mut drivers = vs.iter().copied().filter(|&v| vertices[v].is_driver);
+            let Some(d) = drivers.next() else { continue };
+            if drivers.next().is_some() {
+                return None;
+            }
+            for &l in vs.iter().filter(|&&v| !vertices[v].is_driver) {
+                edges.push(Edge { from: d, to: l, kind: EdgeKind::Wire });
+                delay.push(vec![[0.0f32; 2]; 2]);
+            }
+        }
+        let mut in_edges = vec![Vec::new(); vertices.len()];
+        let mut out_edges = vec![Vec::new(); vertices.len()];
+        for (e, ed) in edges.iter().enumerate() {
+            in_edges[ed.to].push(e);
+            out_edges[ed.from].push(e);
+        }
+        let n = vertices.len();
+        Some(Graph { libs, netlist, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), stale_out_arcs: HashMap::new(), index_cache: std::sync::OnceLock::new() })
+    }
+
+    /// [`Graph::build_with_pins`] with each pin found by its name.
+    fn build_by_name(libs: &'a [Library], netlist: &'a Netlist, pins: Option<&HashMap<String, Vec<String>>>) -> Result<Graph<'a>, String> {
         let find_cell = |name: &str| libs.iter().position(|l| l.cells.contains_key(name));
         let mut vertices = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
@@ -1109,5 +1260,46 @@ mod tests {
         for rf in [RISE, FALL] {
             assert_eq!(g.slew[y][rf], [b_slew, b_slew], "rf {rf}");
         }
+    }
+
+    fn shape(g: &Graph<'_>) -> String {
+        g.shape()
+    }
+
+    /// The template build is the by-name build: on the chain, with a physical-only instance, a
+    /// net pin of a port the master lacks or the cell does not have, a master filter, and the
+    /// order of instances and nets shuffled. Where a name could be shared (a repeated instance,
+    /// a `/` in a port name) it hands over to the by-name build.
+    #[test]
+    fn the_template_build_is_the_by_name_build() {
+        let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
+        let mut nl = chain();
+        nl.insts.insert(1, ("tap0".into(), "tapcell".into()));
+        for n in &mut nl.nets {
+            for c in &mut n.pins {
+                if let Conn::Inst(i, _) = c {
+                    if *i >= 1 {
+                        *i += 1;
+                    }
+                }
+            }
+        }
+        nl.nets.push(Net { name: "x".into(), pins: vec![Conn::Inst(1, "VPWR".into()), Conn::Inst(0, "Q".into()), Conn::Inst(2, "Y".into())] });
+        nl.nets.swap(0, 3);
+        let filter: HashMap<String, Vec<String>> = [("and2".to_string(), vec!["A".to_string(), "Y".to_string()])].into();
+        for pins in [None, Some(&filter)] {
+            let fast = Graph::build_by_cell(&libs, &nl, pins).expect("names are unique");
+            let slow = Graph::build_by_name(&libs, &nl, pins).unwrap();
+            assert_eq!(shape(&fast), shape(&slow));
+        }
+        let mut dup = chain();
+        dup.insts[1].0 = "u1".into();
+        assert!(Graph::build_by_cell(&libs, &dup, None).is_none());
+        let mut slash = chain();
+        slash.ports[0].0 = "u1/A".into();
+        assert!(Graph::build_by_cell(&libs, &slash, None).is_none());
+        // There the port takes the pin's name, and the by-name build's answer stands.
+        assert_eq!(Graph::build(&libs, &slash).err(), Graph::build_by_name(&libs, &slash, None).err());
+        assert!(Graph::build(&libs, &slash).is_err());
     }
 }
