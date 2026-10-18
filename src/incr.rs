@@ -131,6 +131,8 @@ pub struct STag {
     pub is_clock: bool,
     pub crpr: Option<(String, usize, usize, usize)>,
     pub states: States,
+    pub latency: u32,
+    pub segment_start: bool,
 }
 
 /// Where a stored path came from — what the reference compares by pointer: the fanin vertex's
@@ -344,7 +346,7 @@ impl IncTimer {
 
 impl IncTimer {
     fn stag(g: &Graph<'_>, t: &Tag) -> STag {
-        STag { rf: t.rf, mm: t.mm, clk_edge: t.clk_edge, is_clock: t.is_clock, crpr: t.crpr.map(|c| (g_name(g, c.vertex), c.rf, c.mm, c.clk_edge)), states: t.states }
+        STag { rf: t.rf, mm: t.mm, clk_edge: t.clk_edge, is_clock: t.is_clock, crpr: t.crpr.map(|c| (g_name(g, c.vertex), c.rf, c.mm, c.clk_edge)), states: t.states, latency: t.latency, segment_start: t.segment_start }
     }
 
     fn tag(index: &HashMap<String, usize>, t: &STag) -> Option<Tag> {
@@ -352,7 +354,7 @@ impl IncTimer {
             None => None,
             Some((n, rf, mm, clk_edge)) => Some(CrprPath { vertex: *index.get(n)?, rf: *rf, mm: *mm, clk_edge: *clk_edge }),
         };
-        Some(Tag { rf: t.rf, mm: t.mm, clk_edge: t.clk_edge, is_clock: t.is_clock, crpr, states: t.states })
+        Some(Tag { rf: t.rf, mm: t.mm, clk_edge: t.clk_edge, is_clock: t.is_clock, crpr, states: t.states, latency: t.latency, segment_start: t.segment_start })
     }
 
     fn gen_of(&self, name: &str) -> u64 {

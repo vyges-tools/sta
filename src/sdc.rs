@@ -12,12 +12,30 @@ pub struct Clock {
     /// The port the clock is defined on.
     pub source: String,
     pub propagated: bool,
+    /// `set_clock_latency` on pins (network latency), each `delay[rf][min/max]` where set:
+    /// `specific` for one given with this clock (`-clock`), else one on the pin for every clock.
+    pub pin_latencies: Vec<PinLatency>,
+}
+
+/// One `ClockLatency` on a pin.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PinLatency {
+    pub pin: String,
+    pub specific: bool,
+    pub delay: [[Option<f32>; 2]; 2],
 }
 
 impl Clock {
     /// A clock with the default waveform `{0, period / 2}`.
     pub fn new(name: &str, period: f32, source: &str, propagated: bool) -> Clock {
-        Clock { name: name.into(), period, waveform: [0.0, period / 2.0], source: source.into(), propagated }
+        Clock { name: name.into(), period, waveform: [0.0, period / 2.0], source: source.into(), propagated, pin_latencies: Vec::new() }
+    }
+
+    /// `Sdc::clockLatency(clk, pin, rf, min_max)`: the latency given with this clock on the pin,
+    /// else (that one unset for this transition and min/max) the pin's for every clock.
+    pub fn pin_latency(&self, pin: &str, rf: usize, mm: usize) -> Option<f32> {
+        let find = |specific: bool| self.pin_latencies.iter().find(|l| l.specific == specific && l.pin == pin).and_then(|l| l.delay[rf][mm]);
+        find(true).or_else(|| find(false))
     }
 
     /// The time of the clock edge of transition `rf`.

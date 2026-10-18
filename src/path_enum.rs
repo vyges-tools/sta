@@ -214,10 +214,10 @@ impl Enum<'_, '_, '_> {
 }
 
 /// `Search::clkPathArrival`: an IDEAL clock path at a register clock pin launches at its edge
-/// (`(insertion + edge time) + latency`, both 0 here); any other path at its arrival.
+/// (`(insertion + edge time) + latency`, no insertion here); any other path at its arrival.
 fn clk_path_arrival(s: &Search<'_, '_>, v: usize, p: &Path) -> f32 {
     match p.tag.clk_edge {
-        Some(edge) if s.is_reg_clk(v) && p.tag.is_clock && !s.propagated(edge) => (0.0 + s.edge_time(edge)) + 0.0,
+        Some(edge) if s.is_reg_clk(v) && p.tag.is_clock && !s.propagated(edge) => (0.0 + s.edge_time(edge)) + f32::from_bits(p.tag.latency),
         _ => p.arrival,
     }
 }
