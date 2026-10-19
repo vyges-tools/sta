@@ -1160,8 +1160,11 @@ impl<'g, 'a> Search<'g, 'a> {
                 }
                 continue;
             }
+            // Setup and recovery checks alike: the reference visits every check arc
+            // (`visitCheckEnd`), and recovery takes setup's cycle accounting (`setSetupAccting`).
+            // An asynchronous reset's release is checked here, as a data pin is.
             for &e in self.graph.in_edges[v].iter().rev() {
-                if self.role(e) != Some(Role::Setup) {
+                if !matches!(self.role(e), Some(Role::Setup | Role::Recovery)) {
                     continue;
                 }
                 let EdgeKind::Gate { set } = self.graph.edges[e].kind else { continue };
@@ -1400,8 +1403,9 @@ impl<'g, 'a> Search<'g, 'a> {
             }
             return;
         }
+        // Hold and removal checks alike (removal takes hold's cycle accounting, `setHoldAccting`).
         for &e in self.graph.in_edges[v].iter().rev() {
-            if self.role(e) != Some(Role::Hold) {
+            if !matches!(self.role(e), Some(Role::Hold | Role::Removal)) {
                 continue;
             }
             let EdgeKind::Gate { set } = self.graph.edges[e].kind else { continue };
@@ -1495,6 +1499,33 @@ impl<'g, 'a> Search<'g, 'a> {
 
     /// The fuzzily least `required − arrival` over max paths, in tag
     /// order (`INF` with none).
+    /// `Search::wnsSlacks`: the slack an endpoint counts toward the worst and the total negative
+    /// slack, the max analysis (setup) when `max`, else the min (hold). A vertex with fanout takes its OWN path ends' slacks only — its paths'
+    /// required times include the ends downstream (an asynchronous reset's recovery check, and the
+    /// clear arc on to the register's output), which are counted where they end; any other vertex
+    /// its paths' slacks.
+    pub fn wns_slack(&self, v: usize, max: bool) -> f32 {
+        let mm = if max { MAX } else { MIN };
+        let mut req: Vec<f32> = self.paths[v].iter().map(|p| if p.tag.mm == MAX { INF } else { -INF }).collect();
+        if self.has_fanout(v) {
+            self.visit_path_ends(v, &mut req);
+        } else {
+            for (r, p) in req.iter_mut().zip(&self.paths[v]) {
+                *r = p.required;
+            }
+        }
+        let mut slack = INF;
+        for (p, r) in self.paths[v].iter().zip(req) {
+            if p.tag.mm == mm {
+                let s = if mm == MAX { r - p.arrival } else { p.arrival - r };
+                if crate::fuzzy::less(s, slack) {
+                    slack = s;
+                }
+            }
+        }
+        slack
+    }
+
     pub fn vertex_slack(&self, v: usize) -> f32 {
         let mut slack = INF;
         for p in &self.paths[v] {
@@ -1621,6 +1652,69 @@ mod tests {
 
     fn path(s: &Search, v: usize, rf: usize, is_clock: bool) -> Path {
         *s.paths[v].iter().find(|p| p.tag.rf == rf && p.tag.mm == MAX && p.tag.is_clock == is_clock).unwrap()
+    }
+
+    /// A register reset asynchronously: `RESET_B` with a rising recovery check and the clear arc on
+    /// to Q, reset from an input, Q to an output.
+    const LIB_RST: &str = r#"library (r) {
+      time_unit : "1ns"; capacitive_load_unit (1, pf);
+      cell (buf) {
+        pin (A) { direction : input; capacitance : 0.001; }
+        pin (X) { direction : output; function : "A";
+          timing () { related_pin : "A"; timing_sense : positive_unate;
+            cell_rise (scalar) { values ("0.1"); } rise_transition (scalar) { values ("0.05"); }
+            cell_fall (scalar) { values ("0.1"); } fall_transition (scalar) { values ("0.05"); } } }
+      }
+      cell (dffr) {
+        ff (IQ, IQN) { clocked_on : "CLK"; next_state : "D"; clear : "!RESET_B"; }
+        pin (CLK) { direction : input; capacitance : 0.001; clock : true; }
+        pin (D) { direction : input; capacitance : 0.001; }
+        pin (RESET_B) { direction : input; capacitance : 0.001;
+          timing () { related_pin : "CLK"; timing_type : recovery_rising; rise_constraint (scalar) { values ("0.11"); } } }
+        pin (Q) { direction : output; function : "IQ";
+          timing () { related_pin : "CLK"; timing_type : rising_edge;
+            cell_rise (scalar) { values ("0.3"); } rise_transition (scalar) { values ("0.1"); }
+            cell_fall (scalar) { values ("0.35"); } fall_transition (scalar) { values ("0.1"); } }
+          timing () { related_pin : "RESET_B"; timing_sense : positive_unate; timing_type : clear;
+            cell_fall (scalar) { values ("0.25"); } fall_transition (scalar) { values ("0.1"); } } }
+      }
+    }"#;
+
+    /// Rules: a recovery check is a path end as a setup check is (`visitCheckEnd`; setup's cycle
+    /// accounting, `setSetupAccting`); and an endpoint with fanout counts toward the worst and the
+    /// total negative slack by its OWN ends (`Search::wnsSlacks`) while its vertex slack takes the
+    /// ends downstream too. RESET_B: clock 1 ns + 0.1 ns tree − 0.11 recovery − 0.2 input delay.
+    #[test]
+    fn a_recovery_check_ends_a_path_and_counts_by_its_own_end() {
+        let libs = vec![Library::read(&crate::liberty_parse::parse(LIB_RST).unwrap()).unwrap()];
+        let i = |k: usize, p: &str| Conn::Inst(k, p.into());
+        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins };
+        let netlist = Netlist {
+            insts: vec![("b1".into(), "buf".into()), ("f1".into(), "dffr".into())],
+            ports: vec![("clk".into(), PortDir::Input), ("rst".into(), PortDir::Input), ("out".into(), PortDir::Output)],
+            nets: vec![
+                net("clk", vec![i(0, "A"), Conn::Port(0)]),
+                net("cb", vec![i(0, "X"), i(1, "CLK")]),
+                net("rst", vec![i(1, "RESET_B"), Conn::Port(1)]),
+                net("out", vec![i(1, "Q"), Conn::Port(2)]),
+            ],
+        };
+        let sdc = Sdc {
+            clocks: vec![Clock::new("c", 1e-9, "clk", true)],
+            input_delays: vec![PortDelay::uniform("rst", 0.2e-9)],
+            output_delays: vec![PortDelay::uniform("out", 0.2e-9)],
+            path_delays: Vec::new(),
+        };
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        g.find_delays(&HashMap::new(), None).unwrap();
+        let mut s = Search::in_graph_order(&g, &sdc);
+        s.find_arrivals().unwrap();
+        s.find_requireds().unwrap();
+        let rb = g.vertices.iter().position(|x| x.name == "f1/RESET_B").unwrap();
+        assert!(s.is_endpoint(rb) && s.has_fanout(rb));
+        let own = s.wns_slack(rb, true);
+        assert!((own - 0.79e-9).abs() < 1e-15, "recovery slack {own}");
+        assert!(s.vertex_slack(rb) <= own, "the vertex slack takes the clear arc's end too");
     }
 
     /// Rule: a clock tag entering a register clock pin over
