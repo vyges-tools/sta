@@ -629,9 +629,11 @@ impl<'g, 'a> Search<'g, 'a> {
     }
 
     /// `SearchPred0::searchThru`: not a check, not disabled by a `when` under the constants, not of
-    /// sense none.
+    /// sense none, and not a register's preset/clear arc — those are disabled by default
+    /// (`preset_clr_arcs_enabled` false, which no job here changes), so no path runs from an
+    /// asynchronous reset through to the register's output.
     fn search_thru(&self, e: usize) -> bool {
-        !self.is_check(e) && !self.sim.disabled_cond[e] && self.sim.sense[e] != SimSense::None
+        !self.is_check(e) && !self.sim.disabled_cond[e] && self.sim.sense[e] != SimSense::None && self.role(e) != Some(Role::RegSetClr)
     }
 
     /// `searchThruTimingSense`: the arc's transitions against the edge's sense under constants.
@@ -730,7 +732,7 @@ impl<'g, 'a> Search<'g, 'a> {
     /// one arc, the arc's delay, and the arrival it arrives with.
     pub(crate) fn visit_from_path(&self, from_v: usize, from: &Path, e: usize, arc: &ArcRef) -> Option<(Tag, f32, f32)> {
         let to_v = self.graph.edges[e].to;
-        if !self.search_from(from_v) || !self.search_to(to_v) || self.sim.disabled_cond[e] || !self.search_thru_sense(e, from.tag.rf, arc.to_rf) {
+        if !self.search_from(from_v) || !self.search_to(to_v) || !self.search_thru(e) || !self.search_thru_sense(e, from.tag.rf, arc.to_rf) {
             return None;
         }
         let mm = from.tag.mm;
@@ -1681,9 +1683,10 @@ mod tests {
     }"#;
 
     /// Rules: a recovery check is a path end as a setup check is (`visitCheckEnd`; setup's cycle
-    /// accounting, `setSetupAccting`); and an endpoint with fanout counts toward the worst and the
-    /// total negative slack by its OWN ends (`Search::wnsSlacks`) while its vertex slack takes the
-    /// ends downstream too. RESET_B: clock 1 ns + 0.1 ns tree − 0.11 recovery − 0.2 input delay.
+    /// accounting, `setSetupAccting`). RESET_B has NO searched fanout — its clear arc to Q is
+    /// disabled by default (`SearchPred0::searchThru`, `preset_clr_arcs_enabled` false) — so its
+    /// slack is its recovery end's alone. RESET_B: clock 1 ns + 0.1 ns tree − 0.11 recovery − 0.2
+    /// input delay.
     #[test]
     fn a_recovery_check_ends_a_path_and_counts_by_its_own_end() {
         let libs = vec![Library::read(&crate::liberty_parse::parse(LIB_RST).unwrap()).unwrap()];
@@ -1711,10 +1714,46 @@ mod tests {
         s.find_arrivals().unwrap();
         s.find_requireds().unwrap();
         let rb = g.vertices.iter().position(|x| x.name == "f1/RESET_B").unwrap();
-        assert!(s.is_endpoint(rb) && s.has_fanout(rb));
+        assert!(s.is_endpoint(rb) && !s.has_fanout(rb));
         let own = s.wns_slack(rb, true);
         assert!((own - 0.79e-9).abs() < 1e-15, "recovery slack {own}");
-        assert!(s.vertex_slack(rb) <= own, "the vertex slack takes the clear arc's end too");
+        assert_eq!(s.vertex_slack(rb), own, "no clear-arc end downstream");
+    }
+
+    /// Rule: a register's preset/clear arc is not searched by default (`SearchPred0::searchThru`:
+    /// `role == regSetClr && !presetClrArcsEnabled()`), so a late reset never reaches Q. Q falls
+    /// at the clock's 0.1 ns tree + 0.35 clock-to-Q only; through the clear arc it would be the
+    /// 0.6 ns input delay + 0.25 = 0.85 ns.
+    #[test]
+    fn a_clear_arc_is_not_searched_by_default() {
+        let libs = vec![Library::read(&crate::liberty_parse::parse(LIB_RST).unwrap()).unwrap()];
+        let i = |k: usize, p: &str| Conn::Inst(k, p.into());
+        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins };
+        let netlist = Netlist {
+            insts: vec![("b1".into(), "buf".into()), ("f1".into(), "dffr".into())],
+            ports: vec![("clk".into(), PortDir::Input), ("rst".into(), PortDir::Input), ("out".into(), PortDir::Output)],
+            nets: vec![
+                net("clk", vec![i(0, "A"), Conn::Port(0)]),
+                net("cb", vec![i(0, "X"), i(1, "CLK")]),
+                net("rst", vec![i(1, "RESET_B"), Conn::Port(1)]),
+                net("out", vec![i(1, "Q"), Conn::Port(2)]),
+            ],
+        };
+        let sdc = Sdc {
+            clocks: vec![Clock::new("c", 1e-9, "clk", true)],
+            input_delays: vec![PortDelay::uniform("rst", 0.6e-9)],
+            output_delays: vec![PortDelay::uniform("out", 0.2e-9)],
+            path_delays: Vec::new(),
+        };
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        g.find_delays(&HashMap::new(), None).unwrap();
+        let mut s = Search::in_graph_order(&g, &sdc);
+        s.find_arrivals().unwrap();
+        s.find_requireds().unwrap();
+        let q = g.vertices.iter().position(|x| x.name == "f1/Q").unwrap();
+        let falls: Vec<f32> = s.paths[q].iter().filter(|p| p.tag.mm == MAX && p.tag.rf == 1).map(|p| p.arrival).collect();
+        assert_eq!(falls.len(), 1, "one max fall path at Q, the clock's: {falls:?}");
+        assert!((falls[0] - 0.45e-9).abs() < 1e-15, "Q fall {}", falls[0]);
     }
 
     /// Rule: a clock tag entering a register clock pin over
