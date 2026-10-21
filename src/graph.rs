@@ -216,6 +216,29 @@ impl<'a> Graph<'a> {
     /// the instance's pins). A bidirect pin is two
     /// vertices — a driver (arcs INTO it) and a load (arcs FROM it); one on a net is not modelled.
     pub fn build_with_pins(libs: &'a [Library], netlist: &'a Netlist, pins: Option<&HashMap<String, Vec<String>>>) -> Result<Graph<'a>, String> {
+        let g = Graph::build_with_pins_untraced(libs, netlist, pins)?;
+        // `VYGES_STA_BUILD_TRACE`: every graph built, as the reference's graph-edit tracer prints
+        // its build — ids from 1 (the reference's object tables reserve id 0); a diagnostic for
+        // small designs
+        if std::env::var_os("VYGES_STA_BUILD_TRACE").is_some() {
+            g.trace_build();
+        }
+        Ok(g)
+    }
+
+    /// The build trace: each vertex in id order, then each edge in id order.
+    fn trace_build(&self) {
+        for (i, v) in self.vertices.iter().enumerate() {
+            eprintln!("VYGGV|{}|{}|0", i + 1, v.name);
+        }
+        for (i, e) in self.edges.iter().enumerate() {
+            let wire = u8::from(matches!(e.kind, EdgeKind::Wire));
+            eprintln!("VYGGE|{}|{}|{}|{wire}|{}|{}", i + 1, e.from + 1, e.to + 1, self.vertices[e.from].name, self.vertices[e.to].name);
+        }
+        eprintln!("VYGGBUILT");
+    }
+
+    fn build_with_pins_untraced(libs: &'a [Library], netlist: &'a Netlist, pins: Option<&HashMap<String, Vec<String>>>) -> Result<Graph<'a>, String> {
         static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         match Graph::build_by_cell(libs, netlist, pins) {
             // `VYGES_STA_CHECK_BUILD=1`: every template build is checked against the by-name one.
