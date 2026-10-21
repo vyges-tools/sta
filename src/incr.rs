@@ -113,6 +113,9 @@ pub struct IncTimer {
     /// Each instance's cell and each top port's direction (input: true), kept by the events.
     pub cells: HashMap<String, String>,
     pub port_input: HashMap<String, bool>,
+    /// This timer prints the graph-edit trace (`VYGES_STA_GRAPH_TRACE`): one timer per design
+    /// does — the reference has ONE graph for every scene, a caller one timer per scene.
+    pub trace_edits: bool,
 }
 
 /// What applying an edit event reads: the libraries and whether every clock is ideal
@@ -911,8 +914,24 @@ impl IncTimer {
             }
         }
         self.delay_invalid(to.to_string());
-        self.relevelize_from.insert(to.to_string());
+        self.relevelize_from_pin(to.to_string());
+        if self.tracing() {
+            eprintln!("VYGGD|{from}|{to}");
+        }
         self.bump_edge(key);
+    }
+
+    /// The graph-edit trace is on for this timer.
+    fn tracing(&self) -> bool {
+        self.trace_edits && graph_trace()
+    }
+
+    /// `relevelizeFrom(vertex)` (traced while levelized, as the reference queues it only then).
+    fn relevelize_from_pin(&mut self, pin: String) {
+        if self.tracing() && !self.levels.is_empty() {
+            eprintln!("VYGGR|{pin}");
+        }
+        self.relevelize_from.insert(pin);
     }
 
     /// A deleted or remade edge: the next one with this key is a different object.
@@ -956,6 +975,9 @@ impl IncTimer {
     /// One edit event (`Db::edit_log_take`) as the reference's timer acts on it (`dbStaCbk`).
     pub fn apply_event(&mut self, cx: &EventCtx<'_>, ev: &str) -> Result<(), String> {
         let f: Vec<&str> = ev.split('|').collect();
+        if self.tracing() {
+            trace_callback(&f);
+        }
         match f.as_slice() {
             ["iterm_connect" | "bterm_connect", pin, _net, pins] => self.connect_pin_after(cx, pin, pins),
             ["iterm_disconnect" | "bterm_disconnect", pin, _net, pins] => self.disconnect_pin_before(cx, pin, pins),
@@ -965,10 +987,16 @@ impl IncTimer {
                 self.cells.insert(inst.to_string(), master.to_string());
                 if let Some(cell) = self.cell(cx, master) {
                     for p in &cell.ports {
+                        if self.tracing() {
+                            eprintln!("VYGGV|{inst}/{}", p.name);
+                        }
                         self.delete_vertex(&format!("{inst}/{}", p.name));
                     }
                 }
-                for (_, _, key) in self.inst_edges(cx, inst, master) {
+                for (from, to, key) in self.inst_edges(cx, inst, master) {
+                    if self.tracing() {
+                        eprintln!("VYGGE|0|{from}|{to}");
+                    }
                     self.bump_edge(key);
                 }
             }
@@ -999,19 +1027,25 @@ impl IncTimer {
         let (drivers, loads) = self.drivers_loads(cx, pins);
         if is_drv {
             for l in loads.iter().filter(|l| *l != pin) {
+                if self.tracing() {
+                    eprintln!("VYGGE|1|{pin}|{l}");
+                }
                 self.bump_edge(EdgeKey::Wire { from: pin.to_string(), to: l.clone() });
                 self.arrival_invalid(l.clone());
             }
             self.delay_invalid(pin.to_string());
             self.required_invalid(pin.to_string());
-            self.relevelize_from.insert(pin.to_string());
+            self.relevelize_from_pin(pin.to_string());
         }
         if is_load {
             for d in drivers.iter().filter(|d| *d != pin) {
+                if self.tracing() {
+                    eprintln!("VYGGE|1|{d}|{pin}");
+                }
                 self.bump_edge(EdgeKey::Wire { from: d.clone(), to: pin.to_string() });
                 self.delay_invalid(d.clone());
                 self.required_invalid(d.clone());
-                self.relevelize_from.insert(d.clone());
+                self.relevelize_from_pin(d.clone());
             }
             self.delay_invalid(pin.to_string());
             self.arrival_invalid(pin.to_string());
@@ -1044,6 +1078,10 @@ impl IncTimer {
             return Ok(());
         };
         let equiv = equiv_cells_arcs(from_cell, to_cell);
+        if self.tracing() {
+            TRACE_SWAP_EQUIV.with(|e| e.set(equiv));
+            eprintln!("VYGGC|{}|{inst}|{to}", if equiv { "replaceEquivCellBefore" } else { "replaceCellBefore" });
+        }
         for t in terms.split(';').filter(|t| !t.is_empty()) {
             let mut parts = t.splitn(3, '=');
             let (Some(port), Some(_net), Some(pins)) = (parts.next(), parts.next(), parts.next()) else { continue };
@@ -1260,4 +1298,35 @@ mod tests {
         inc.find_delays(&mut g, &HashMap::new(), None).unwrap();
         assert_eq!(inc.visited[..2], ["b2/A".to_string(), "b2/X".into()]);
     }
+}
+
+/// `VYGES_STA_GRAPH_TRACE`: print, in call order, each netlist-edit callback the timer applies and
+/// the graph edits it implies (stderr) — the reference's graph-edit trace, by pin name.
+fn graph_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VYGES_STA_GRAPH_TRACE").is_some())
+}
+
+thread_local! {
+    /// The last traced swap's arcs were equivalent (`swap_master_arcs_equiv_`).
+    static TRACE_SWAP_EQUIV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The reference callback an edit event is delivered to, as the graph-edit trace names it.
+fn trace_callback(f: &[&str]) {
+    let line = match f {
+        ["iterm_connect" | "bterm_connect", pin, net, ..] => format!("connectPinAfter|{pin}|{net}"),
+        ["iterm_disconnect" | "bterm_disconnect", pin, net, ..] => format!("disconnectPinBefore|{pin}|{net}"),
+        ["iterm_destroy", pin, ..] => format!("deletePinBefore|{pin}|"),
+        ["inst_create", inst, ..] => format!("makeInstanceAfter|{inst}|"),
+        ["inst_destroy", inst] => format!("deleteInstanceBefore|{inst}|"),
+        // the after half of the swap `swap_before` named (`swap_master_arcs_equiv_`)
+        ["swap_after", inst, ..] => {
+            let equiv = TRACE_SWAP_EQUIV.with(|e| e.get());
+            format!("{}|{inst}|", if equiv { "replaceEquivCellAfter" } else { "replaceCellAfter" })
+        }
+        ["net_destroy", net, ..] => format!("deleteNetBefore|{net}|"),
+        _ => return,
+    };
+    eprintln!("VYGGC|{line}");
 }
