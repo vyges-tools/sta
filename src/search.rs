@@ -1756,6 +1756,36 @@ mod tests {
         assert!((falls[0] - 0.45e-9).abs() < 1e-15, "Q fall {}", falls[0]);
     }
 
+    /// Rule: the delay calculation skips a register's preset/clear arc too (`DcalcPred::searchThru`,
+    /// the same `presetClrArcsEnabled` test), so its slew never reaches Q: with the clear arc's
+    /// fall transition at 0.4 ns, Q's max fall slew stays clock-to-Q's 0.1 ns.
+    #[test]
+    fn a_clear_arcs_slew_does_not_reach_its_output() {
+        let lib = LIB_RST.replacen(
+            r#"cell_fall (scalar) { values ("0.25"); } fall_transition (scalar) { values ("0.1"); }"#,
+            r#"cell_fall (scalar) { values ("0.25"); } fall_transition (scalar) { values ("0.4"); }"#,
+            1,
+        );
+        assert_ne!(lib, LIB_RST);
+        let libs = vec![Library::read(&crate::liberty_parse::parse(&lib).unwrap()).unwrap()];
+        let i = |k: usize, p: &str| Conn::Inst(k, p.into());
+        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins };
+        let netlist = Netlist {
+            insts: vec![("b1".into(), "buf".into()), ("f1".into(), "dffr".into())],
+            ports: vec![("clk".into(), PortDir::Input), ("rst".into(), PortDir::Input), ("out".into(), PortDir::Output)],
+            nets: vec![
+                net("clk", vec![i(0, "A"), Conn::Port(0)]),
+                net("cb", vec![i(0, "X"), i(1, "CLK")]),
+                net("rst", vec![i(1, "RESET_B"), Conn::Port(1)]),
+                net("out", vec![i(1, "Q"), Conn::Port(2)]),
+            ],
+        };
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        g.find_delays(&HashMap::new(), None).unwrap();
+        let q = g.vertices.iter().position(|x| x.name == "f1/Q").unwrap();
+        assert_eq!(g.slew[q][FALL][MAX], 0.1e-9, "Q fall slew is clock-to-Q's");
+    }
+
     /// Rule: a clock tag entering a register clock pin over
     /// an arc with equal min/max delay takes the DRIVING path as its CRPR clock path, and the
     /// launched data tag keeps it — the clock buffer's output, not the flop's clock pin.

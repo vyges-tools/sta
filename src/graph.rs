@@ -1052,8 +1052,11 @@ impl<'a> Graph<'a> {
             let EdgeKind::Gate { set } = self.edges[e].kind else { continue };
             let arcs = self.arc_set(e, set).arcs.clone();
             let from = self.edges[e].from;
-            // `findDriverEdgeDelays`: no arc from a constant pin (`DcalcPred::searchFrom`).
-            if self.is_constant(from) {
+            // `findDriverEdgeDelays`: no arc from a constant pin (`DcalcPred::searchFrom`), and
+            // none through a register set/clear arc (`DcalcPred::searchThru`: disabled while
+            // `preset_clr_arcs_enabled` is false, its default) — so its slew never reaches the
+            // driver: a dfrtp's Q takes CLK->Q's fall slew even where RESET_B->Q's is larger.
+            if self.is_constant(from) || self.arc_set(e, set).role == Role::RegSetClr {
                 continue;
             }
             let ideal_clk_to_q = matches!(self.arc_set(e, set).role, Role::RegClkToQ | Role::LatchEnToQ) && self.ideal_clock.contains(&from);
