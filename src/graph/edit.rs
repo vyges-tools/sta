@@ -360,33 +360,38 @@ impl<'a> Graph<'a> {
     /// The slots of the nets named `names` in the netlist, ascending — the nets a pass over every
     /// net would meet. The kept map takes the nets appended after `old_nets`; a name it holds at a
     /// slot where the netlist has another name (a rename moves a name, not a slot), or a name it
-    /// does not hold, makes it again by that pass.
+    /// does not hold, is looked for by a pass over the netlist and entered — the names missed, not
+    /// the map again (on picorv32 a miss came every twentieth edit, each a whole-map rebuild).
     fn named_net_slots(&mut self, names: &std::collections::HashSet<String>, old_nets: usize) -> Vec<usize> {
         let nets = &self.netlist.nets;
-        if let Some(map) = self.net_slots.as_mut() {
-            for (k, n) in nets.iter().enumerate().skip(old_nets) {
-                map.insert(n.name.clone(), k);
-            }
-            let mut out = Vec::with_capacity(names.len());
-            if names.iter().all(|name| match map.get(name) {
-                Some(&k) if nets.get(k).is_some_and(|n| &n.name == name) => {
-                    out.push(k);
-                    true
+        let map = match self.net_slots.as_mut() {
+            Some(map) => {
+                for (k, n) in nets.iter().enumerate().skip(old_nets) {
+                    map.insert(n.name.clone(), k);
                 }
-                _ => false,
-            }) {
-                out.sort_unstable();
-                return out;
+                map
+            }
+            None => self.net_slots.insert(nets.iter().enumerate().map(|(k, n)| (n.name.clone(), k)).collect()),
+        };
+        let held = |map: &HashMap<String, usize>, name: &String| map.get(name).copied().filter(|&k| nets.get(k).is_some_and(|n| &n.name == name));
+        let mut missed: Vec<&String> = names.iter().filter(|name| held(map, name).is_none()).collect();
+        if !missed.is_empty() {
+            if std::env::var_os("VYGES_STA_NET_SLOTS_TRACE").is_some() {
+                eprintln!("VYGSLOTS|missed|{missed:?}");
+            }
+            for (k, n) in nets.iter().enumerate() {
+                if let Some(i) = missed.iter().position(|m| **m == n.name) {
+                    map.insert(n.name.clone(), k);
+                    missed.swap_remove(i);
+                    if missed.is_empty() {
+                        break;
+                    }
+                }
             }
         }
-        if self.net_slots.is_some() && std::env::var_os("VYGES_STA_NET_SLOTS_TRACE").is_some() {
-            let missed: Vec<&String> = names.iter().filter(|n| self.net_slots.as_ref().and_then(|m| m.get(*n)).is_none_or(|&k| nets.get(k).is_none_or(|x| &x.name != *n))).collect();
-            eprintln!("VYGSLOTS|rebuilt|{missed:?}");
-        }
-        let map: HashMap<String, usize> = nets.iter().enumerate().map(|(k, n)| (n.name.clone(), k)).collect();
-        let mut out: Vec<usize> = names.iter().filter_map(|n| map.get(n).copied()).collect();
+        // A name on no net in the netlist has no slot.
+        let mut out: Vec<usize> = names.iter().filter_map(|name| held(map, name)).collect();
         out.sort_unstable();
-        self.net_slots = Some(map);
         out
     }
 
@@ -545,6 +550,11 @@ mod tests {
         g.netlist = NetlistRef::Shared(Arc::new(traded));
         assert_eq!(g.named_net_slots(&names(&["n1"]), 6), vec![5]);
         assert_eq!(g.named_net_slots(&names(&["n2"]), 6), vec![2]);
+        // a name the map never held, at a slot below the old count; a name on no net has no slot
+        let mut moved = chain(true);
+        Arc::make_mut(&mut moved.nets[3]).name = "fresh".into();
+        g.netlist = NetlistRef::Shared(Arc::new(moved));
+        assert_eq!(g.named_net_slots(&names(&["fresh", "nowhere", "n1"]), 6), vec![2, 3], "n1 back at 2: its kept slot 5 is stale");
     }
 
     /// Rule: an entry the next netlist shares with the graph's (the same allocation) is the same

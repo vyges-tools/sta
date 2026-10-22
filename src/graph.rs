@@ -668,7 +668,9 @@ impl<'a> Graph<'a> {
 
     /// The arc set of a gate edge as the graph holds it: an output-to-output edge of an instance
     /// replaced by an equivalent-arcs cell keeps its OLD cell's set ([`Graph::stale_out_arcs`]).
-    pub fn arc_set(&self, e: usize, set: usize) -> &crate::liberty::ArcSet {
+    /// Borrowed from the libraries (`'a`), not from the graph: a caller editing delays and slews
+    /// holds the arcs without copying them.
+    pub fn arc_set(&self, e: usize, set: usize) -> &'a crate::liberty::ArcSet {
         let v = &self.vertices[self.edges[e].to];
         if !self.stale_out_arcs.is_empty() {
             let from = &self.vertices[self.edges[e].from];
@@ -989,7 +991,7 @@ impl<'a> Graph<'a> {
             return false;
         }
         let Some(drvr_lib) = self.vertices[v].lib else { return false };
-        let arcs = self.arc_set(e, set).arcs.clone();
+        let arcs = &self.arc_set(e, set).arcs;
         let mut changed = false;
         for mm in [MIN, MAX] {
             for (k, arc) in arcs.iter().enumerate() {
@@ -1117,7 +1119,7 @@ impl<'a> Graph<'a> {
         // the reverse of the cell's arc-set order.
         for &e in fanin.iter().rev() {
             let EdgeKind::Gate { set } = self.edges[e].kind else { continue };
-            let arcs = self.arc_set(e, set).arcs.clone();
+            let arcs = &self.arc_set(e, set).arcs;
             let from = self.edges[e].from;
             // `findDriverEdgeDelays`: no arc from a constant pin (`DcalcPred::searchFrom`), and
             // none through a register set/clear arc (`DcalcPred::searchThru`: disabled while
@@ -1215,7 +1217,7 @@ impl<'a> Graph<'a> {
     /// One timing check edge's delays (`findCheckEdgeDelays`), from the slews at both ends.
     pub fn find_check_edge_delays(&mut self, e: usize) {
         let EdgeKind::Gate { set } = self.edges[e].kind else { return };
-        let arcs = self.arc_set(e, set).arcs.clone();
+        let arcs = &self.arc_set(e, set).arcs;
         let (from, to) = (self.edges[e].from, self.edges[e].to);
         for (k, arc) in arcs.iter().enumerate() {
             let Model::Check(table) = &arc.model else { continue };
