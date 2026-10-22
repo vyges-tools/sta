@@ -66,8 +66,20 @@ impl<'a> Graph<'a> {
     pub fn apply_edits(&mut self, events: &[String], netlist: Arc<Netlist>, pins: Option<&HashMap<String, Vec<String>>>) -> Result<(), NotInPlace> {
         self.check_extends(&netlist)?;
         let index = match self.index_cache.take() {
-            Some(ix) => Arc::try_unwrap(ix).unwrap_or_else(|shared| (*shared).clone()),
-            None => self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect(),
+            Some(ix) => Arc::try_unwrap(ix).unwrap_or_else(|shared| {
+                // ⚠️ O(graph): another holder of the index makes every edit copy it
+                if std::env::var_os("VYGES_STA_INDEX_TRACE").is_some() {
+                    eprintln!("VYGINDEX|copied|{}", Arc::strong_count(&shared));
+                }
+                (*shared).clone()
+            }),
+            None => {
+                // ⚠️ O(graph): no index kept from the last build or edit
+                if std::env::var_os("VYGES_STA_INDEX_TRACE").is_some() {
+                    eprintln!("VYGINDEX|built|{}", self.vertices.len());
+                }
+                self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect()
+            }
         };
         if index.len() != self.vertices.len() {
             return Err(NotInPlace::Event("a pin name shared by two vertices".into()));
