@@ -29,6 +29,9 @@ use crate::liberty::{Cell, Direction, Library, Model, Role, FALL, MAX, MIN, RISE
 use crate::netlist::{Conn, Netlist, PortDir};
 use crate::parasitics::{reduce_to_pi_elmore, Network, NodePins};
 
+mod edit;
+pub use edit::NotInPlace;
+
 /// A vertex: one pin (a bidirect pin is refused).
 #[derive(Debug, Clone)]
 pub struct Vertex {
@@ -76,9 +79,28 @@ pub struct NetParasitics {
     pub pi_rise_only: bool,
 }
 
+/// The netlist a graph was built over: borrowed from its caller, or shared with it — a graph
+/// that outlives the netlist generation it was built from (it is edited in place) holds the
+/// generation it is current with.
+#[derive(Debug, Clone)]
+pub enum NetlistRef<'a> {
+    Borrowed(&'a Netlist),
+    Shared(std::sync::Arc<Netlist>),
+}
+
+impl std::ops::Deref for NetlistRef<'_> {
+    type Target = Netlist;
+    fn deref(&self) -> &Netlist {
+        match self {
+            NetlistRef::Borrowed(n) => n,
+            NetlistRef::Shared(n) => n,
+        }
+    }
+}
+
 pub struct Graph<'a> {
     pub libs: &'a [Library],
-    pub netlist: &'a Netlist,
+    pub netlist: NetlistRef<'a>,
     pub vertices: Vec<Vertex>,
     pub edges: Vec<Edge>,
     pub in_edges: Vec<Vec<usize>>,
@@ -117,6 +139,12 @@ pub struct Graph<'a> {
     /// is built, and [`Graph::load_cap`] and its kin are called per driver by a repair loop.
     /// Shared, so a caller holding it ([`Graph::pin_index`]) does not copy every name.
     index_cache: std::sync::OnceLock<std::sync::Arc<HashMap<String, usize>>>,
+    /// The caller's: how far into its log of netlist edits this graph is ([`Graph::apply_edits`]
+    /// brings it on). `None` from a build — not known, so a caller builds again.
+    pub edit_seq: Option<usize>,
+    /// The timer's: the state it imported, as its stamp and how far into its log of written names
+    /// ([`crate::incr::IncTimer::import`] brings it on). `None` from a build.
+    pub state_seq: Option<(u64, usize)>,
 }
 
 /// [`Graph::parasitic_load`]: `(pin_cap, wire_cap, the pi model and its node names)`.
@@ -216,7 +244,19 @@ impl<'a> Graph<'a> {
     /// the instance's pins). A bidirect pin is two
     /// vertices — a driver (arcs INTO it) and a load (arcs FROM it); one on a net is not modelled.
     pub fn build_with_pins(libs: &'a [Library], netlist: &'a Netlist, pins: Option<&HashMap<String, Vec<String>>>) -> Result<Graph<'a>, String> {
-        let g = Graph::build_with_pins_untraced(libs, netlist, pins)?;
+        Graph::build_keeping(libs, netlist, NetlistRef::Borrowed(netlist), pins)
+    }
+
+    /// [`Graph::build_with_pins`] over a netlist the graph SHARES (it may outlive the caller's
+    /// generation of it, and be moved to a later one).
+    pub fn build_shared(libs: &'a [Library], netlist: std::sync::Arc<Netlist>, pins: Option<&HashMap<String, Vec<String>>>) -> Result<Graph<'a>, String> {
+        let read = netlist.clone();
+        Graph::build_keeping(libs, &read, NetlistRef::Shared(netlist), pins)
+    }
+
+    /// The build over `netlist`, the graph keeping `keep` (the same netlist).
+    fn build_keeping(libs: &'a [Library], netlist: &Netlist, keep: NetlistRef<'a>, pins: Option<&HashMap<String, Vec<String>>>) -> Result<Graph<'a>, String> {
+        let g = Graph::build_with_pins_untraced(libs, netlist, keep, pins)?;
         // `VYGES_STA_BUILD_TRACE`: every graph built, as the reference's graph-edit tracer prints
         // its build — ids from 1 (the reference's object tables reserve id 0); a diagnostic for
         // small designs
@@ -238,12 +278,12 @@ impl<'a> Graph<'a> {
         eprintln!("VYGGBUILT");
     }
 
-    fn build_with_pins_untraced(libs: &'a [Library], netlist: &'a Netlist, pins: Option<&HashMap<String, Vec<String>>>) -> Result<Graph<'a>, String> {
+    fn build_with_pins_untraced(libs: &'a [Library], netlist: &Netlist, keep: NetlistRef<'a>, pins: Option<&HashMap<String, Vec<String>>>) -> Result<Graph<'a>, String> {
         static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        match Graph::build_by_cell(libs, netlist, pins) {
+        match Graph::build_by_cell(libs, netlist, keep.clone(), pins) {
             // `VYGES_STA_CHECK_BUILD=1`: every template build is checked against the by-name one.
             Some(g) if *CHECK.get_or_init(|| std::env::var_os("VYGES_STA_CHECK_BUILD").is_some()) => {
-                let by_name = Graph::build_by_name(libs, netlist, pins)?;
+                let by_name = Graph::build_by_name(libs, netlist, keep, pins)?;
                 if g.shape() != by_name.shape() {
                     return Err("the template build differs from the by-name build".into());
                 }
@@ -256,7 +296,7 @@ impl<'a> Graph<'a> {
                 Ok(g)
             }
             Some(g) => Ok(g),
-            None => Graph::build_by_name(libs, netlist, pins),
+            None => Graph::build_by_name(libs, netlist, keep, pins),
         }
     }
 
@@ -272,7 +312,7 @@ impl<'a> Graph<'a> {
     /// [`Graph::build_by_name`] whenever a pin's name is its alone, which is checked: `None`
     /// (build by name) when an instance or port name repeats, a port or liberty port name holds a
     /// `/` (an instance pin's name could then be another's), or a cell has a bidirect pin.
-    fn build_by_cell(libs: &'a [Library], netlist: &'a Netlist, pins: Option<&HashMap<String, Vec<String>>>) -> Option<Graph<'a>> {
+    fn build_by_cell(libs: &'a [Library], netlist: &Netlist, keep: NetlistRef<'a>, pins: Option<&HashMap<String, Vec<String>>>) -> Option<Graph<'a>> {
         /// One cell's instance layout: per vertex its port, whether it drives, and its delay-row
         /// count's source; the first vertex of each port; the gate edges `(from, to, set, arcs)`.
         struct Template<'l> {
@@ -509,11 +549,11 @@ impl<'a> Graph<'a> {
                 let _ = index_cache.set(std::sync::Arc::new(map));
             }
         }
-        Some(Graph { libs, netlist, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), stale_out_arcs: HashMap::new(), index_cache })
+        Some(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), stale_out_arcs: HashMap::new(), index_cache, edit_seq: None, state_seq: None })
     }
 
     /// [`Graph::build_with_pins`] with each pin found by its name.
-    fn build_by_name(libs: &'a [Library], netlist: &'a Netlist, pins: Option<&HashMap<String, Vec<String>>>) -> Result<Graph<'a>, String> {
+    fn build_by_name(libs: &'a [Library], netlist: &Netlist, keep: NetlistRef<'a>, pins: Option<&HashMap<String, Vec<String>>>) -> Result<Graph<'a>, String> {
         let find_cell = |name: &str| libs.iter().position(|l| l.cells.contains_key(name));
         let mut vertices = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
@@ -612,7 +652,7 @@ impl<'a> Graph<'a> {
                 EdgeKind::Wire => vec![[0.0f32; 2]; 2],
             })
             .collect();
-        Ok(Graph { libs, netlist, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), stale_out_arcs: HashMap::new(), index_cache: std::sync::OnceLock::new() })
+        Ok(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), stale_out_arcs: HashMap::new(), index_cache: std::sync::OnceLock::new(), edit_seq: None, state_seq: None })
     }
 
     pub fn is_check(&self, e: usize) -> bool {
@@ -1483,18 +1523,18 @@ mod tests {
         nl.nets.swap(0, 3);
         let filter: HashMap<String, Vec<String>> = [("and2".to_string(), vec!["A".to_string(), "Y".to_string()])].into();
         for pins in [None, Some(&filter)] {
-            let fast = Graph::build_by_cell(&libs, &nl, pins).expect("names are unique");
-            let slow = Graph::build_by_name(&libs, &nl, pins).unwrap();
+            let fast = Graph::build_by_cell(&libs, &nl, NetlistRef::Borrowed(&nl), pins).expect("names are unique");
+            let slow = Graph::build_by_name(&libs, &nl, NetlistRef::Borrowed(&nl), pins).unwrap();
             assert_eq!(shape(&fast), shape(&slow));
         }
         let mut dup = chain();
         dup.insts[1].0 = "u1".into();
-        assert!(Graph::build_by_cell(&libs, &dup, None).is_none());
+        assert!(Graph::build_by_cell(&libs, &dup, NetlistRef::Borrowed(&dup), None).is_none());
         let mut slash = chain();
         slash.ports[0].0 = "u1/A".into();
-        assert!(Graph::build_by_cell(&libs, &slash, None).is_none());
+        assert!(Graph::build_by_cell(&libs, &slash, NetlistRef::Borrowed(&slash), None).is_none());
         // There the port takes the pin's name, and the by-name build's answer stands.
-        assert_eq!(Graph::build(&libs, &slash).err(), Graph::build_by_name(&libs, &slash, None).err());
+        assert_eq!(Graph::build(&libs, &slash).err(), Graph::build_by_name(&libs, &slash, NetlistRef::Borrowed(&slash), None).err());
         assert!(Graph::build(&libs, &slash).is_err());
     }
 

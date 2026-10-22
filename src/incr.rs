@@ -68,11 +68,39 @@ impl EdgeTail {
 /// The full levelization's spacing; incremental relevelization steps by 1 between.
 pub const LEVEL_SPACE: i32 = 10;
 
+/// Which state a graph imported: a new one per timer, per copy of one and per [`IncTimer::export`]
+/// — a copy goes its own way, so a graph that imported the original imports the copy whole.
+#[derive(Debug)]
+struct Stamp(u64);
+
+impl Stamp {
+    fn new() -> Stamp {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Stamp(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Default for Stamp {
+    fn default() -> Stamp {
+        Stamp::new()
+    }
+}
+
+impl Clone for Stamp {
+    fn clone(&self) -> Stamp {
+        Stamp::new()
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct IncTimer {
     /// Each vertex's level.
     pub levels: HashMap<String, i32>,
     slews: HashMap<String, [[f32; 2]; 2]>,
+    /// The vertices whose slew or in-edge delays were stored since the last [`IncTimer::export`],
+    /// in order, under `stamp`: what a graph that imported before takes ([`IncTimer::import`]).
+    written: Vec<String>,
+    stamp: Stamp,
     /// Each edge's delays by its [`EdgeKey`], held as to-vertex → the rest of the key, so an edge of
     /// a graph is found without making its key (a graph is imported whole after every edit).
     delays: HashMap<String, Vec<(EdgeTail, EdgeDelays)>>,
@@ -81,6 +109,9 @@ pub struct IncTimer {
     pub invalid_delays: BTreeSet<String>,
     pub delay_queue: BTreeSet<String>,
     pub relevelize_from: BTreeSet<String>,
+    /// Vertices made since (`makeVertex`: level 0) that `levels` may not hold yet: what the
+    /// relevelize that visits only the raised vertices adds at 0.
+    made: BTreeSet<String>,
     pub invalid_check_edges: BTreeSet<EdgeKey>,
     /// Latch D -> Q edges to re-time (`invalid_latch_edges_`): their D was visited.
     pub invalid_latch_edges: BTreeSet<EdgeKey>,
@@ -168,17 +199,47 @@ impl IncTimer {
         }
     }
 
-    /// The stored slews and delays into a freshly built graph; a vertex or edge the state has
-    /// never seen starts at 0.
+    /// The stored slews and delays into a graph; a vertex or edge the state has never seen
+    /// starts at 0. A graph that imported this state before (and edited in place since: what it
+    /// made new is 0, as here) takes only the vertices written after; one built, whole.
     pub fn import(&self, g: &mut Graph<'_>) {
-        for v in 0..g.vertices.len() {
-            g.slew[v] = self.slews.get(&g.vertices[v].name).copied().unwrap_or([[0.0; 2]; 2]);
-        }
-        for e in 0..g.edges.len() {
-            if let Some(d) = self.delay_of(g, e) {
-                if d.len() == g.delay[e].len() {
-                    g.delay[e] = d.clone();
+        match g.state_seq {
+            // one name, two vertices (a bidirect pin): the index holds one of them
+            Some((stamp, n)) if stamp == self.stamp.0 && n <= self.written.len() && g.index().len() == g.vertices.len() => {
+                let index = g.pin_index();
+                let mut seen = std::collections::HashSet::new();
+                for name in &self.written[n..] {
+                    if seen.insert(name.as_str()) {
+                        if let Some(&v) = index.get(name) {
+                            self.import_vertex(g, v);
+                        }
+                    }
                 }
+            }
+            _ => {
+                for v in 0..g.vertices.len() {
+                    g.slew[v] = self.slews.get(&g.vertices[v].name).copied().unwrap_or([[0.0; 2]; 2]);
+                }
+                for e in 0..g.edges.len() {
+                    self.import_delay(g, e);
+                }
+            }
+        }
+        g.state_seq = Some((self.stamp.0, self.written.len()));
+    }
+
+    /// Vertex `v`'s slew and its in-edges' delays.
+    fn import_vertex(&self, g: &mut Graph<'_>, v: usize) {
+        g.slew[v] = self.slews.get(&g.vertices[v].name).copied().unwrap_or([[0.0; 2]; 2]);
+        for i in 0..g.in_edges[v].len() {
+            self.import_delay(g, g.in_edges[v][i]);
+        }
+    }
+
+    fn import_delay(&self, g: &mut Graph<'_>, e: usize) {
+        if let Some(d) = self.delay_of(g, e) {
+            if d.len() == g.delay[e].len() {
+                g.delay[e] = d.clone();
             }
         }
     }
@@ -208,6 +269,8 @@ impl IncTimer {
     pub fn export(&mut self, g: &Graph<'_>) {
         self.slews = (0..g.vertices.len()).map(|v| (g.vertices[v].name.clone(), g.slew[v])).collect();
         self.delays.clear();
+        self.written.clear();
+        self.stamp = Stamp::new();
         for e in 0..g.edges.len() {
             self.store_delay(g, e);
         }
@@ -218,12 +281,14 @@ impl IncTimer {
     /// after a visit without exporting the whole graph.
     pub fn export_around(&mut self, g: &Graph<'_>, v: usize) {
         self.slews.insert(g.vertices[v].name.clone(), g.slew[v]);
+        self.written.push(g.vertices[v].name.clone());
         for &e in g.in_edges[v].iter().chain(g.out_edges[v].iter()) {
             self.store_delay(g, e);
         }
         for &e in &g.out_edges[v] {
             let to = g.edges[e].to;
             self.slews.insert(g.vertices[to].name.clone(), g.slew[to]);
+            self.written.push(g.vertices[to].name.clone());
         }
     }
 
@@ -242,6 +307,7 @@ impl IncTimer {
             let l = g.levels()?;
             self.levels = (0..g.vertices.len()).map(|v| (g.vertices[v].name.clone(), l[v] * LEVEL_SPACE)).collect();
             self.relevelize_from.clear();
+            self.made.clear();
             return Ok(());
         }
         // Nothing to relevelize from: every level stays (a new vertex reads 0 either way, as an
@@ -250,6 +316,77 @@ impl IncTimer {
             return Ok(());
         }
         let index = g.pin_index();
+        // One vertex per name: only the vertices the visits raise change, so only they are read
+        // and written. `VYGES_STA_CHECK_LEVELS=1`: against the whole pass, every call.
+        if index.len() == g.vertices.len() {
+            let full = std::env::var_os("VYGES_STA_CHECK_LEVELS").is_some().then(|| {
+                let mut t = self.clone();
+                t.relevelize_all(g, &index);
+                t
+            });
+            self.relevelize_raised(g, &index);
+            if let Some(t) = full {
+                if t.levels != self.levels || t.invalid_delays != self.invalid_delays || t.invalid_arrivals != self.invalid_arrivals || t.invalid_requireds != self.invalid_requireds {
+                    return Err("relevelize: the raised vertices' pass differs from the whole pass".to_string());
+                }
+            }
+            return Ok(());
+        }
+        self.relevelize_all(g, &index);
+        Ok(())
+    }
+
+    /// [`IncTimer::relevelize`] reading and writing only the vertices the visits raise; the map
+    /// otherwise holds every vertex already (the new ones added at 0, the deleted ones forgotten
+    /// by their events).
+    fn relevelize_raised(&mut self, g: &Graph<'_>, index: &HashMap<String, usize>) {
+        let levels = &self.levels;
+        let at = |raised: &HashMap<usize, i32>, u: usize| raised.get(&u).copied().unwrap_or_else(|| levels.get(&g.vertices[u].name).copied().unwrap_or(0));
+        let mut raised: HashMap<usize, i32> = HashMap::new();
+        for name in std::mem::take(&mut self.relevelize_from) {
+            let Some(&v) = index.get(&name) else { continue };
+            // As the whole pass: a vertex is pushed at the level it was raised to, and levels only
+            // rise, so it is never below its push.
+            let mut stack = vec![(v, at(&raised, v))];
+            while let Some((u, l)) = stack.pop() {
+                for &e in &g.out_edges[u] {
+                    if !Self::search_thru(g, e) {
+                        continue;
+                    }
+                    let to = g.edges[e].to;
+                    if at(&raised, to) <= l {
+                        raised.insert(to, l + 1);
+                        stack.push((to, l + 1));
+                    }
+                }
+            }
+        }
+        // Every raised vertex rose: `levelChangedBefore`.
+        for &v in raised.keys() {
+            let name = &g.vertices[v].name;
+            if self.delays_exist {
+                self.invalid_delays.insert(name.clone());
+            }
+            if self.arrivals_exist {
+                self.invalid_arrivals.insert(name.clone());
+            }
+            if self.requireds_exist {
+                self.invalid_requireds.insert(name.clone());
+            }
+        }
+        for (v, l) in raised {
+            self.levels.insert(g.vertices[v].name.clone(), l);
+        }
+        for name in std::mem::take(&mut self.made) {
+            if index.contains_key(&name) {
+                self.levels.entry(name).or_insert(0);
+            }
+        }
+    }
+
+    /// [`IncTimer::relevelize`] over every vertex.
+    fn relevelize_all(&mut self, g: &Graph<'_>, index: &HashMap<String, usize>) {
+        self.made.clear();
         // A new vertex starts at level 0 (`makeVertex`); a deleted one is forgotten.
         let mut level: Vec<i32> = (0..g.vertices.len()).map(|v| self.levels.get(&g.vertices[v].name).copied().unwrap_or(0)).collect();
         let start = level.clone();
@@ -303,7 +440,6 @@ impl IncTimer {
         if self.levels.len() != g.vertices.len() {
             self.levels.retain(|k, _| index.contains_key(k.as_str()));
         }
-        Ok(())
     }
 
     /// `GraphDelayCalc::findDelays(to_level)` (all levels with `None`), after `relevelize`.
@@ -964,10 +1100,11 @@ impl IncTimer {
     /// Forget a deleted vertex (`deleteVertexBefore`).
     fn delete_vertex(&mut self, v: &str) {
         self.slews.remove(v);
+        self.written.push(v.to_string());
         self.paths.remove(v);
         self.path_gen.remove(v);
         self.levels.remove(v);
-        for q in [&mut self.invalid_delays, &mut self.delay_queue, &mut self.invalid_arrivals, &mut self.arrival_queue, &mut self.invalid_requireds, &mut self.required_queue, &mut self.relevelize_from] {
+        for q in [&mut self.invalid_delays, &mut self.delay_queue, &mut self.invalid_arrivals, &mut self.arrival_queue, &mut self.invalid_requireds, &mut self.required_queue, &mut self.relevelize_from, &mut self.made] {
             q.remove(v);
         }
     }
@@ -990,7 +1127,9 @@ impl IncTimer {
                         if self.tracing() {
                             eprintln!("VYGGV|{inst}/{}", p.name);
                         }
-                        self.delete_vertex(&format!("{inst}/{}", p.name));
+                        let v = format!("{inst}/{}", p.name);
+                        self.delete_vertex(&v);
+                        self.made.insert(v);
                     }
                 }
                 for (from, to, key) in self.inst_edges(cx, inst, master) {
@@ -1013,7 +1152,15 @@ impl IncTimer {
                     self.disconnect_pin_before(cx, p, pins);
                 }
             }
-            ["net_create", ..] | ["net_merge", ..] | ["bterm_create", ..] | ["bterm_destroy", ..] => {}
+            // A port's vertex: made at level 0, or forgotten with its level.
+            ["bterm_create", port, ..] => {
+                self.made.insert(port.to_string());
+            }
+            ["bterm_destroy", port, ..] => {
+                self.levels.remove(*port);
+                self.made.remove(*port);
+            }
+            ["net_create", ..] | ["net_merge", ..] => {}
             _ => return Err(format!("edit event not modelled: {ev}")),
         }
         Ok(())
@@ -1194,6 +1341,75 @@ mod tests {
 
     fn libs() -> Vec<Library> {
         vec![Library::read(&parse(LIB).unwrap()).unwrap()]
+    }
+
+    // The reference has ONE graph, so a value written is a value read; ours holds several graph
+    // sets beside the timer. A graph that imported the state takes, at its next import, every
+    // vertex written since — slew and in-edge delays — and only those; a copy of the timer is
+    // another state, imported whole.
+    #[test]
+    fn a_graph_that_imported_takes_what_was_written_since() {
+        let libs = libs();
+        let mut inc = IncTimer::default();
+        let nl0 = chain("buf");
+        let mut g = Graph::build(&libs, &nl0).unwrap();
+        inc.find_delays(&mut g, &HashMap::new(), None).unwrap();
+        inc.export(&g);
+        let nl = chain("big");
+        let (mut a, mut b) = (Graph::build(&libs, &nl).unwrap(), Graph::build(&libs, &nl).unwrap());
+        inc.import(&mut a);
+        inc.import(&mut b);
+        inc.invalid_delays.insert("b1/X".into());
+        // to the driver's level: the load's new slew is written by its driver, the load queued
+        let level = inc.levels["b1/X"];
+        inc.find_delays(&mut a, &HashMap::new(), Some(level)).unwrap();
+        assert_eq!(inc.visited, ["b1/X"]);
+        let port = b.index()["in"];
+        b.slew[port] = [[7.0; 2]; 2];
+        inc.import(&mut b);
+        let load = a.index()["b2/A"];
+        assert_ne!(a.slew[load], [[0.0; 2]; 2]);
+        for v in (0..a.vertices.len()).filter(|&v| v != port) {
+            assert_eq!(a.slew[v], b.slew[v], "{}", a.vertices[v].name);
+        }
+        assert_eq!(a.delay, b.delay);
+        assert_eq!(b.slew[port], [[7.0; 2]; 2], "not written since: left as it was");
+        inc.clone().import(&mut b);
+        assert_eq!(b.slew[port], a.slew[port], "a copy: imported whole");
+    }
+
+    // Rule (relevelize): from each vertex an edit relevelized from, a fanout not above the level
+    // is raised to level + 1 and invalid (`levelChangedBefore`); a made vertex starts at 0. Only
+    // the raised vertices change, so visiting only them gives what the whole pass gives.
+    #[test]
+    fn relevelizing_only_the_raised_vertices_is_the_whole_pass() {
+        let libs = libs();
+        let mut inc = IncTimer::default();
+        let nl0 = chain("buf");
+        let g0 = Graph::build(&libs, &nl0).unwrap();
+        inc.relevelize(&g0).unwrap();
+        // b4 inserted between b1 and b2: n1 → b4 → n4 → b2.
+        let mut nl = chain("buf");
+        nl.insts.push(("b4".into(), "buf".into()));
+        // b5 made and left unconnected: no visit reaches it, it is added at 0 all the same
+        nl.insts.push(("b5".into(), "buf".into()));
+        nl.nets[1].pins = vec![Conn::Inst(0, "X".into()), Conn::Inst(3, "A".into())];
+        nl.nets.push(Net { name: "n4".into(), pins: vec![Conn::Inst(3, "X".into()), Conn::Inst(1, "A".into())] });
+        let g = Graph::build(&libs, &nl).unwrap();
+        inc.delays_exist = true;
+        inc.arrivals_exist = true;
+        inc.made = ["b4/A", "b4/X", "b5/A", "b5/X", "gone/A"].map(String::from).into();
+        inc.relevelize_from = ["b1/X".to_string()].into();
+        let mut all = inc.clone();
+        all.relevelize_all(&g, &g.pin_index());
+        inc.relevelize_raised(&g, &g.pin_index());
+        assert_eq!(inc.levels, all.levels);
+        assert_eq!(inc.invalid_delays, all.invalid_delays);
+        assert_eq!(inc.invalid_arrivals, all.invalid_arrivals);
+        assert_eq!(inc.levels.len(), g.vertices.len(), "the made vertices in, a made name not in the graph left out");
+        assert_eq!(inc.levels["b5/X"], 0);
+        // the full levels are spaced, so the raise stops at b4: b2 is already above it
+        assert_eq!(inc.invalid_delays, ["b4/A", "b4/X"].map(String::from).into());
     }
 
     // Rule (findVertexDelay): a recomputed driver whose loads' slews are unchanged enqueues
