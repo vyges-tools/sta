@@ -139,6 +139,10 @@ pub struct Graph<'a> {
     /// is built, and [`Graph::load_cap`] and its kin are called per driver by a repair loop.
     /// Shared, so a caller holding it ([`Graph::pin_index`]) does not copy every name.
     index_cache: std::sync::OnceLock<std::sync::Arc<HashMap<String, usize>>>,
+    /// Each net's slot in [`Graph::netlist`] by name, kept across in-place edits (an edit replaces
+    /// nets in their slots or appends them): [`Graph::apply_edits`] finds the nets its edits named
+    /// without a pass over every net. Checked by name at each slot read; made again on a miss.
+    net_slots: Option<HashMap<String, usize>>,
     /// The caller's: how far into its log of netlist edits this graph is ([`Graph::apply_edits`]
     /// brings it on). `None` from a build — not known, so a caller builds again.
     pub edit_seq: Option<usize>,
@@ -326,12 +330,12 @@ impl<'a> Graph<'a> {
             return None;
         }
         names.clear();
-        if !netlist.insts.iter().all(|(n, _)| names.insert(n.as_str())) {
+        if !netlist.insts.iter().all(|i| names.insert(i.0.as_str())) {
             return None;
         }
         let mut templates: HashMap<&str, Option<Template<'a>>> = HashMap::new();
         let mut inst_tpl: Vec<Option<&str>> = Vec::with_capacity(netlist.insts.len());
-        for (_, cname) in &netlist.insts {
+        for (_, cname) in netlist.insts.iter().map(|i| &**i) {
             if !templates.contains_key(cname.as_str()) {
                 let t = match libs.iter().position(|l| l.cells.contains_key(cname)) {
                     // A physical-only cell (tap, fill, decap) has no liberty cell and nothing to time.
@@ -413,7 +417,7 @@ impl<'a> Graph<'a> {
         let mut by_inst: Option<HashMap<String, usize>> = None;
         let mut vertices = Vec::with_capacity(old.len().max(netlist.ports.len() + 4 * netlist.insts.len()));
         let mut base = vec![0usize; netlist.insts.len()];
-        for (i, (name, cname)) in netlist.insts.iter().enumerate() {
+        for (i, (name, cname)) in netlist.insts.iter().map(|i| &**i).enumerate() {
             let Some(t) = tpl(i) else { continue };
             base[i] = vertices.len();
             // The spare's block for this instance: next in order, else (an instance removed or
@@ -549,7 +553,7 @@ impl<'a> Graph<'a> {
                 let _ = index_cache.set(std::sync::Arc::new(map));
             }
         }
-        Some(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), stale_out_arcs: HashMap::new(), index_cache, edit_seq: None, state_seq: None })
+        Some(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), stale_out_arcs: HashMap::new(), index_cache, net_slots: None, edit_seq: None, state_seq: None })
     }
 
     /// [`Graph::build_with_pins`] with each pin found by its name.
@@ -562,7 +566,7 @@ impl<'a> Graph<'a> {
         let mut inst_vertices: Vec<HashMap<String, usize>> = vec![HashMap::new(); netlist.insts.len()];
         let mut inst_from: Vec<HashMap<String, usize>> = vec![HashMap::new(); netlist.insts.len()];
         let mut bidirect: Vec<String> = Vec::new();
-        for (i, (name, cname)) in netlist.insts.iter().enumerate() {
+        for (i, (name, cname)) in netlist.insts.iter().map(|i| &**i).enumerate() {
             // A physical-only cell (tap, fill, decap) has no liberty cell and nothing to time.
             let Some(lib) = find_cell(cname) else { continue };
             let has = pins.and_then(|m| m.get(cname));
@@ -607,7 +611,7 @@ impl<'a> Graph<'a> {
             vertices.push(Vertex { name: name.clone(), conn: Conn::Port(i), is_driver: *dir == PortDir::Input, lib: None, cell: None, port: None });
         }
         let mut edges = Vec::new();
-        for (i, (_, cname)) in netlist.insts.iter().enumerate() {
+        for (i, (_, cname)) in netlist.insts.iter().map(|i| &**i).enumerate() {
             let Some(lib) = find_cell(cname) else { continue };
             for (k, set) in cell(libs, lib, cname).arc_sets.iter().enumerate() {
                 let tristate = matches!(set.role, Role::TristateEnable | Role::TristateDisable);
@@ -652,7 +656,7 @@ impl<'a> Graph<'a> {
                 EdgeKind::Wire => vec![[0.0f32; 2]; 2],
             })
             .collect();
-        Ok(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), stale_out_arcs: HashMap::new(), index_cache: std::sync::OnceLock::new(), edit_seq: None, state_seq: None })
+        Ok(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), stale_out_arcs: HashMap::new(), index_cache: std::sync::OnceLock::new(), net_slots: None, edit_seq: None, state_seq: None })
     }
 
     pub fn is_check(&self, e: usize) -> bool {
@@ -1254,14 +1258,14 @@ mod tests {
     fn chain() -> Netlist {
         let pin = |i: usize, p: &str| Conn::Inst(i, p.into());
         Netlist {
-            insts: vec![("u1".into(), "and2".into()), ("u2".into(), "and2".into())],
+            insts: vec![crate::netlist::inst("u1", "and2"), crate::netlist::inst("u2", "and2")],
             ports: vec![("a".into(), PortDir::Input), ("b".into(), PortDir::Input), ("c".into(), PortDir::Input), ("y".into(), PortDir::Output)],
             nets: vec![
-                Net { name: "a".into(), pins: vec![pin(0, "A"), Conn::Port(0)] },
-                Net { name: "b".into(), pins: vec![pin(0, "B"), Conn::Port(1)] },
-                Net { name: "n1".into(), pins: vec![pin(0, "Y"), pin(1, "A")] },
-                Net { name: "c".into(), pins: vec![pin(1, "B"), Conn::Port(2)] },
-                Net { name: "y".into(), pins: vec![pin(1, "Y"), Conn::Port(3)] },
+                Net { name: "a".into(), pins: vec![pin(0, "A"), Conn::Port(0)] }.into(),
+                Net { name: "b".into(), pins: vec![pin(0, "B"), Conn::Port(1)] }.into(),
+                Net { name: "n1".into(), pins: vec![pin(0, "Y"), pin(1, "A")] }.into(),
+                Net { name: "c".into(), pins: vec![pin(1, "B"), Conn::Port(2)] }.into(),
+                Net { name: "y".into(), pins: vec![pin(1, "Y"), Conn::Port(3)] }.into(),
             ],
         }
     }
@@ -1411,9 +1415,9 @@ mod tests {
             pin (NDOUT) { direction : output; function : "PAD"; } } }"#;
         let libs = [Library::read(&crate::liberty_parse::parse(lib).unwrap()).unwrap()];
         let nl = Netlist {
-            insts: vec![("p1".into(), "PADC".into())],
+            insts: vec![crate::netlist::inst("p1", "PADC")],
             ports: vec![("a".into(), PortDir::Input)],
-            nets: vec![Net { name: "a".into(), pins: vec![Conn::Port(0), Conn::Inst(0, "DATA".into())] }],
+            nets: vec![Net { name: "a".into(), pins: vec![Conn::Port(0), Conn::Inst(0, "DATA".into())] }.into()],
         };
         let pins: HashMap<String, Vec<String>> = [("PADC".to_string(), vec!["DATA".into(), "EN".into(), "PAD".into(), "Y".into()])].into();
         let g = Graph::build_with_pins(&libs, &nl, Some(&pins)).unwrap();
@@ -1428,7 +1432,7 @@ mod tests {
         assert!(g.out_edges[load].iter().any(|&e| g.edges[e].to == v("p1/Y")));
         // A bidirect pin on a net is refused.
         let mut nl2 = nl.clone();
-        nl2.nets.push(Net { name: "b".into(), pins: vec![Conn::Inst(0, "PAD".into())] });
+        nl2.nets.push(Net { name: "b".into(), pins: vec![Conn::Inst(0, "PAD".into())] }.into());
         assert!(Graph::build_with_pins(&libs, &nl2, Some(&pins)).is_err());
     }
 
@@ -1479,12 +1483,12 @@ mod tests {
         let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
         let a = |p: &str| Conn::Inst(0, p.into());
         let netlist = Netlist {
-            insts: vec![("u1".into(), "and2".into())],
+            insts: vec![crate::netlist::inst("u1", "and2")],
             ports: vec![("a".into(), PortDir::Input), ("b".into(), PortDir::Input), ("y".into(), PortDir::Output)],
             nets: vec![
-                Net { name: "a".into(), pins: vec![a("A"), Conn::Port(0)] },
-                Net { name: "b".into(), pins: vec![a("B"), Conn::Port(1)] },
-                Net { name: "y".into(), pins: vec![a("Y"), Conn::Port(2)] },
+                Net { name: "a".into(), pins: vec![a("A"), Conn::Port(0)] }.into(),
+                Net { name: "b".into(), pins: vec![a("B"), Conn::Port(1)] }.into(),
+                Net { name: "y".into(), pins: vec![a("Y"), Conn::Port(2)] }.into(),
             ],
         };
         let mut g = Graph::build(&libs, &netlist).unwrap();
@@ -1509,9 +1513,9 @@ mod tests {
     fn the_template_build_is_the_by_name_build() {
         let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
         let mut nl = chain();
-        nl.insts.insert(1, ("tap0".into(), "tapcell".into()));
+        nl.insts.insert(1, crate::netlist::inst("tap0", "tapcell"));
         for n in &mut nl.nets {
-            for c in &mut n.pins {
+            for c in &mut std::sync::Arc::make_mut(n).pins {
                 if let Conn::Inst(i, _) = c {
                     if *i >= 1 {
                         *i += 1;
@@ -1519,7 +1523,7 @@ mod tests {
                 }
             }
         }
-        nl.nets.push(Net { name: "x".into(), pins: vec![Conn::Inst(1, "VPWR".into()), Conn::Inst(0, "Q".into()), Conn::Inst(2, "Y".into())] });
+        nl.nets.push(Net { name: "x".into(), pins: vec![Conn::Inst(1, "VPWR".into()), Conn::Inst(0, "Q".into()), Conn::Inst(2, "Y".into())] }.into());
         nl.nets.swap(0, 3);
         let filter: HashMap<String, Vec<String>> = [("and2".to_string(), vec!["A".to_string(), "Y".to_string()])].into();
         for pins in [None, Some(&filter)] {
@@ -1528,7 +1532,7 @@ mod tests {
             assert_eq!(shape(&fast), shape(&slow));
         }
         let mut dup = chain();
-        dup.insts[1].0 = "u1".into();
+        std::sync::Arc::make_mut(&mut dup.insts[1]).0 = "u1".into();
         assert!(Graph::build_by_cell(&libs, &dup, NetlistRef::Borrowed(&dup), None).is_none());
         let mut slash = chain();
         slash.ports[0].0 = "u1/A".into();
@@ -1569,19 +1573,19 @@ mod tests {
         // a buffer appended between u1 and u2
         let nl1 = chain();
         let mut nl2 = chain();
-        nl2.insts.push(("b1".into(), "buf".into()));
-        nl2.nets[2] = Net { name: "n1".into(), pins: vec![pin(0, "Y"), pin(2, "A")] };
-        nl2.nets.push(Net { name: "n2".into(), pins: vec![pin(2, "Y"), pin(1, "A")] });
+        nl2.insts.push(crate::netlist::inst("b1", "buf"));
+        nl2.nets[2] = Net { name: "n1".into(), pins: vec![pin(0, "Y"), pin(2, "A")] }.into();
+        nl2.nets.push(Net { name: "n2".into(), pins: vec![pin(2, "Y"), pin(1, "A")] }.into());
         check(&nl2, Graph::build(&libs, &nl1).unwrap());
         // u1 removed (every later instance moves up) and u2's cell changed
         let nl3 = Netlist {
-            insts: vec![("u2".into(), "and2x".into()), ("b1".into(), "buf".into())],
+            insts: vec![crate::netlist::inst("u2", "and2x"), crate::netlist::inst("b1", "buf")],
             ports: nl2.ports.clone(),
             nets: vec![
-                Net { name: "n2".into(), pins: vec![pin(1, "Y"), pin(0, "A")] },
-                Net { name: "c".into(), pins: vec![pin(0, "B"), Conn::Port(2)] },
-                Net { name: "y".into(), pins: vec![pin(0, "Y"), Conn::Port(3)] },
-                Net { name: "a".into(), pins: vec![pin(1, "A"), Conn::Port(0)] },
+                Net { name: "n2".into(), pins: vec![pin(1, "Y"), pin(0, "A")] }.into(),
+                Net { name: "c".into(), pins: vec![pin(0, "B"), Conn::Port(2)] }.into(),
+                Net { name: "y".into(), pins: vec![pin(0, "Y"), Conn::Port(3)] }.into(),
+                Net { name: "a".into(), pins: vec![pin(1, "A"), Conn::Port(0)] }.into(),
             ],
         };
         check(&nl3, Graph::build(&libs, &nl2).unwrap());

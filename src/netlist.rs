@@ -26,10 +26,18 @@ pub struct Net {
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Netlist {
-    /// `(name, cell)`.
-    pub insts: Vec<(String, String)>,
+    /// `(name, cell)`, shared between netlist generations like the nets: an edit appends
+    /// instances or replaces one, so the copy a generation makes is one pointer per instance.
+    pub insts: Vec<std::sync::Arc<(String, String)>>,
     pub ports: Vec<(String, PortDir)>,
-    pub nets: Vec<Net>,
+    /// Shared between netlist generations: an edit replaces the nets it touched, so the copy a
+    /// generation makes is one pointer per net, not every pin.
+    pub nets: Vec<std::sync::Arc<Net>>,
+}
+
+/// One [`Netlist::insts`] entry: an instance `name` of library cell `cell`.
+pub fn inst(name: impl Into<String>, cell: impl Into<String>) -> std::sync::Arc<(String, String)> {
+    std::sync::Arc::new((name.into(), cell.into()))
 }
 
 impl Netlist {

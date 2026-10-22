@@ -999,7 +999,7 @@ pub fn find_requireds_scenes(incs: &mut [IncTimer], searches: &mut [Search<'_, '
 impl IncTimer {
     /// The instances' cells and the ports' directions as the netlist has them now.
     pub fn track_netlist(&mut self, nl: &crate::netlist::Netlist) {
-        self.cells = nl.insts.iter().cloned().collect();
+        self.cells = nl.insts.iter().map(|i| (**i).clone()).collect();
         self.port_input = nl.ports.iter().map(|(n, d)| (n.clone(), *d == crate::netlist::PortDir::Input)).collect();
     }
 
@@ -1328,13 +1328,13 @@ mod tests {
     fn chain(mid: &str) -> Netlist {
         let inst = |i: usize, p: &str| Conn::Inst(i, p.to_string());
         Netlist {
-            insts: vec![("b1".into(), "buf".into()), ("b2".into(), mid.into()), ("b3".into(), "buf".into())],
+            insts: vec![crate::netlist::inst("b1", "buf"), crate::netlist::inst("b2", mid), crate::netlist::inst("b3", "buf")],
             ports: vec![("in".into(), PortDir::Input), ("out".into(), PortDir::Output)],
             nets: vec![
-                Net { name: "n0".into(), pins: vec![inst(0, "A"), Conn::Port(0)] },
-                Net { name: "n1".into(), pins: vec![inst(0, "X"), inst(1, "A")] },
-                Net { name: "n2".into(), pins: vec![inst(1, "X"), inst(2, "A")] },
-                Net { name: "n3".into(), pins: vec![inst(2, "X"), Conn::Port(1)] },
+                Net { name: "n0".into(), pins: vec![inst(0, "A"), Conn::Port(0)] }.into(),
+                Net { name: "n1".into(), pins: vec![inst(0, "X"), inst(1, "A")] }.into(),
+                Net { name: "n2".into(), pins: vec![inst(1, "X"), inst(2, "A")] }.into(),
+                Net { name: "n3".into(), pins: vec![inst(2, "X"), Conn::Port(1)] }.into(),
             ],
         }
     }
@@ -1390,11 +1390,11 @@ mod tests {
         inc.relevelize(&g0).unwrap();
         // b4 inserted between b1 and b2: n1 → b4 → n4 → b2.
         let mut nl = chain("buf");
-        nl.insts.push(("b4".into(), "buf".into()));
+        nl.insts.push(crate::netlist::inst("b4", "buf"));
         // b5 made and left unconnected: no visit reaches it, it is added at 0 all the same
-        nl.insts.push(("b5".into(), "buf".into()));
-        nl.nets[1].pins = vec![Conn::Inst(0, "X".into()), Conn::Inst(3, "A".into())];
-        nl.nets.push(Net { name: "n4".into(), pins: vec![Conn::Inst(3, "X".into()), Conn::Inst(1, "A".into())] });
+        nl.insts.push(crate::netlist::inst("b5", "buf"));
+        std::sync::Arc::make_mut(&mut nl.nets[1]).pins = vec![Conn::Inst(0, "X".into()), Conn::Inst(3, "A".into())];
+        nl.nets.push(Net { name: "n4".into(), pins: vec![Conn::Inst(3, "X".into()), Conn::Inst(1, "A".into())] }.into());
         let g = Graph::build(&libs, &nl).unwrap();
         inc.delays_exist = true;
         inc.arrivals_exist = true;

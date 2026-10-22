@@ -292,9 +292,9 @@ mod tests {
     fn enumerate(endpoint_path_count: usize) -> Vec<(Vec<String>, usize, f32)> {
         let libs = vec![Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
         let i = |p: &str| Conn::Inst(0, p.into());
-        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins };
+        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins }.into();
         let netlist = Netlist {
-            insts: vec![("u1".into(), "and2".into())],
+            insts: vec![crate::netlist::inst("u1", "and2")],
             ports: vec![("clk".into(), PortDir::Input), ("a".into(), PortDir::Input), ("b".into(), PortDir::Input), ("y".into(), PortDir::Output)],
             nets: vec![net("clk", vec![Conn::Port(0)]), net("a", vec![i("A"), Conn::Port(1)]), net("b", vec![i("B"), Conn::Port(2)]), net("y", vec![i("Y"), Conn::Port(3)])],
         };

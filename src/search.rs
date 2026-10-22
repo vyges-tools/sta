@@ -1614,9 +1614,9 @@ mod tests {
     fn design() -> (Vec<Library>, Netlist, Sdc) {
         let libs = vec![Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
         let i = |k: usize, p: &str| Conn::Inst(k, p.into());
-        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins };
+        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins }.into();
         let netlist = Netlist {
-            insts: vec![("b1".into(), "buf".into()), ("f1".into(), "dff".into()), ("f2".into(), "dff".into())],
+            insts: vec![crate::netlist::inst("b1", "buf"), crate::netlist::inst("f1", "dff"), crate::netlist::inst("f2", "dff")],
             ports: vec![("clk".into(), PortDir::Input), ("in".into(), PortDir::Input), ("out".into(), PortDir::Output)],
             nets: vec![
                 net("clk", vec![i(0, "A"), Conn::Port(0)]),
@@ -1691,9 +1691,9 @@ mod tests {
     fn a_recovery_check_ends_a_path_and_counts_by_its_own_end() {
         let libs = vec![Library::read(&crate::liberty_parse::parse(LIB_RST).unwrap()).unwrap()];
         let i = |k: usize, p: &str| Conn::Inst(k, p.into());
-        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins };
+        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins }.into();
         let netlist = Netlist {
-            insts: vec![("b1".into(), "buf".into()), ("f1".into(), "dffr".into())],
+            insts: vec![crate::netlist::inst("b1", "buf"), crate::netlist::inst("f1", "dffr")],
             ports: vec![("clk".into(), PortDir::Input), ("rst".into(), PortDir::Input), ("out".into(), PortDir::Output)],
             nets: vec![
                 net("clk", vec![i(0, "A"), Conn::Port(0)]),
@@ -1728,9 +1728,9 @@ mod tests {
     fn a_clear_arc_is_not_searched_by_default() {
         let libs = vec![Library::read(&crate::liberty_parse::parse(LIB_RST).unwrap()).unwrap()];
         let i = |k: usize, p: &str| Conn::Inst(k, p.into());
-        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins };
+        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins }.into();
         let netlist = Netlist {
-            insts: vec![("b1".into(), "buf".into()), ("f1".into(), "dffr".into())],
+            insts: vec![crate::netlist::inst("b1", "buf"), crate::netlist::inst("f1", "dffr")],
             ports: vec![("clk".into(), PortDir::Input), ("rst".into(), PortDir::Input), ("out".into(), PortDir::Output)],
             nets: vec![
                 net("clk", vec![i(0, "A"), Conn::Port(0)]),
@@ -1769,9 +1769,9 @@ mod tests {
         assert_ne!(lib, LIB_RST);
         let libs = vec![Library::read(&crate::liberty_parse::parse(&lib).unwrap()).unwrap()];
         let i = |k: usize, p: &str| Conn::Inst(k, p.into());
-        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins };
+        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins }.into();
         let netlist = Netlist {
-            insts: vec![("b1".into(), "buf".into()), ("f1".into(), "dffr".into())],
+            insts: vec![crate::netlist::inst("b1", "buf"), crate::netlist::inst("f1", "dffr")],
             ports: vec![("clk".into(), PortDir::Input), ("rst".into(), PortDir::Input), ("out".into(), PortDir::Output)],
             nets: vec![
                 net("clk", vec![i(0, "A"), Conn::Port(0)]),
@@ -2140,9 +2140,9 @@ mod tests {
     fn internal_pins_timed<R>(f: impl FnOnce(&Search, &dyn Fn(&str) -> usize) -> R) -> R {
         let libs = vec![Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
         let i = |k: usize, p: &str| Conn::Inst(k, p.into());
-        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins };
+        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins }.into();
         let netlist = Netlist {
-            insts: vec![("b1".into(), "buf".into()), ("b2".into(), "buf".into())],
+            insts: vec![crate::netlist::inst("b1", "buf"), crate::netlist::inst("b2", "buf")],
             ports: vec![("in".into(), PortDir::Input), ("out".into(), PortDir::Output)],
             nets: vec![net("in", vec![i(0, "A"), Conn::Port(0)]), net("m", vec![i(0, "X"), i(1, "A")]), net("out", vec![i(1, "X"), Conn::Port(1)])],
         };
