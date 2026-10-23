@@ -152,7 +152,7 @@ pub struct Graph<'a> {
 }
 
 /// [`Graph::parasitic_load`]: `(pin_cap, wire_cap, the pi model and its node names)`.
-type ParasiticLoad = (f32, f32, Option<(crate::parasitics::PiElmore, Vec<String>)>);
+type ParasiticLoad<'p> = (f32, f32, Option<(crate::parasitics::PiElmore, &'p [String])>);
 
 /// The SDC loads and drives delay calculation reads (`Sdc::connectedCap`, `seedDrvrSlew`).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -870,7 +870,7 @@ impl<'a> Graph<'a> {
     /// (`drvrPinHasWireCap`: set_load net has precedence over parasitics; the gate is lumped at
     /// the SDC's load). Otherwise a pi model at least the pin cap adds `pi − pin`; a smaller one is
     /// dropped. `(pin_cap, wire_cap, the pi model)`.
-    fn parasitic_load(&self, drvr: usize, rf: usize, mm: usize, parasitics: &HashMap<String, NetParasitics>, index: &HashMap<String, usize>) -> ParasiticLoad {
+    fn parasitic_load<'p>(&self, drvr: usize, rf: usize, mm: usize, parasitics: &'p HashMap<String, NetParasitics>, index: &HashMap<String, usize>) -> ParasiticLoad<'p> {
         let (pin_cap, mut wire_cap, has_net_load) = self.connected_cap(drvr, rf, mm, index);
         let mut parasitic = if self.sdc.net_wire_cap.contains_key(&self.vertices[drvr].name) { None } else { self.reduced(drvr, rf, mm, parasitics, index) };
         if !has_net_load {
@@ -901,7 +901,7 @@ impl<'a> Graph<'a> {
 
     /// The pi-Elmore model of a driver's net, for a transition and min/max — the one delay
     /// calculation and [`Graph::load_cap`] both read.
-    fn reduced(&self, drvr: usize, rf: usize, mm: usize, parasitics: &HashMap<String, NetParasitics>, index: &HashMap<String, usize>) -> Option<(crate::parasitics::PiElmore, Vec<String>)> {
+    fn reduced<'p>(&self, drvr: usize, rf: usize, mm: usize, parasitics: &'p HashMap<String, NetParasitics>, index: &HashMap<String, usize>) -> Option<(crate::parasitics::PiElmore, &'p [String])> {
         let n = self.vertex_net[drvr]?;
         let np = parasitics.get(&self.netlist.nets[n].name)?;
         let d = np.node_names.iter().position(|x| x == &self.vertices[drvr].name)?;
@@ -910,7 +910,7 @@ impl<'a> Graph<'a> {
             if np.pi_rise_only && rf == FALL {
                 return None;
             }
-            return Some((p.clone(), names.clone()));
+            return Some((p.clone(), names));
         }
         let cap = |i: usize| {
             index.get(&names[i]).map_or(0.0, |&v| match (&np.port_pin_caps, &self.vertices[v].conn) {
@@ -919,7 +919,7 @@ impl<'a> Graph<'a> {
             })
         };
         let load = |i: usize| index.get(&names[i]).is_some_and(|&v| !self.vertices[v].is_driver);
-        Some((reduce_to_pi_elmore(&np.network, d, &NodePins { pin_cap: &cap, is_load: &load }), names.clone()))
+        Some((reduce_to_pi_elmore(&np.network, d, &NodePins { pin_cap: &cap, is_load: &load }), names))
     }
 
     /// `ArcDelayCalc::findParasitic(drvr_pin, rf, scene, min_max)`: the driver net's reduced pi model
