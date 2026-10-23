@@ -753,9 +753,35 @@ impl<'a> Graph<'a> {
             }
         }
         if order.len() != n {
-            return Err("the timing graph has a loop — not modelled".into());
+            return Err(format!("the timing graph has a loop — not modelled: {}", self.loop_names(&indeg).join(" -> ")));
         }
         Ok(order)
+    }
+
+    /// One loop among the vertices `topo_order` could not order (`indeg` > 0), for the refusal:
+    /// walk back along a propagating in-edge from another unordered vertex until a vertex
+    /// repeats; each is named with its cell.
+    fn loop_names(&self, indeg: &[usize]) -> Vec<String> {
+        let mut in_edges = vec![Vec::new(); self.vertices.len()];
+        for (e, ed) in self.edges.iter().enumerate() {
+            if !self.is_check(e) && indeg[ed.from] > 0 && indeg[ed.to] > 0 {
+                in_edges[ed.to].push(ed.from);
+            }
+        }
+        let Some(mut v) = (0..indeg.len()).find(|&v| !in_edges[v].is_empty()) else { return Vec::new() };
+        let mut seen = vec![usize::MAX; indeg.len()];
+        let mut path = Vec::new();
+        while seen[v] == usize::MAX {
+            seen[v] = path.len();
+            path.push(v);
+            v = in_edges[v][0];
+        }
+        let mut cycle: Vec<usize> = path[seen[v]..].to_vec();
+        cycle.reverse();
+        cycle.iter().map(|&v| {
+            let x = &self.vertices[v];
+            match &x.cell { Some(c) => format!("{} ({c})", x.name), None => x.name.clone() }
+        }).collect()
     }
 
     fn lib_thresholds(&self, lib: usize, rf: usize) -> LibThresholds {
@@ -1282,6 +1308,28 @@ mod tests {
         let lv = g.levels().unwrap();
         let at = |n: &str| lv[g.vertices.iter().position(|v| v.name == n).unwrap()];
         assert_eq!([at("a"), at("u1/A"), at("u1/Y"), at("u2/A"), at("u2/B"), at("u2/Y"), at("y")], [0, 1, 2, 3, 1, 4, 5]);
+    }
+
+    /// A combinational loop (u1/Y back into u1/A) is refused, and the refusal names the loop's
+    /// pins in edge order with their cells.
+    #[test]
+    fn a_loop_is_refused_naming_its_pins() {
+        let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
+        let pin = |i: usize, p: &str| Conn::Inst(i, p.into());
+        let nl = Netlist {
+            insts: vec![crate::netlist::inst("u1", "and2")],
+            ports: vec![("b".into(), PortDir::Input), ("y".into(), PortDir::Output)],
+            nets: vec![
+                Net { name: "b".into(), pins: vec![pin(0, "B"), Conn::Port(0)] }.into(),
+                Net { name: "y".into(), pins: vec![pin(0, "Y"), pin(0, "A"), Conn::Port(1)] }.into(),
+            ],
+        };
+        let g = Graph::build(&libs, &nl).unwrap();
+        let err = g.topo_order().unwrap_err();
+        assert!(err.starts_with("the timing graph has a loop — not modelled: "), "{err}");
+        let cycle: Vec<&str> = err.rsplit(": ").next().unwrap().split(" -> ").collect();
+        assert_eq!(cycle.len(), 2, "{err}");
+        assert!(cycle.contains(&"u1/A (and2)") && cycle.contains(&"u1/Y (and2)"), "{err}");
     }
 
     /// Rule (an annotated load slew): a load whose max slew exceeds its limit on either
