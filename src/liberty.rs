@@ -14,13 +14,14 @@ use crate::liberty_parse::{Group, Value};
 use crate::table::{Axis, AxisVar, GateModel, Table};
 
 /// A pin's direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Direction {
     Input,
     Output,
     Tristate,
     Bidirect,
     Internal,
+    #[default]
     Unknown,
 }
 
@@ -47,13 +48,49 @@ impl Direction {
     }
 }
 
+/// A test cell port's `signal_type` (`test_scan_*`): what the port is to scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanSignalType {
+    #[default]
+    None,
+    Enable,
+    EnableInverted,
+    Clock,
+    ClockA,
+    ClockB,
+    Input,
+    InputInverted,
+    Output,
+    OutputInverted,
+}
+
+impl ScanSignalType {
+    /// The `signal_type` words, exactly; any other word (or none) sets nothing.
+    fn parse(word: &str) -> Option<ScanSignalType> {
+        Some(match word {
+            "test_scan_enable" => ScanSignalType::Enable,
+            "test_scan_enable_inverted" => ScanSignalType::EnableInverted,
+            "test_scan_clock" => ScanSignalType::Clock,
+            "test_scan_clock_a" => ScanSignalType::ClockA,
+            "test_scan_clock_b" => ScanSignalType::ClockB,
+            "test_scan_in" => ScanSignalType::Input,
+            "test_scan_in_inverted" => ScanSignalType::InputInverted,
+            "test_scan_out" => ScanSignalType::Output,
+            "test_scan_out_inverted" => ScanSignalType::OutputInverted,
+            _ => return None,
+        })
+    }
+}
+
 /// Transition index: rise 0, fall 1. Min/max index: min 0, max 1.
 pub const RISE: usize = 0;
 pub const FALL: usize = 1;
 pub const MIN: usize = 0;
 pub const MAX: usize = 1;
 
-#[derive(Debug, Clone, PartialEq)]
+/// A port. `Default` is an unnamed port of unknown direction with every attribute unset, so a
+/// caller building one states only what it needs.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Port {
     pub name: String,
     pub direction: Direction,
@@ -78,6 +115,8 @@ pub struct Port {
     /// `isolationCellEnable`): `true`/`false` compared case-insensitively, false when unset.
     pub is_isolation_cell_data: bool,
     pub is_isolation_cell_enable: bool,
+    /// `signal_type`, read on a TEST CELL's ports only (a cell's own ports keep `None`).
+    pub scan_signal_type: ScanSignalType,
 }
 
 impl Port {
@@ -123,6 +162,11 @@ pub struct Cell {
     pub is_clock_cell: bool,
     /// The cell has a `statetable` group (not read further).
     pub has_statetable: bool,
+    /// `clock_gating_integrated_cell` is set (to anything): a clock gate.
+    pub is_clock_gate: bool,
+    /// The cell's FIRST `test_cell` group, read as a cell of its own named `<cell>/test_cell`
+    /// (its ports carry their `signal_type`).
+    pub test_cell: Option<Box<Cell>>,
     /// `pg_pin` groups, in order: (name, `pg_type`). The reference counts them among a cell's ports.
     pub pg_pins: Vec<(String, String)>,
     /// Bus ports: name and member bit ports, in the reader's member order (bit_from to bit_to).
@@ -141,6 +185,11 @@ pub struct Cell {
 impl Cell {
     pub fn port(&self, name: &str) -> Option<&Port> {
         self.ports.iter().find(|p| p.name == name)
+    }
+
+    /// The cell has an `ff`, `latch`, `ff_bank` or `latch_bank` group.
+    pub fn is_sequential(&self) -> bool {
+        !self.seqs.is_empty() || self.has_seq_bank
     }
 
     /// `bufferPorts`: the single input and single output, in port order. A second input or
@@ -409,7 +458,7 @@ impl Library {
         }
         lib.bus_types = read_bus_types(g);
         for cg in g.groups_of("cell") {
-            let cell = lib.read_cell(cg)?;
+            let cell = lib.read_cell(cg, false)?;
             lib.cells.insert(cell.name.clone(), cell);
         }
         Ok(lib)
@@ -424,8 +473,10 @@ impl Library {
         }
     }
 
-    fn read_cell(&self, cg: &Group) -> Result<Cell, String> {
-        let mut cell = Cell { name: cg.name().ok_or("cell without a name")?, ..Default::default() };
+    fn read_cell(&self, cg: &Group, is_test_cell: bool) -> Result<Cell, String> {
+        // A test cell's group has no name; its caller names it.
+        let name = if is_test_cell { String::new() } else { cg.name().ok_or("cell without a name")? };
+        let mut cell = Cell { name, ..Default::default() };
         cell.area = cg.attr_float("area").unwrap_or(0.0);
         cell.footprint = cg.attr_text("cell_footprint").unwrap_or_default();
         cell.user_function_class = cg.attr_text("user_function_class").unwrap_or_default();
@@ -441,6 +492,12 @@ impl Library {
         cell.always_on = flag("always_on", false);
         cell.is_clock_cell = flag("is_clock_cell", false);
         cell.has_statetable = cg.groups_of("statetable").next().is_some();
+        cell.is_clock_gate = cg.attr_text("clock_gating_integrated_cell").is_some_and(|t| !t.is_empty());
+        if let Some(tg) = cg.groups_of("test_cell").next() {
+            let mut test = self.read_cell(tg, true)?;
+            test.name = format!("{}/test_cell", cell.name);
+            cell.test_cell = Some(Box::new(test));
+        }
         cell.leakage_power = cg.attr_float("cell_leakage_power").map(|v| v * self.power_scale);
         cell.leakage_powers = cg.groups_of("leakage_power").filter_map(|lg| lg.attr_float("value")).map(|v| v * self.power_scale).collect();
         for pg in cg.groups_of("pg_pin") {
@@ -534,6 +591,22 @@ impl Library {
                         self.override_port(&mut cell.ports[i], pg);
                     }
                     PortRef::Pin(_) => {}
+                }
+            }
+        }
+        // A test cell's ports: `signal_type` per port group, on the ports it names (a bus group: the
+        // bus port, not its bits).
+        if is_test_cell {
+            for (pg, refs) in &port_groups {
+                let Some(t) = pg.attr_text("signal_type").as_deref().and_then(ScanSignalType::parse) else { continue };
+                for r in refs {
+                    let port = match r {
+                        PortRef::Pin(n) => cell.ports.iter_mut().find(|p| &p.name == n),
+                        PortRef::Bus(b) => cell.buses.iter().position(|(n, _)| n == b).map(|i| &mut cell.bus_ports[i]),
+                    };
+                    if let Some(port) = port {
+                        port.scan_signal_type = t;
+                    }
                 }
             }
         }
@@ -660,6 +733,7 @@ impl Library {
             is_clock_gate_clock,
             is_isolation_cell_data,
             is_isolation_cell_enable,
+            scan_signal_type: ScanSignalType::None,
         }
     }
 }
@@ -1085,6 +1159,50 @@ mod tests {
         assert_eq!(flags("C"), (false, false));
         assert_eq!(flags("X"), (false, false));
         assert!(c.is_isolation_cell);
+    }
+
+    // Rule: a `test_cell` group is read as a cell of its own, `<cell>/test_cell`, and only ITS
+    // ports take `signal_type` (the exact `test_scan_*` words; any other word sets nothing); the
+    // cell's own ports never do. Only the first `test_cell` group counts. A clock gate is any
+    // non-empty `clock_gating_integrated_cell`; sequential = an ff/latch (or bank) group.
+    #[test]
+    fn a_test_cell_carries_the_scan_signal_types() {
+        let lib = r#"library (s) { time_unit : "1ns"; capacitive_load_unit (1, pf);
+          cell (sdff) {
+            ff (IQ, IQN) { clocked_on : "CLK"; next_state : "(D&!SCE)|(SCD&SCE)"; }
+            pin (CLK) { direction : input; clock : true; }
+            pin (D) { direction : input; signal_type : test_scan_in; }
+            pin (SCD) { direction : input; }
+            pin (SCE) { direction : input; }
+            pin (Q) { direction : output; function : "IQ"; }
+            test_cell () {
+              ff (IQ, IQN) { clocked_on : "CLK"; next_state : "D"; }
+              pin (CLK) { direction : input; }
+              pin (D) { direction : input; }
+              pin (SCD) { direction : input; signal_type : test_scan_in; }
+              pin (SCE) { direction : input; signal_type : "test_scan_enable"; }
+              pin (Q) { direction : output; function : "IQ"; signal_type : test_scan_out; }
+              pin (X) { direction : input; signal_type : test_scan_sideways; } }
+            test_cell () { pin (CLK) { direction : input; signal_type : test_scan_clock; } } }
+          cell (icg) { clock_gating_integrated_cell : "latch_posedge_precontrol";
+            pin (CLK) { direction : input; } }
+          cell (bank) { ff_bank (IQ, IQN, 2) { clocked_on : "CLK"; next_state : "D"; }
+            pin (CLK) { direction : input; } }
+          cell (buf) { pin (A) { direction : input; } pin (X) { direction : output; function : "A"; } } }"#;
+        let l = Library::read(&parse(lib).unwrap()).unwrap();
+        let c = &l.cells["sdff"];
+        assert!(c.is_sequential() && !c.is_clock_gate);
+        assert_eq!(c.port("D").unwrap().scan_signal_type, ScanSignalType::None);
+        let t = c.test_cell.as_deref().expect("a test cell");
+        assert_eq!(t.name, "sdff/test_cell");
+        let sig = |n: &str| t.port(n).unwrap().scan_signal_type;
+        assert_eq!(
+            [sig("CLK"), sig("D"), sig("SCD"), sig("SCE"), sig("Q"), sig("X")],
+            [ScanSignalType::None, ScanSignalType::None, ScanSignalType::Input, ScanSignalType::Enable, ScanSignalType::Output, ScanSignalType::None]
+        );
+        assert!(l.cells["icg"].is_clock_gate && !l.cells["icg"].is_sequential());
+        assert!(l.cells["buf"].test_cell.is_none() && !l.cells["buf"].is_clock_gate && !l.cells["buf"].is_sequential());
+        assert!(l.cells["bank"].is_sequential());
     }
 
     // Rule (the lexer): a bus subscript's range is one token with its name — `pin (d[1:0])` inside
