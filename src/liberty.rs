@@ -74,6 +74,10 @@ pub struct Port {
     pub three_state: Option<String>,
     /// `clock_gate_clock_pin : true` (`isClockGateClock`).
     pub is_clock_gate_clock: bool,
+    /// `isolation_cell_data_pin` / `isolation_cell_enable_pin` (`isolationCellData`,
+    /// `isolationCellEnable`): `true`/`false` compared case-insensitively, false when unset.
+    pub is_isolation_cell_data: bool,
+    pub is_isolation_cell_enable: bool,
 }
 
 impl Port {
@@ -639,7 +643,24 @@ impl Library {
         let max_fanout = pg.attr_float("max_fanout");
         let three_state = pg.attr_text("three_state");
         let is_clock_gate_clock = pg.attr_text("clock_gate_clock_pin").is_some_and(|c| c.eq_ignore_ascii_case("true"));
-        Port { name: name.to_string(), direction, is_clock, capacitance, function, max_transition, max_capacitance, fanout_load, max_fanout, three_state, is_clock_gate_clock }
+        let flag = |name: &str| pg.attr_text(name).is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        let is_isolation_cell_data = flag("isolation_cell_data_pin");
+        let is_isolation_cell_enable = flag("isolation_cell_enable_pin");
+        Port {
+            name: name.to_string(),
+            direction,
+            is_clock,
+            capacitance,
+            function,
+            max_transition,
+            max_capacitance,
+            fanout_load,
+            max_fanout,
+            three_state,
+            is_clock_gate_clock,
+            is_isolation_cell_data,
+            is_isolation_cell_enable,
+        }
     }
 }
 
@@ -1043,6 +1064,27 @@ mod tests {
         assert_eq!(c.port("out[3]").unwrap().function.as_deref(), Some("in[3]"));
         assert_eq!(c.port("out[0]").unwrap().function.as_deref(), Some("in[0]"));
         assert_eq!(c.port("q[1]").unwrap().function.as_deref(), Some("in[3]"), "offset 0 of in");
+    }
+
+    // Rule (readPortAttrBool with isolationCellData / isolationCellEnable): `true` / `false`
+    // compared case-insensitively (stringEqual is charEqual = tolower); unset or any other value
+    // leaves the port false. An isolation cell's data and enable pins are found by these flags.
+    #[test]
+    fn isolation_cell_pin_flags() {
+        let lib = r#"library (i) { time_unit : "1ns"; capacitive_load_unit (1, pf);
+          cell (iso) { is_isolation_cell : true;
+            pin (A) { direction : input; isolation_cell_data_pin : "true"; }
+            pin (SLEEP_B) { direction : input; isolation_cell_enable_pin : TRUE; }
+            pin (C) { direction : input; isolation_cell_data_pin : "maybe"; }
+            pin (X) { direction : output; function : "(A&SLEEP_B)"; } } }"#;
+        let l = Library::read(&parse(lib).unwrap()).unwrap();
+        let c = &l.cells["iso"];
+        let flags = |n: &str| (c.port(n).unwrap().is_isolation_cell_data, c.port(n).unwrap().is_isolation_cell_enable);
+        assert_eq!(flags("A"), (true, false));
+        assert_eq!(flags("SLEEP_B"), (false, true));
+        assert_eq!(flags("C"), (false, false));
+        assert_eq!(flags("X"), (false, false));
+        assert!(c.is_isolation_cell);
     }
 
     // Rule (the lexer): a bus subscript's range is one token with its name — `pin (d[1:0])` inside
