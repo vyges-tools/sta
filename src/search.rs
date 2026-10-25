@@ -723,6 +723,87 @@ impl<'g, 'a> Search<'g, 'a> {
         self.clk_network[v]
     }
 
+    /// `Sta::vertexWorstSlackPath(vertex, min_max)`: of the vertex's paths of that min/max, in tag
+    /// order, the first with the fuzzily least slack — strictly less than `INF`, so an
+    /// unconstrained vertex has none.
+    pub fn worst_slack_path(&self, v: usize, mm: usize) -> Option<&Path> {
+        let mut worst = None;
+        let mut min_slack = INF;
+        for p in self.paths[v].iter().filter(|p| p.tag.mm == mm) {
+            let s = if mm == MAX { p.required - p.arrival } else { p.arrival - p.required };
+            if crate::fuzzy::less(s, min_slack) {
+                min_slack = s;
+                worst = Some(p);
+            }
+        }
+        worst
+    }
+
+    /// `Sta::vertexWorstArrivalPath(vertex, min_max)`: the first path of that min/max with the
+    /// fuzzily latest arrival (earliest, for min), from the min/max's initial value.
+    pub fn worst_arrival_path(&self, v: usize, mm: usize) -> Option<&Path> {
+        let mut worst = None;
+        let mut worst_arrival = if mm == MAX { -INF } else { INF };
+        for p in self.paths[v].iter().filter(|p| p.tag.mm == mm) {
+            let later = if mm == MAX { crate::fuzzy::greater(p.arrival, worst_arrival) } else { crate::fuzzy::less(p.arrival, worst_arrival) };
+            if later {
+                worst_arrival = p.arrival;
+                worst = Some(p);
+            }
+        }
+        worst
+    }
+
+    /// `Sta::arrival(vertex, rf, scenes, min_max)` for one transition: the latest arrival of its
+    /// paths (the earliest, for min); the min/max's initial value (±`INF`) with none.
+    pub fn arrival_rf(&self, v: usize, rf: usize, mm: usize) -> f32 {
+        let mut arrival = if mm == MAX { -INF } else { INF };
+        for p in self.paths[v].iter().filter(|p| p.tag.mm == mm && p.tag.rf == rf) {
+            let later = if mm == MAX { crate::fuzzy::greater(p.arrival, arrival) } else { crate::fuzzy::less(p.arrival, arrival) };
+            if later {
+                arrival = p.arrival;
+            }
+        }
+        arrival
+    }
+
+    /// `Sta::required(vertex, rf, scenes, min_max)` for one transition: the earliest required of
+    /// its max paths (the latest, for min) — the OPPOSITE min/max's order; its initial value
+    /// (±`INF`) with none.
+    pub fn required_rf(&self, v: usize, rf: usize, mm: usize) -> f32 {
+        let mut required = if mm == MAX { INF } else { -INF };
+        for p in self.paths[v].iter().filter(|p| p.tag.mm == mm && p.tag.rf == rf) {
+            let first = if mm == MAX { crate::fuzzy::less(p.required, required) } else { crate::fuzzy::greater(p.required, required) };
+            if first {
+                required = p.required;
+            }
+        }
+        required
+    }
+
+    /// `PathExpanded::size()` (generated clock sources not expanded): the path and every path
+    /// before it, back to the first — through the launching clock's own path. Before the start is
+    /// found (a register clock-to-Q or latch enable-to-Q arc), a latch D-to-Q arc ends it after
+    /// the latch's D path.
+    pub fn expanded_size(&self, p: &Path) -> usize {
+        let mut n = 0;
+        let mut found_start = false;
+        let mut cur = Some(p);
+        while let Some(q) = cur {
+            let prev = self.prev_path(q);
+            if let (false, Some(_), Some(pv)) = (found_start, prev, q.prev) {
+                match self.role(pv.edge) {
+                    Some(Role::RegClkToQ) | Some(Role::LatchEnToQ) => found_start = true,
+                    Some(Role::LatchDtoQ) => return n + 2,
+                    _ => {}
+                }
+            }
+            n += 1;
+            cur = prev.map(|(_, q)| q);
+        }
+        n
+    }
+
     /// Whether a CLOCK arrival reaches `v` (`Search::clocks(vertex)` is not empty): a data path's
     /// tag carries its launching clock too, and does not count.
     pub fn has_clock_arrival(&self, v: usize) -> bool {
@@ -1965,6 +2046,41 @@ mod tests {
             assert!(!s.comb_logic_thru(edge("f1/CLK", "f1/Q")));
             assert!(!s.comb_logic_thru(edge("f1/CLK", "f1/D")));
             assert!(s.is_reg_output(v("f1/Q")) && !s.is_reg_output(v("b1/X")) && !s.is_reg_output(v("out")));
+        });
+    }
+
+    #[test]
+    fn the_worst_slack_path_expands_back_to_the_clock_source() {
+        // `vertexWorstSlackPath` + `PathExpanded::size`: f2/D's worst path is f1/Q's launch, which
+        // runs back through f1/CLK, b1/X, b1/A to the clock port — six paths.
+        timed(|s, v| {
+            let p = s.worst_slack_path(v("f2/D"), MAX).expect("constrained");
+            let slack = p.required - p.arrival;
+            assert!(s.paths[v("f2/D")].iter().filter(|q| q.tag.mm == MAX).all(|q| q.required - q.arrival >= slack));
+            assert_eq!(s.expanded_size(p), 6);
+            let (pv, _) = s.prev_path(p).unwrap();
+            assert_eq!(pv, v("f1/Q"));
+        });
+        // No required time (no output delay): no worst-slack path, as for an unconstrained end.
+        timed_with(|sdc| sdc.output_delays.clear(), |s, v| assert!(s.worst_slack_path(v("out"), MAX).is_none()));
+    }
+
+    #[test]
+    fn per_transition_arrival_and_required_take_the_worst_of_their_paths() {
+        timed(|s, v| {
+            let d = v("f2/D");
+            for rf in [RISE, FALL] {
+                let of = |f: fn(&Path) -> f32| s.paths[d].iter().filter(|p| p.tag.mm == MAX && p.tag.rf == rf).map(f).collect::<Vec<f32>>();
+                assert_eq!(s.arrival_rf(d, rf, MAX), of(|p| p.arrival).into_iter().fold(-INF, f32::max));
+                assert_eq!(s.required_rf(d, rf, MAX), of(|p| p.required).into_iter().fold(INF, f32::min));
+            }
+            let a = s.worst_arrival_path(d, MAX).unwrap().arrival;
+            assert_eq!(a, s.arrival_rf(d, RISE, MAX).max(s.arrival_rf(d, FALL, MAX)));
+            // A vertex no path reaches keeps the initial values.
+            let none = (0..s.graph.vertices.len()).find(|&x| s.paths[x].is_empty());
+            if let Some(x) = none {
+                assert_eq!((s.arrival_rf(x, RISE, MAX), s.required_rf(x, RISE, MAX)), (-INF, INF));
+            }
         });
     }
 
