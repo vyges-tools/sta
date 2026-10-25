@@ -166,6 +166,10 @@ pub struct Cell {
     pub is_isolation_cell: bool,
     pub always_on: bool,
     pub is_clock_cell: bool,
+    /// `is_macro_cell`.
+    pub is_macro: bool,
+    /// `is_memory`, or a `memory` group (which sets it after the attribute is read).
+    pub is_memory: bool,
     /// The cell has a `statetable` group (not read further).
     pub has_statetable: bool,
     /// `clock_gating_integrated_cell` is set (to anything): a clock gate.
@@ -556,6 +560,8 @@ impl Library {
         cell.is_isolation_cell = flag("is_isolation_cell", false);
         cell.always_on = flag("always_on", false);
         cell.is_clock_cell = flag("is_clock_cell", false);
+        cell.is_macro = flag("is_macro_cell", false);
+        cell.is_memory = flag("is_memory", false) || cg.groups_of("memory").next().is_some();
         cell.has_statetable = cg.groups_of("statetable").next().is_some();
         cell.is_clock_gate = cg.attr_text("clock_gating_integrated_cell").is_some_and(|t| !t.is_empty());
         if let Some(tg) = cg.groups_of("test_cell").next() {
@@ -1448,6 +1454,21 @@ mod tests {
         assert_eq!(z.max_transition, Some(0.5 * 1e-9f32));
         assert_eq!(z.max_capacitance, Some(30.0 * 1e-15f32));
         assert_eq!(c.port("A").unwrap().fanout_load, Some(2.0));
+    }
+
+    // Rules (LibertyReader::readCellAttributes): `is_macro_cell` sets a macro; `is_memory` sets a
+    // memory, and a `memory` group sets it too, read after the attribute so it wins over `false`.
+    #[test]
+    fn macro_and_memory_cells_are_flagged() {
+        let text = r#"library (l) {
+            cell (M) { is_macro_cell : true ; }
+            cell (R) { is_memory : false ; memory () { type : ram ; } }
+            cell (S) { is_memory : TRUE ; }
+            cell (N) { is_macro_cell : false ; }
+            } "#;
+        let lib = Library::read(&parse(text).unwrap()).unwrap();
+        let f = |n: &str| (lib.cells[n].is_macro, lib.cells[n].is_memory);
+        assert_eq!([f("M"), f("R"), f("S"), f("N")], [(true, false), (false, true), (false, true), (false, false)]);
     }
 
     // Rules (LibertyCell::bufferPorts, isBuffer, hasBufferFunc): one input and one output in

@@ -197,6 +197,33 @@ impl FuncExpr {
         Ok(e)
     }
 
+    /// `FuncExpr::to_string`: a port is its name, a constant `0` / `1`, a NOT `!` before its
+    /// operand, a binary node its operands around `+` (or), `*` (and) or `^` (xor). Every operand
+    /// of a NOT or binary node is parenthesised when it is itself binary; the top node is not.
+    pub fn to_text(&self) -> String {
+        self.text(false)
+    }
+
+    fn text(&self, with_parens: bool) -> String {
+        let binary = |l: &FuncExpr, op: char, r: &FuncExpr| {
+            let inner = format!("{}{op}{}", l.text(true), r.text(true));
+            if with_parens {
+                format!("({inner})")
+            } else {
+                inner
+            }
+        };
+        match self {
+            FuncExpr::Port(p) => p.clone(),
+            FuncExpr::Not(e) => format!("!{}", e.text(true)),
+            FuncExpr::Or(l, r) => binary(l, '+', r),
+            FuncExpr::And(l, r) => binary(l, '*', r),
+            FuncExpr::Xor(l, r) => binary(l, '^', r),
+            FuncExpr::One => "1".into(),
+            FuncExpr::Zero => "0".into(),
+        }
+    }
+
     /// `FuncExpr::equiv`: the same operator at every node and the same port names (a port's
     /// direction is compared by the caller, with the port).
     pub fn equiv(a: Option<&FuncExpr>, b: Option<&FuncExpr>) -> bool {
@@ -211,6 +238,26 @@ impl FuncExpr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `FuncExpr::to_string`: the parser's tree printed back — left-associative chains nest to the
+    // left, a NOT's operand and every binary operand are parenthesised, the top node is not; `&`,
+    // `|` and implicit AND print as `*` and `+`, and a postfix `'` as a prefix `!`.
+    #[test]
+    fn to_text_prints_the_tree_as_the_reference_does() {
+        let t = |s: &str| FuncExpr::parse(s).unwrap().to_text();
+        assert_eq!(t("A"), "A");
+        assert_eq!(t("!A"), "!A");
+        assert_eq!(t("A'"), "!A");
+        assert_eq!(t("!(A1 & A2)"), "!(A1*A2)");
+        assert_eq!(t("A * B * C"), "(A*B)*C");
+        assert_eq!(t("A | B & C"), "A+(B*C)");
+        assert_eq!(t("(A ^ B)"), "A^B");
+        assert_eq!(t("!(!A)"), "!!A");
+        assert_eq!(t("A B"), "A*B");
+        assert_eq!(t("!((A1 * A2) + B)"), "!((A1*A2)+B)");
+        assert_eq!(t("0"), "0");
+        assert_eq!(t("1"), "1");
+    }
 
     // `portTimingSense`: NOT swaps the sense, AND/OR of opposite senses is non-unate, a side
     // without the port defers to the other, XOR is non-unate, an absent port is none.
