@@ -204,6 +204,20 @@ pub struct Activities {
     pub trace: Vec<String>,
 }
 
+/// dropped (`a\/b\[1\]` prints `a/b[1]`; an escaped backslash prints one backslash).
+/// dropped (`a\\/b\\[1\\]` prints `a/b[1]`; an escaped backslash prints one backslash).
+fn path_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut it = name.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => out.extend(it.next()),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn bits(v: f32) -> String {
     format!("{:08x}", v.to_bits())
 }
@@ -351,7 +365,7 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
             if !self.is_root(v) || self.inp.clock_source[v] {
                 continue;
             }
-            self.act.trace.push(format!("seed {}", self.g.vertices[v].name));
+            self.act.trace.push(format!("seed {}", path_name(&self.g.vertices[v].name)));
             self.act.pin[v] = Some(input);
             self.enqueue_adjacent(v);
         }
@@ -380,7 +394,7 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
 
     /// `PropActivityVisitor::visit`.
     fn visit(&mut self, v: usize) {
-        self.act.trace.push(format!("visit {}", self.g.vertices[v].name));
+        self.act.trace.push(format!("visit {}", path_name(&self.g.vertices[v].name)));
         let mut changed = false;
         if self.is_load(v) {
             if let Some(&e) = self.g.in_edges[v].last() {
@@ -472,7 +486,7 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
         let changed = density_delta > CHANGE_TOLERANCE || duty_delta > CHANGE_TOLERANCE || a.origin != prev.origin;
         self.act.trace.push(format!(
             "VYG-SET {} slew {} dens {} duty {} origin {} changed {}",
-            self.g.vertices[v].name,
+            path_name(&self.g.vertices[v].name),
             bits(slew),
             bits(a.density),
             bits(a.duty),
@@ -533,7 +547,7 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
                 }
                 if let Some(FuncExpr::Port(fp)) = self.func(cell, &port) {
                     if Some(&fp) == seq.output.as_ref() || Some(&fp) == seq.output_inv.as_ref() {
-                        self.act.trace.push(format!("enqueue reg output {}", self.g.vertices[v].name));
+                        self.act.trace.push(format!("enqueue reg output {}", path_name(&self.g.vertices[v].name)));
                         self.bfs.enqueue(v, self.inp.level[v]);
                     }
                 }
@@ -569,7 +583,7 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
         let out = Activity::new(out_density, out_duty, Origin::Propagated);
         self.act.trace.push(format!(
             "VYG-SEQ {} {} in {} {} clk {} out {} {}",
-            self.g.netlist.insts[i].0,
+            path_name(&self.g.netlist.insts[i].0),
             output.unwrap_or("-"),
             bits(in_density),
             bits(in_duty),
@@ -619,6 +633,15 @@ impl InstPins for InstView<'_, '_, '_, '_> {
 
 #[cfg(test)]
 mod tests {
+    // The reference's trace prints network path names: the database's escapes are dropped, an
+    // escaped backslash keeps one.
+    #[test]
+    fn trace_names_drop_the_database_escapes() {
+        assert_eq!(super::path_name(r"ctrl\/state\/out\[1\]$_DFF_P__2/Y"), "ctrl/state/out[1]$_DFF_P__2/Y");
+        assert_eq!(super::path_name(r"a\\b/Y"), r"a\b/Y");
+        assert_eq!(super::path_name("_896_/QN"), "_896_/QN");
+    }
+
     use super::*;
     use std::collections::HashMap;
 

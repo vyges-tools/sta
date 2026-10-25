@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::func_expr::{FuncExpr, Sense};
 use crate::liberty_parse::{Group, Value};
 use crate::table::{Axis, AxisVar, GateModel, Table};
 
@@ -1037,7 +1038,18 @@ impl Library {
                             arcs.push(Arc { from_rf, to_rf, model: m.clone() });
                         }
                     };
-                    match sense.as_deref() {
+                    // `makeCombinationalArcs`: no timing_sense ⇒ the sense of the related pin
+                    // through the output's function; any sense but positive/negative unate (none,
+                    // unknown, a pin the function does not name) makes the non-unate arcs.
+                    let derived = match sense.as_deref() {
+                        Some(s) => Some(s),
+                        None => match function.map(FuncExpr::parse).transpose().map_err(|e| format!("cell {}: {e}", cell.name))?.map(|f| f.port_timing_sense(from)) {
+                            Some(Sense::PositiveUnate) => Some("positive_unate"),
+                            Some(Sense::NegativeUnate) => Some("negative_unate"),
+                            _ => Some("non_unate"),
+                        },
+                    };
+                    match derived {
                         Some("positive_unate") => {
                             if to_rise {
                                 push(RISE, RISE);
@@ -1064,7 +1076,7 @@ impl Library {
                                 push(FALL, RISE);
                             }
                         }
-                        _ => return Err(format!("cell {}: a combinational arc {from} -> {to} without timing_sense is not modelled", cell.name)),
+                        _ => return Err(format!("cell {}: a combinational arc {from} -> {to}: timing_sense {} is not modelled", cell.name, derived.unwrap_or_default())),
                     }
                     ArcSet { from: from.clone(), to: to.to_string(), role: Role::Combinational, timing_type: timing_type.clone(), cond: cond.clone(), arcs }
                 }
@@ -1145,6 +1157,36 @@ mod tests {
         assert_eq!(c.port("out[3]").unwrap().function.as_deref(), Some("in[3]"));
         assert_eq!(c.port("out[0]").unwrap().function.as_deref(), Some("in[0]"));
         assert_eq!(c.port("q[1]").unwrap().function.as_deref(), Some("in[3]"), "offset 0 of in");
+    }
+
+    // Rule (makeCombinationalArcs): a combinational timing group without timing_sense takes the
+    // related pin's sense through the output's function (a pad's `IN = PAD` is positive unate: rise
+    // to rise, fall to fall); a pin the function does not name makes the non-unate arcs.
+    #[test]
+    fn a_missing_timing_sense_comes_from_the_function() {
+        let lib = r#"library (p) { time_unit : "1ns"; capacitive_load_unit (1, pf);
+          cell (pad) {
+            pin (PAD) { direction : input; capacitance : 0.001; }
+            pin (EN) { direction : input; capacitance : 0.001; }
+            pin (IN) { direction : output; function : "PAD";
+              timing () { related_pin : "PAD";
+                cell_rise (scalar) { values ("1"); } cell_fall (scalar) { values ("2"); }
+                rise_transition (scalar) { values ("1"); } fall_transition (scalar) { values ("2"); } }
+              timing () { related_pin : "EN";
+                cell_rise (scalar) { values ("1"); } cell_fall (scalar) { values ("2"); }
+                rise_transition (scalar) { values ("1"); } fall_transition (scalar) { values ("2"); } } }
+            pin (INB) { direction : output; function : "!PAD";
+              timing () { related_pin : "PAD";
+                cell_rise (scalar) { values ("1"); } cell_fall (scalar) { values ("2"); }
+                rise_transition (scalar) { values ("1"); } fall_transition (scalar) { values ("2"); } } } } }"#;
+        let l = Library::read(&parse(lib).unwrap()).unwrap();
+        let c = &l.cells["pad"];
+        let arcs = |from: &str, to: &str| -> Vec<(usize, usize)> {
+            c.arc_sets.iter().filter(|s| s.from == from && s.to == to).flat_map(|s| s.arcs.iter().map(|a| (a.from_rf, a.to_rf))).collect()
+        };
+        assert_eq!(arcs("PAD", "IN"), [(RISE, RISE), (FALL, FALL)]);
+        assert_eq!(arcs("PAD", "INB"), [(RISE, FALL), (FALL, RISE)]);
+        assert_eq!(arcs("EN", "IN"), [(FALL, FALL), (RISE, FALL), (RISE, RISE), (FALL, RISE)]);
     }
 
     // Rule (readPortAttrBool with isolationCellData / isolationCellEnable): `true` / `false`

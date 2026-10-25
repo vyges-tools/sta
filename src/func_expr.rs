@@ -141,7 +141,52 @@ impl Parser {
     }
 }
 
+/// A port's timing sense through a function (`TimingSense`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sense {
+    PositiveUnate,
+    NegativeUnate,
+    NonUnate,
+    None,
+    Unknown,
+}
+
 impl FuncExpr {
+    /// `FuncExpr::portTimingSense`: the port itself is positive unate, any other port or a
+    /// constant none; a NOT swaps positive and negative; an AND/OR keeps equal senses, is non-unate
+    /// on a non-unate side or opposite unate sides, else takes the side that is neither none nor
+    /// unknown; an XOR is non-unate when either side has a sense, else unknown.
+    pub fn port_timing_sense(&self, port: &str) -> Sense {
+        use Sense::*;
+        match self {
+            FuncExpr::Port(p) => if p == port { PositiveUnate } else { None },
+            FuncExpr::Not(e) => match e.port_timing_sense(port) {
+                PositiveUnate => NegativeUnate,
+                NegativeUnate => PositiveUnate,
+                s => s,
+            },
+            FuncExpr::And(l, r) | FuncExpr::Or(l, r) => {
+                let (l, r) = (l.port_timing_sense(port), r.port_timing_sense(port));
+                if l == r {
+                    l
+                } else if l == NonUnate || r == NonUnate || (l == PositiveUnate && r == NegativeUnate) || (l == NegativeUnate && r == PositiveUnate) {
+                    NonUnate
+                } else if l == None || l == Unknown {
+                    r
+                } else if r == None || r == Unknown {
+                    l
+                } else {
+                    Unknown
+                }
+            }
+            FuncExpr::Xor(l, r) => {
+                let has = |s: Sense| matches!(s, PositiveUnate | NegativeUnate | NonUnate);
+                if has(l.port_timing_sense(port)) || has(r.port_timing_sense(port)) { NonUnate } else { Unknown }
+            }
+            FuncExpr::One | FuncExpr::Zero => None,
+        }
+    }
+
     /// Parse a liberty function.
     pub fn parse(s: &str) -> Result<FuncExpr, String> {
         let mut p = Parser { toks: scan(s), at: 0 };
@@ -166,6 +211,20 @@ impl FuncExpr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `portTimingSense`: NOT swaps the sense, AND/OR of opposite senses is non-unate, a side
+    // without the port defers to the other, XOR is non-unate, an absent port is none.
+    #[test]
+    fn a_port_sense_through_the_function() {
+        use Sense::*;
+        assert_eq!(p("PAD").port_timing_sense("PAD"), PositiveUnate);
+        assert_eq!(p("!(A & B)").port_timing_sense("A"), NegativeUnate);
+        assert_eq!(p("(A & B) | (!A & C)").port_timing_sense("A"), NonUnate);
+        assert_eq!(p("(A & B) | C").port_timing_sense("B"), PositiveUnate);
+        assert_eq!(p("A ^ B").port_timing_sense("B"), NonUnate);
+        assert_eq!(p("A & B").port_timing_sense("C"), None);
+        assert_eq!(p("1").port_timing_sense("A"), None);
+    }
 
     fn p(s: &str) -> FuncExpr {
         FuncExpr::parse(s).unwrap()
