@@ -493,7 +493,7 @@ impl<'g, 'a> Search<'g, 'a> {
             for pd in &sdc.path_delays {
                 // `recordPathDelayInternalFrom`: not `isExceptionStartpoint`.
                 for &v in pd.from_pins.iter().filter_map(|p| index.get(p.as_str())) {
-                    let top_input = graph.vertices[v].lib.is_none() && graph.vertices[v].is_driver;
+                    let top_input = graph.is_port(v) && graph.vertices[v].is_driver;
                     if !(top_input || is_reg_clk[v]) {
                         internal_from[v] = true;
                         internal_from_break[v] |= pd.break_path;
@@ -501,7 +501,7 @@ impl<'g, 'a> Search<'g, 'a> {
                 }
                 // `recordPathDelayInternalTo`: not `hasLibertyCheckTo` nor a top port.
                 for &v in pd.to_pins.iter().filter_map(|p| index.get(p.as_str())) {
-                    if !(has_check(v) || graph.vertices[v].lib.is_none()) {
+                    if !(has_check(v) || graph.is_port(v)) {
                         internal_to[v] = true;
                         internal_to_break[v] |= pd.break_path;
                     }
@@ -655,7 +655,7 @@ impl<'g, 'a> Search<'g, 'a> {
     /// output delay), or no fanout, or a path delay's internal `-to` pin.
     pub fn is_endpoint(&self, v: usize) -> bool {
         let vx = &self.graph.vertices[v];
-        let constrained = vx.lib.is_none() && (!vx.is_driver || self.output_delay.contains_key(&vx.name));
+        let constrained = self.graph.is_port(v) && (!vx.is_driver || self.output_delay.contains_key(&vx.name));
         let checks = self.graph.in_edges[v].iter().any(|&e| self.is_check(e));
         self.has_fanin(v) && (checks || constrained || !self.has_fanout(v) || self.internal_to[v] || self.gated.contains_key(&v))
     }
@@ -1014,7 +1014,7 @@ impl<'g, 'a> Search<'g, 'a> {
     /// and nothing sets it) — every other input port, UNCLOCKED at 0.
     fn seed_arrivals(&self, v: usize, bldr: &mut Bldr) {
         let name = &self.graph.vertices[v].name;
-        if self.graph.vertices[v].lib.is_some() {
+        if !self.graph.is_port(v) {
             return;
         }
         let sources: Vec<usize> = self.sdc.clocks.iter().enumerate().filter(|(_, c)| !c.source.is_empty() && *name == c.source).map(|(k, _)| k).collect();
@@ -1139,7 +1139,7 @@ impl<'g, 'a> Search<'g, 'a> {
     /// setup for a max path, hold for a min path.
     fn visit_path_ends(&self, v: usize, req: &mut [f32]) {
         let name = &self.graph.vertices[v].name;
-        let ods: &[usize] = if self.graph.vertices[v].lib.is_none() { self.output_delay.get(name).map_or(&[], Vec::as_slice) } else { &[] };
+        let ods: &[usize] = if self.graph.is_port(v) { self.output_delay.get(name).map_or(&[], Vec::as_slice) } else { &[] };
         let checks = self.graph.in_edges[v].iter().any(|&e| self.is_check(e));
         let gated = self.gated.get(&v).copied();
         for (i, path) in self.paths[v].iter().enumerate() {

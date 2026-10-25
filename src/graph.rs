@@ -251,6 +251,20 @@ impl<'a> Graph<'a> {
         Graph::build_keeping(libs, netlist, NetlistRef::Borrowed(netlist), pins)
     }
 
+    /// [`Graph::build_with_pins`] with a vertex for every signal pin of an instance whose cell no
+    /// library holds (`unlinked`: master name → its signal terminals in order, each with its
+    /// direction from the database; `Graph::makePinVertices` makes a vertex for every pin of every
+    /// leaf instance, linked or not). Such an instance has no gate edge, only wire edges: an
+    /// output is a root driver, an input a load whose capacitance is 0. Its vertices have no
+    /// library (`lib: None`) — a top-level port is told apart by its connection, not by that.
+    pub fn build_with_unlinked(libs: &'a [Library], netlist: &'a Netlist, pins: Option<&HashMap<String, Vec<String>>>, unlinked: &HashMap<String, Vec<(String, Direction)>>) -> Result<Graph<'a>, String> {
+        let g = Graph::build_by_name(libs, netlist, NetlistRef::Borrowed(netlist), pins, Some(unlinked))?;
+        if std::env::var_os("VYGES_STA_BUILD_TRACE").is_some() {
+            g.trace_build();
+        }
+        Ok(g)
+    }
+
     /// [`Graph::build_with_pins`] over a netlist the graph SHARES (it may outlive the caller's
     /// generation of it, and be moved to a later one).
     pub fn build_shared(libs: &'a [Library], netlist: std::sync::Arc<Netlist>, pins: Option<&HashMap<String, Vec<String>>>) -> Result<Graph<'a>, String> {
@@ -287,7 +301,7 @@ impl<'a> Graph<'a> {
         match Graph::build_by_cell(libs, netlist, keep.clone(), pins) {
             // `VYGES_STA_CHECK_BUILD=1`: every template build is checked against the by-name one.
             Some(g) if *CHECK.get_or_init(|| std::env::var_os("VYGES_STA_CHECK_BUILD").is_some()) => {
-                let by_name = Graph::build_by_name(libs, netlist, keep, pins)?;
+                let by_name = Graph::build_by_name(libs, netlist, keep, pins, None)?;
                 if g.shape() != by_name.shape() {
                     return Err("the template build differs from the by-name build".into());
                 }
@@ -300,7 +314,7 @@ impl<'a> Graph<'a> {
                 Ok(g)
             }
             Some(g) => Ok(g),
-            None => Graph::build_by_name(libs, netlist, keep, pins),
+            None => Graph::build_by_name(libs, netlist, keep, pins, None),
         }
     }
 
@@ -467,7 +481,7 @@ impl<'a> Graph<'a> {
                 return None;
             }
             let is_driver = *dir == PortDir::Input;
-            let reuse = old_ports.get(pc).copied().filter(|&k| old[k].as_ref().is_some_and(|v| v.name == *name && v.is_driver == is_driver && v.lib.is_none()));
+            let reuse = old_ports.get(pc).copied().filter(|&k| old[k].as_ref().is_some_and(|v| v.name == *name && v.is_driver == is_driver && matches!(v.conn, Conn::Port(_))));
             match reuse {
                 Some(k) => {
                     let mut v = old[k].take().expect("a matching port");
@@ -557,7 +571,7 @@ impl<'a> Graph<'a> {
     }
 
     /// [`Graph::build_with_pins`] with each pin found by its name.
-    fn build_by_name(libs: &'a [Library], netlist: &Netlist, keep: NetlistRef<'a>, pins: Option<&HashMap<String, Vec<String>>>) -> Result<Graph<'a>, String> {
+    fn build_by_name(libs: &'a [Library], netlist: &Netlist, keep: NetlistRef<'a>, pins: Option<&HashMap<String, Vec<String>>>, unlinked: Option<&HashMap<String, Vec<(String, Direction)>>>) -> Result<Graph<'a>, String> {
         let find_cell = |name: &str| libs.iter().position(|l| l.cells.contains_key(name));
         let mut vertices = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
@@ -568,7 +582,19 @@ impl<'a> Graph<'a> {
         let mut bidirect: Vec<String> = Vec::new();
         for (i, (name, cname)) in netlist.insts.iter().map(|i| &**i).enumerate() {
             // A physical-only cell (tap, fill, decap) has no liberty cell and nothing to time.
-            let Some(lib) = find_cell(cname) else { continue };
+            let Some(lib) = find_cell(cname) else {
+                for (port, dir) in unlinked.and_then(|u| u.get(cname)).map_or(&[][..], Vec::as_slice) {
+                    let is_driver = match dir {
+                        Direction::Input => false,
+                        Direction::Output | Direction::Tristate => true,
+                        _ => return Err(format!("{name}/{port}: a {dir:?} pin of a cell no library holds is not modelled")),
+                    };
+                    let vname = format!("{name}/{port}");
+                    index.entry(vname.clone()).or_insert(vertices.len());
+                    vertices.push(Vertex { name: vname, conn: Conn::Inst(i, port.clone()), is_driver, lib: None, cell: Some(cname.clone()), port: Some(port.clone()) });
+                }
+                continue;
+            };
             let has = pins.and_then(|m| m.get(cname));
             for p in &cell(libs, lib, cname).ports {
                 if has.is_some_and(|h| !h.contains(&p.name)) {
@@ -657,6 +683,12 @@ impl<'a> Graph<'a> {
             })
             .collect();
         Ok(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), stale_out_arcs: HashMap::new(), index_cache: std::sync::OnceLock::new(), net_slots: None, edit_seq: None, state_seq: None })
+    }
+
+    /// Whether vertex `v` is a top-level port's (an instance's vertex may have no library too:
+    /// [`Graph::build_with_unlinked`]).
+    pub fn is_port(&self, v: usize) -> bool {
+        matches!(self.vertices[v].conn, Conn::Port(_))
     }
 
     pub fn is_check(&self, e: usize) -> bool {
@@ -1282,6 +1314,37 @@ mod tests {
       }
     }"#;
 
+    // Rule (`Graph::makePinVertices` over every leaf instance, `dbNetwork::direction` from the
+    // terminal when no liberty port): an instance whose cell no library holds still has a vertex
+    // per signal pin, in instance then terminal order, with wire edges and no gate edge — its
+    // output is a root driver, and a vertex without a library is not a top-level port. Without
+    // the unlinked map the instance has no vertex at all.
+    #[test]
+    fn an_unlinked_instance_has_vertices_and_wires_only() {
+        let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
+        let pin = |i: usize, p: &str| Conn::Inst(i, p.into());
+        let nl = Netlist {
+            insts: vec![crate::netlist::inst("x", "blk"), crate::netlist::inst("u1", "and2")],
+            ports: vec![("a".into(), PortDir::Input), ("y".into(), PortDir::Output)],
+            nets: vec![
+                Net { name: "a".into(), pins: vec![pin(0, "A"), pin(1, "B"), Conn::Port(0)] }.into(),
+                Net { name: "n".into(), pins: vec![pin(0, "Y"), pin(1, "A")] }.into(),
+                Net { name: "y".into(), pins: vec![pin(1, "Y"), Conn::Port(1)] }.into(),
+            ],
+        };
+        let unlinked: HashMap<String, Vec<(String, Direction)>> = [("blk".to_string(), vec![("A".to_string(), Direction::Input), ("Y".to_string(), Direction::Output)])].into();
+        let g = Graph::build_with_unlinked(&libs, &nl, None, &unlinked).unwrap();
+        let names: Vec<&str> = g.vertices.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, ["x/A", "x/Y", "u1/A", "u1/B", "u1/Y", "a", "y"]);
+        let y = 1;
+        assert!(g.vertices[y].is_driver && g.in_edges[y].is_empty(), "a root driver");
+        assert!(!g.is_port(y) && g.vertices[y].lib.is_none());
+        let edges: Vec<(&str, &str, bool)> = g.edges.iter().map(|e| (names[e.from], names[e.to], matches!(e.kind, EdgeKind::Wire))).collect();
+        assert_eq!(edges, [("u1/A", "u1/Y", false), ("u1/B", "u1/Y", false), ("a", "x/A", true), ("a", "u1/B", true), ("x/Y", "u1/A", true), ("u1/Y", "y", true)]);
+        let plain = Graph::build(&libs, &nl).unwrap();
+        assert!(plain.vertices.iter().all(|v| !v.name.starts_with("x/")));
+    }
+
     /// Two `and2` in a chain: ports a, b into u1; u1/Y and port c into u2; u2/Y out to y.
     fn chain() -> Netlist {
         let pin = |i: usize, p: &str| Conn::Inst(i, p.into());
@@ -1578,7 +1641,7 @@ mod tests {
         let filter: HashMap<String, Vec<String>> = [("and2".to_string(), vec!["A".to_string(), "Y".to_string()])].into();
         for pins in [None, Some(&filter)] {
             let fast = Graph::build_by_cell(&libs, &nl, NetlistRef::Borrowed(&nl), pins).expect("names are unique");
-            let slow = Graph::build_by_name(&libs, &nl, NetlistRef::Borrowed(&nl), pins).unwrap();
+            let slow = Graph::build_by_name(&libs, &nl, NetlistRef::Borrowed(&nl), pins, None).unwrap();
             assert_eq!(shape(&fast), shape(&slow));
         }
         let mut dup = chain();
@@ -1588,7 +1651,7 @@ mod tests {
         slash.ports[0].0 = "u1/A".into();
         assert!(Graph::build_by_cell(&libs, &slash, NetlistRef::Borrowed(&slash), None).is_none());
         // There the port takes the pin's name, and the by-name build's answer stands.
-        assert_eq!(Graph::build(&libs, &slash).err(), Graph::build_by_name(&libs, &slash, NetlistRef::Borrowed(&slash), None).err());
+        assert_eq!(Graph::build(&libs, &slash).err(), Graph::build_by_name(&libs, &slash, NetlistRef::Borrowed(&slash), None, None).err());
         assert!(Graph::build(&libs, &slash).is_err());
     }
 
