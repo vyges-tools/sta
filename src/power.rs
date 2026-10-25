@@ -193,7 +193,7 @@ pub struct ActivityInputs<'x> {
 }
 
 /// The activities the propagation settled on, and its trace.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Activities {
     /// Per vertex, the activity set on it (`None`: never set).
     pub pin: Vec<Option<Activity>>,
@@ -204,9 +204,10 @@ pub struct Activities {
     pub trace: Vec<String>,
 }
 
-/// dropped (`a\/b\[1\]` prints `a/b[1]`; an escaped backslash prints one backslash).
-/// dropped (`a\\/b\\[1\\]` prints `a/b[1]`; an escaped backslash prints one backslash).
-fn path_name(name: &str) -> String {
+/// A vertex name as the reference's path names print it: each escaping backslash dropped
+/// (`a\/b\[1\]` prints `a/b[1]`; an escaped backslash prints one backslash). Constraints name
+/// pins this way (`get_pins {a.b[0]/IN}` is the pin `a\.b\[0\]/IN`).
+pub fn path_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut it = name.chars();
     while let Some(c) = it.next() {
@@ -256,6 +257,13 @@ struct Prop<'x, 'g, 'a> {
     inp: &'x ActivityInputs<'x>,
     /// Per instance, its pins' vertices in pin order.
     inst_pins: Vec<Vec<usize>>,
+    /// Per vertex, its pin's first vertex: an activity is the PIN's (`activity_map_` is keyed by
+    /// pin), so a bidirect pin's load and driver vertices share the first's.
+    pin_key: Vec<usize>,
+    /// Per vertex, its pin's driver vertex (`pinDrvrVertex`: a bidirect pin's second).
+    pin_drvr: Vec<usize>,
+    /// Whether the vertex is one of a bidirect pin's two.
+    bidir: Vec<bool>,
     funcs: HashMap<String, Option<FuncExpr>>,
     act: Activities,
     bfs: Bfs,
@@ -286,6 +294,10 @@ pub fn ensure_activities(g: &Graph<'_>, inp: &ActivityInputs<'_>) -> Result<Acti
         pass += 1;
     }
     p.act.passes = pass - 1;
+    // a bidirect pin's driver vertex reads the pin's activity
+    for v in 0..p.act.pin.len() {
+        p.act.pin[v] = p.act.pin[p.pin_key[v]];
+    }
     Ok(p.act)
 }
 
@@ -298,11 +310,24 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
                 inst_pins[i].push(v);
             }
         }
+        let (mut pin_key, mut pin_drvr, mut bidir): (Vec<usize>, Vec<usize>, Vec<bool>) = ((0..n).collect(), (0..n).collect(), vec![false; n]);
+        for v in 1..n {
+            let (a, b) = (&g.vertices[v - 1], &g.vertices[v]);
+            if a.name == b.name && a.conn == b.conn {
+                pin_key[v] = v - 1;
+                pin_drvr[v - 1] = v;
+                bidir[v - 1] = true;
+                bidir[v] = true;
+            }
+        }
         let max_level = inp.level.iter().copied().max().unwrap_or(0);
         Ok(Prop {
             g,
             inp,
             inst_pins,
+            pin_key,
+            pin_drvr,
+            bidir,
             funcs: HashMap::new(),
             act: Activities { pin: vec![None; n], ..Activities::default() },
             bfs: Bfs::new(n, max_level),
@@ -324,9 +349,26 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
         }
     }
 
-    /// `Network::isLoad`: an instance input, or a top OUTPUT port.
+    /// `Network::isLoad`: an instance input, or a top OUTPUT port — or a bidirect pin or port,
+    /// whichever of its vertices (the PIN's direction decides).
     fn is_load(&self, v: usize) -> bool {
-        !self.g.vertices[v].is_driver
+        !self.g.vertices[v].is_driver || self.bidir[v]
+    }
+
+    /// `Network::isDriver`: an instance output, or a top INPUT port, or a bidirect pin or port.
+    fn is_driver(&self, v: usize) -> bool {
+        self.g.vertices[v].is_driver || self.bidir[v]
+    }
+
+    /// `Vertex::to_string`: the pin's path name, and for a bidirect pin's vertex ` load` or
+    /// ` driver`.
+    fn label(&self, v: usize) -> String {
+        let name = path_name(&self.g.vertices[v].name);
+        match (self.bidir[v], self.g.vertices[v].is_driver) {
+            (true, true) => format!("{name} driver"),
+            (true, false) => format!("{name} load"),
+            _ => name,
+        }
     }
 
     /// The liberty function of a port of `cell` (parsed once per cell and port).
@@ -344,7 +386,7 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
     fn search_thru(&self, e: usize) -> bool {
         match self.g.edges[e].kind {
             EdgeKind::Wire => true,
-            EdgeKind::Gate { set } => !self.g.is_check(e) && !matches!(self.g.arc_set(e, set).role, Role::RegClkToQ | Role::LatchDtoQ),
+            EdgeKind::Gate { set } => !self.g.is_check(e) && !matches!(self.g.arc_set(e, set).role, Role::RegClkToQ | Role::LatchDtoQ) && !self.g.bidirect_inst_paths.contains(&e),
         }
     }
 
@@ -365,18 +407,19 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
             if !self.is_root(v) || self.inp.clock_source[v] {
                 continue;
             }
-            self.act.trace.push(format!("seed {}", path_name(&self.g.vertices[v].name)));
-            self.act.pin[v] = Some(input);
-            self.enqueue_adjacent(v);
+            self.act.trace.push(format!("seed {}", self.label(v)));
+            self.act.pin[self.pin_key[v]] = Some(input);
+            // the fanout of the pin's DRIVER vertex
+            self.enqueue_adjacent(self.pin_drvr[v]);
         }
     }
 
-    /// `Levelize::isRoot`: no in-edge it levels through (timing checks, latch D->Q and the
-    /// disabled set/clear arcs do not count).
+    /// `Levelize::isRoot`: no in-edge it levels through (timing checks, latch D->Q, the disabled
+    /// set/clear arcs and the bidirect instance and port paths do not count).
     fn is_root(&self, v: usize) -> bool {
         !self.g.in_edges[v].iter().any(|&e| match self.g.edges[e].kind {
-            EdgeKind::Wire => true,
-            EdgeKind::Gate { set } => !self.g.is_check(e) && !matches!(self.g.arc_set(e, set).role, Role::RegSetClr | Role::LatchDtoQ),
+            EdgeKind::Wire => !self.g.bidirect_port_paths.contains(&e),
+            EdgeKind::Gate { set } => !self.g.is_check(e) && !matches!(self.g.arc_set(e, set).role, Role::RegSetClr | Role::LatchDtoQ) && !self.g.bidirect_inst_paths.contains(&e),
         })
     }
 
@@ -394,18 +437,18 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
 
     /// `PropActivityVisitor::visit`.
     fn visit(&mut self, v: usize) {
-        self.act.trace.push(format!("visit {}", path_name(&self.g.vertices[v].name)));
+        self.act.trace.push(format!("visit {}", self.label(v)));
         let mut changed = false;
         if self.is_load(v) {
             if let Some(&e) = self.g.in_edges[v].last() {
                 if matches!(self.g.edges[e].kind, EdgeKind::Wire) {
-                    let from = self.act.pin[self.g.edges[e].from].unwrap_or(Activity::UNKNOWN);
+                    let from = self.act.pin[self.pin_key[self.g.edges[e].from]].unwrap_or(Activity::UNKNOWN);
                     changed = self.set_activity_check(v, Activity::new(from.density, from.duty, Origin::Propagated));
                 }
             }
         }
         let inst = self.inst_of(v);
-        if self.g.vertices[v].is_driver {
+        if self.is_driver(v) {
             if let (Some(i), Some(port)) = (inst, self.g.vertices[v].port.clone()) {
                 if let Some(cell) = self.cell_of_inst(i) {
                     let mut func = self.func(cell, &port);
@@ -467,6 +510,8 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
     /// `setActivityCheck`: clamp the density to one transition per (least) slew, set it, and
     /// say whether it moved by more than the tolerance or changed origin.
     fn set_activity_check(&mut self, v: usize, mut a: Activity) -> bool {
+        // the pin's: `getMinRfSlew` reads its first vertex
+        let v = self.pin_key[v];
         let slew = self.inp.min_rf_slew[v];
         let max_density = if slew > 0.0 { (1.0 / f64::from(slew)) as f32 } else { f32::INFINITY };
         if a.density > max_density {
@@ -500,6 +545,7 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
     /// `findActivity`: a clock pin's own activity if one was set, else its clock's; any other
     /// pin's activity if set, else unknown.
     fn find_activity(&self, v: usize) -> Activity {
+        let v = self.pin_key[v];
         if self.inp.is_clock[v] {
             if let Some(a) = self.act.pin[v].filter(Activity::is_set) {
                 return a;
@@ -603,6 +649,374 @@ pub fn is_internal_port(cell: &Cell, port: &str) -> bool {
     match cell.ports.iter().find(|p| p.name == port) {
         Some(p) => p.direction == Direction::Internal,
         None => cell.seqs.iter().any(|s| s.output.as_deref() == Some(port) || s.output_inv.as_deref() == Some(port)),
+    }
+}
+
+/// One instance's power (`PowerResult`): each term summed in float as its pins are visited.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct InstPower {
+    pub internal: f32,
+    pub switching: f32,
+    pub leakage: f32,
+}
+
+impl InstPower {
+    /// `PowerResult::total`: internal + switching + leakage, in float.
+    pub fn total(&self) -> f32 {
+        self.internal + self.switching + self.leakage
+    }
+}
+
+/// What the instance powers read besides the activities, for the analyzed scene (its graph is
+/// the one passed: its libraries are the scene's cells, its slews and loads the scene's).
+pub struct PowerInputs<'x> {
+    /// `Sim` constants by pin name: what a leakage `when` is evaluated under.
+    pub constants: &'x HashMap<String, bool>,
+    /// Per vertex: in an ideal clock's network, the clock slew per `[rise, fall]`
+    /// (`idealClkSlew`, the clocks' `set_clock_transition`, 0 without).
+    pub ideal_clock_slew: &'x [Option<[f32; 2]>],
+    /// Per vertex: `loadCap(pin, scene, max)` of a driver.
+    pub load_cap: &'x [f32],
+    /// The libraries in read order: an instance's LINK cell is the first one's of its name. The
+    /// network's ports (directions, functions, related power pins) and the cell leakage are the
+    /// link cell's; the power groups, the arcs' senses and the supply voltages the scene's.
+    pub link_libs: &'x [crate::liberty::Library],
+}
+
+/// `Power::findInstPowers`: per instance (`None` without a liberty cell), in instance order,
+/// `findInternalPower`, `findSwitchingPower`, then `findLeakagePower`, over the activities
+/// `ensure_activities` found on the same graph.
+pub fn inst_powers(g: &Graph<'_>, inp: &ActivityInputs<'_>, act: &Activities, pw: &PowerInputs<'_>) -> Result<Vec<Option<InstPower>>, String> {
+    let mut p = Prop::new(g, inp)?;
+    p.act = act.clone();
+    let mut out = Vec::with_capacity(g.netlist.insts.len());
+    for i in 0..g.netlist.insts.len() {
+        let Some(cell) = p.cell_of_inst(i) else {
+            out.push(None);
+            continue;
+        };
+        let link = pw.link_libs.iter().find_map(|l| l.cells.get(&cell.name)).unwrap_or(cell);
+        let mut r = InstPower::default();
+        p.find_internal_power(i, cell, link, pw, &mut r);
+        p.find_switching_power(i, link, pw, &mut r);
+        p.find_leakage_power(i, cell, link, pw, &mut r);
+        out.push(Some(r));
+    }
+    Ok(out)
+}
+
+fn is_any_output(d: Direction) -> bool {
+    matches!(d, Direction::Output | Direction::Tristate | Direction::Bidirect)
+}
+
+fn is_any_input(d: Direction) -> bool {
+    matches!(d, Direction::Input | Direction::Bidirect)
+}
+
+/// `findExprOutPort`: the first port the expression names (left before right) that is an output.
+fn find_expr_out_port<'c>(expr: &'c FuncExpr, cell: &Cell) -> Option<&'c str> {
+    match expr {
+        FuncExpr::Port(p) => cell.port(p).filter(|x| is_any_output(x.direction)).map(|_| p.as_str()),
+        FuncExpr::Not(e) => find_expr_out_port(e, cell),
+        FuncExpr::And(l, r) | FuncExpr::Or(l, r) | FuncExpr::Xor(l, r) => find_expr_out_port(l, cell).or_else(|| find_expr_out_port(r, cell)),
+        FuncExpr::One | FuncExpr::Zero => None,
+    }
+}
+
+fn has_port(expr: &FuncExpr, port: &str) -> bool {
+    match expr {
+        FuncExpr::Port(p) => p == port,
+        FuncExpr::Not(e) => has_port(e, port),
+        FuncExpr::And(l, r) | FuncExpr::Or(l, r) | FuncExpr::Xor(l, r) => has_port(l, port) || has_port(r, port),
+        FuncExpr::One | FuncExpr::Zero => false,
+    }
+}
+
+/// `InternalPowerModel::power`: the table at the axes it names (input transition, output load).
+fn internal_energy(model: Option<&crate::table::Table>, slew: f32, load_cap: f32) -> f32 {
+    let Some(t) = model else { return 0.0 };
+    let pick = |a: usize| match t.axes.get(a).map(|x| x.var) {
+        Some(crate::table::AxisVar::InputTransitionTime) => slew,
+        Some(crate::table::AxisVar::TotalOutputNetCapacitance) => load_cap,
+        _ => 0.0,
+    };
+    t.find_value(pick(0), pick(1), pick(2))
+}
+
+impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
+    /// The instance's pins in network order, one vertex each (a bidirect pin's first).
+    fn pins_of(&self, i: usize) -> Vec<usize> {
+        self.inst_pins[i].iter().copied().filter(|&v| self.pin_key[v] == v).collect()
+    }
+
+    fn port_of(&self, v: usize, cell: &'a Cell) -> Option<&'a crate::liberty::Port> {
+        self.g.vertices[v].port.as_deref().and_then(|p| cell.port(p))
+    }
+
+    fn pin_on(&self, i: usize, port: &str) -> Option<usize> {
+        self.inst_pins[i].iter().copied().find(|&v| self.g.vertices[v].port.as_deref() == Some(port))
+    }
+
+    /// `getSlew(vertex, rf, scene)`: an ideal clock pin's clock slew, else the max slew.
+    fn get_slew(&self, v: usize, rf: usize, pw: &PowerInputs<'_>) -> f32 {
+        match pw.ideal_clock_slew[v] {
+            Some(s) => s[rf],
+            None => self.g.slew[v][rf][crate::liberty::MAX],
+        }
+    }
+
+    fn eval_activity_on(&self, expr: &FuncExpr, i: usize) -> Activity {
+        eval_activity(expr, &InstView { p: self, inst: i })
+    }
+
+    /// `findInternalPower`: per pin with a (link) liberty port, an output's then an input's.
+    fn find_internal_power(&mut self, i: usize, cell: &'a Cell, link: &'a Cell, pw: &PowerInputs<'_>, r: &mut InstPower) {
+        for v in self.pins_of(i) {
+            let Some(port) = self.port_of(v, link) else { continue };
+            let out = is_any_output(port.direction);
+            let load_cap = if out { pw.load_cap[v] } else { 0.0 };
+            let activity = self.find_activity(v);
+            if out {
+                self.find_output_internal_power(i, cell, port, activity, load_cap, pw, r);
+            }
+            if is_any_input(port.direction) {
+                self.find_input_internal_power(i, v, cell, link, port, activity, load_cap, pw, r);
+            }
+        }
+    }
+
+    /// `findInputInternalPower`: each group on the port, its energy averaged over the
+    /// transitions × its `when` duty (the output's Boolean difference when the output's function
+    /// names the port) × the pin's density.
+    #[allow(clippy::too_many_arguments)]
+    fn find_input_internal_power(&mut self, i: usize, v: usize, cell: &'a Cell, link: &Cell, port: &crate::liberty::Port, activity: Activity, load_cap: f32, pw: &PowerInputs<'_>, r: &mut InstPower) {
+        let pwrs: Vec<&crate::liberty::InternalPower> = cell.internal_powers.iter().filter(|ip| ip.port == port.name).collect();
+        if pwrs.is_empty() {
+            return;
+        }
+        let mut internal = 0.0f32;
+        for pwr in pwrs {
+            let mut energy = 0.0f32;
+            let mut rf_count = 0;
+            for rf in [crate::liberty::RISE, crate::liberty::FALL] {
+                let slew = self.get_slew(v, rf, pw);
+                if slew < 1e30 {
+                    energy += internal_energy(pwr.models[rf].as_ref(), slew, load_cap);
+                    rf_count += 1;
+                }
+            }
+            if rf_count > 0 {
+                energy /= rf_count as f32;
+            }
+            let mut duty = 1.0f32;
+            if let Some(when) = pwr.when.as_deref().and_then(|w| FuncExpr::parse(w).ok()) {
+                // the scene port the `when` names, then the link cell's port of that name
+                match find_expr_out_port(&when, cell) {
+                    Some(out) => {
+                        if let Some(out_port) = link.port(out) {
+                            match out_port.function.as_deref().and_then(|f| FuncExpr::parse(f).ok()) {
+                                Some(func) if has_port(&func, &port.name) => duty = eval_diff_duty(&func, &port.name, &InstView { p: self, inst: i }),
+                                _ => duty = self.eval_activity_on(&when, i).duty,
+                            }
+                        }
+                    }
+                    None => duty = self.eval_activity_on(&when, i).duty,
+                }
+            }
+            internal += energy * duty * activity.density;
+        }
+        r.internal += internal;
+    }
+
+    /// `findInputDuty`: the related pin's Boolean-difference duty through the output's function
+    /// when it names the pin, else the `when` duty, else 0.5; 0 without a related pin.
+    fn find_input_duty(&self, i: usize, func: Option<&FuncExpr>, pwr: &crate::liberty::InternalPower) -> f32 {
+        let Some(from) = pwr.related.as_deref() else { return 0.0 };
+        if self.pin_on(i, from).is_none() {
+            return 0.0;
+        }
+        if let Some(f) = func.filter(|f| has_port(f, from)) {
+            return eval_diff_duty(f, from, &InstView { p: self, inst: i });
+        }
+        match pwr.when.as_deref().and_then(|w| FuncExpr::parse(w).ok()) {
+            Some(when) => self.eval_activity_on(&when, i).duty,
+            None => 0.5,
+        }
+    }
+
+    /// `findOutputInternalPower`: each group's energy (the related pin's slew on the transition
+    /// its unateness gives) weighted by its share of the related pins' density × duty for its pg
+    /// pin, × the output's density.
+    #[allow(clippy::too_many_arguments)]
+    fn find_output_internal_power(&mut self, i: usize, cell: &'a Cell, to_port: &crate::liberty::Port, to_activity: Activity, load_cap: f32, pw: &PowerInputs<'_>, r: &mut InstPower) {
+        let func = to_port.function.as_deref().and_then(|f| FuncExpr::parse(f).ok());
+        let pwrs: Vec<&crate::liberty::InternalPower> = cell.internal_powers.iter().filter(|ip| ip.port == to_port.name).collect();
+        // per related pg pin (none is a key of its own)
+        let mut pg_duty_sum: Vec<(Option<&str>, f32)> = Vec::new();
+        for pwr in &pwrs {
+            let Some(from) = pwr.related.as_deref() else { continue };
+            let from_density = self.pin_on(i, from).map_or(0.0, |fv| self.find_activity(fv).density);
+            let duty = self.find_input_duty(i, func.as_ref(), pwr);
+            let key = pwr.related_pg_pin.as_deref();
+            match pg_duty_sum.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, s)) => *s += from_density * duty,
+                None => pg_duty_sum.push((key, from_density * duty)),
+            }
+        }
+        let mut internal = 0.0f32;
+        for pwr in &pwrs {
+            let duty = self.find_input_duty(i, func.as_ref(), pwr);
+            let from_pin = pwr.related.as_deref().and_then(|f| self.pin_on(i, f));
+            let positive_unate = pwr.related.is_none() || pwr.positive_unate;
+            let mut energy = 0.0f32;
+            let mut rf_count = 0;
+            for to_rf in [crate::liberty::RISE, crate::liberty::FALL] {
+                let from_rf = if positive_unate { to_rf } else { 1 - to_rf };
+                let slew = from_pin.map_or(0.0, |fv| self.get_slew(self.pin_key[fv], from_rf, pw));
+                if slew < 1e30 {
+                    energy += internal_energy(pwr.models[to_rf].as_ref(), slew, load_cap);
+                    rf_count += 1;
+                }
+            }
+            if rf_count > 0 {
+                energy /= rf_count as f32;
+            }
+            let mut weight = 0.0f32;
+            if let Some(&(_, duty_sum)) = pg_duty_sum.iter().find(|(k, _)| *k == pwr.related_pg_pin.as_deref()) {
+                if duty_sum != 0.0 {
+                    if let Some(fv) = from_pin {
+                        let from_density = self.find_activity(fv).density;
+                        weight = from_density * duty / duty_sum;
+                    }
+                }
+            }
+            internal += weight * energy * to_activity.density;
+        }
+        r.internal += internal;
+    }
+
+    /// `findSwitchingPower`: each output pin's `0.5 × load × volt² × density`, in double.
+    fn find_switching_power(&mut self, i: usize, link: &'a Cell, pw: &PowerInputs<'_>, r: &mut InstPower) {
+        for v in self.pins_of(i) {
+            let Some(port) = self.port_of(v, link) else { continue };
+            if !is_any_output(port.direction) {
+                continue;
+            }
+            let load_cap = pw.load_cap[v];
+            let activity = self.find_activity(v);
+            let volt = self.port_voltage(link, port);
+            let switching = 0.5 * f64::from(load_cap) * f64::from(volt) * f64::from(volt) * f64::from(activity.density);
+            r.switching += switching as f32;
+        }
+    }
+
+    /// `portVoltage` / `pgPortVoltage`: the (link) port's related power pin's voltage name, in the
+    /// scene cell's library's `voltage_map`; else that library's default operating conditions'
+    /// voltage; else 0.
+    fn port_voltage(&self, link: &Cell, port: &crate::liberty::Port) -> f32 {
+        let lib = self.g.libs.iter().find(|l| l.cells.contains_key(&link.name));
+        if let (Some(lib), Some(pg)) = (lib, port.related_power_pin.as_deref()) {
+            if link.pg_pins.iter().any(|(n, _)| n == pg) {
+                if let Some(v) = link.pg_voltage_names.get(pg).and_then(|name| lib.supply_voltages.get(name)) {
+                    return *v;
+                }
+            }
+        }
+        lib.and_then(|l| l.default_op_voltage).unwrap_or(0.0)
+    }
+
+    /// `Sim::evalExpr(when, inst) == one`: the expression's diagram with the instance's constant
+    /// pins substituted is the constant one.
+    fn sim_is_one(&self, expr: &FuncExpr, i: usize, pw: &PowerInputs<'_>) -> bool {
+        let (mut b, mut f) = Bdd::of(expr);
+        for &v in &self.inst_pins[i] {
+            let Some(port) = self.g.vertices[v].port.as_deref() else { continue };
+            let Some(var) = b.var_index(port) else { continue };
+            if let Some(&value) = pw.constants.get(&self.g.vertices[v].name) {
+                f = b.restrict(f, var, value);
+            }
+        }
+        f == bdd::ONE
+    }
+
+    /// `findLeakagePower`: per related primary power pin (none first, then pg pin order), a
+    /// `when` true under the constants gives its leakage; otherwise the `when` groups weighted by
+    /// duty plus the cell leakage over the rest of the duty; an unconditional group only without
+    /// conditional ones. No group at all: the cell leakage.
+    fn find_leakage_power(&mut self, i: usize, cell: &'a Cell, link: &Cell, pw: &PowerInputs<'_>, r: &mut InstPower) {
+        #[derive(Default)]
+        struct Sum {
+            cond_exists: bool,
+            cond_leakage: f32,
+            cond_duty_sum: f32,
+            cond_true_exists: bool,
+            cond_true_leakage: f32,
+            uncond_exists: bool,
+            uncond_leakage: f32,
+        }
+        // keyed by the pg port: none, then the cell's pg pins in order
+        let rank = |pg: Option<&str>| pg.map_or(0, |n| 1 + cell.pg_pins.iter().position(|(p, _)| p == n).unwrap_or(usize::MAX - 1));
+        let mut sums: Vec<(usize, Sum)> = Vec::new();
+        for lp in &cell.leakage_groups {
+            let pg = lp.related_pg_pin.as_deref().filter(|n| cell.pg_pins.iter().any(|(p, _)| p == n));
+            if let Some(n) = pg {
+                if cell.pg_pins.iter().find(|(p, _)| p == n).is_none_or(|(_, t)| t != "primary_power") {
+                    continue;
+                }
+            }
+            let key = rank(pg);
+            let k = match sums.iter().position(|(r, _)| *r == key) {
+                Some(k) => k,
+                None => {
+                    sums.push((key, Sum::default()));
+                    sums.len() - 1
+                }
+            };
+            let leakage = lp.power;
+            match lp.when.as_deref().and_then(|w| FuncExpr::parse(w).ok()) {
+                Some(when) => {
+                    if self.sim_is_one(&when, i, pw) {
+                        sums[k].1.cond_true_leakage = leakage;
+                        sums[k].1.cond_true_exists = true;
+                    } else {
+                        let cond_duty = self.eval_activity_on(&when, i).duty;
+                        let sum = &mut sums[k].1;
+                        sum.cond_leakage += leakage * cond_duty;
+                        if leakage > 0.0 {
+                            sum.cond_duty_sum += cond_duty;
+                        }
+                        sum.cond_exists = true;
+                    }
+                }
+                None => {
+                    sums[k].1.uncond_leakage = leakage;
+                    sums[k].1.uncond_exists = true;
+                }
+            }
+        }
+        // `cell->leakagePower`: the LINK cell's, not the scene's (a corner read from another
+        // library keeps the link library's cell leakage)
+        let (cell_leakage, cell_leakage_exists) = (link.leakage_power.unwrap_or(0.0), link.leakage_power.is_some());
+        if sums.is_empty() {
+            r.leakage += cell_leakage;
+            return;
+        }
+        sums.sort_by_key(|(k, _)| *k);
+        for (_, sum) in &sums {
+            let mut leakage = 0.0f32;
+            if sum.cond_true_exists {
+                leakage = sum.cond_true_leakage;
+            } else if sum.cond_exists {
+                leakage = sum.cond_leakage;
+                if cell_leakage_exists {
+                    let duty = (1.0 - f64::from(sum.cond_duty_sum)) as f32;
+                    leakage += cell_leakage * duty;
+                }
+            } else if sum.uncond_exists {
+                leakage = sum.uncond_leakage;
+            }
+            r.leakage += leakage;
+        }
     }
 }
 

@@ -167,6 +167,9 @@ pub struct Search<'g, 'a> {
     /// `ClkNetwork::isClock`: the vertices the clocks reach from their sources over wires and
     /// combinational arcs.
     clk_network: Vec<bool>,
+    /// `Sdc::isLeafPinClock`: a clock's source pin — a port or any instance pin, both vertices of
+    /// a bidirect one.
+    clock_leaf: Vec<bool>,
     /// `GatedClk::isGatedClkEnable`: an enable pin, its gate's clock pin and whether the gate's
     /// active value is 1 (AND-like) or 0 (OR-like) — when the clock pin reaches a register clock
     /// pin (`hasDownstreamClkPin`).
@@ -511,7 +514,8 @@ impl<'g, 'a> Search<'g, 'a> {
         let sim = sim_edges(graph);
         let (latch_en, latch_data) = latch_enables(graph);
         let clk_network = clock_network(graph, sdc);
-        let mut search = Search { graph, sdc, paths: vec![Vec::new(); n], vertex_id, input_delay, output_delay, is_reg_clk, level, internal_from, internal_from_break, internal_to, internal_to_break, sim, latch_en, latch_data, clk_network, gated: HashMap::new() };
+        let clock_leaf = graph.vertices.iter().map(|v| sdc.clocks.iter().any(|c| !c.source.is_empty() && v.name == c.source)).collect();
+        let mut search = Search { graph, sdc, paths: vec![Vec::new(); n], vertex_id, input_delay, output_delay, is_reg_clk, level, internal_from, internal_from_break, internal_to, internal_to_break, sim, latch_en, latch_data, clk_network, clock_leaf, gated: HashMap::new() };
         search.gated = search.gated_clk_enables();
         search
     }
@@ -614,8 +618,10 @@ impl<'g, 'a> Search<'g, 'a> {
 
     /// `SearchThru::searchTo`: fanin paths are broken at a path delay's internal `-from` pin, and
     /// a constant is never entered (`SearchPred0::searchTo`).
+    /// `EvalPred::searchTo`: not a constant, not a clock's source pin (its arrival is the clock's
+    /// own) unless a path delay ends there, not a breaking path delay `-from` pin.
     fn search_to(&self, v: usize) -> bool {
-        !self.internal_from_break[v] && !self.graph.is_constant(v)
+        !self.internal_from_break[v] && !self.graph.is_constant(v) && !(self.clock_leaf[v] && !self.internal_to[v])
     }
 
     /// `SearchPred0::searchFrom`: nothing leaves a constant.
@@ -1014,9 +1020,8 @@ impl<'g, 'a> Search<'g, 'a> {
     /// and nothing sets it) — every other input port, UNCLOCKED at 0.
     fn seed_arrivals(&self, v: usize, bldr: &mut Bldr) {
         let name = &self.graph.vertices[v].name;
-        if !self.graph.is_port(v) {
-            return;
-        }
+        // `isLeafPinClock`: a clock seeds on its source pin wherever it is — a port or an
+        // instance pin; the input arrivals below seed on top ports only.
         let sources: Vec<usize> = self.sdc.clocks.iter().enumerate().filter(|(_, c)| !c.source.is_empty() && *name == c.source).map(|(k, _)| k).collect();
         if !sources.is_empty() {
             // `seedClkArrivals`: each clock on the pin; per min/max and transition, the edge of
@@ -1035,6 +1040,9 @@ impl<'g, 'a> Search<'g, 'a> {
                     }
                 }
             }
+        }
+        if !self.graph.is_port(v) {
+            return;
         }
         let delays: Vec<usize> = self.input_delay.get(name).map(|l| l.iter().copied().filter(|&d| self.sdc.input_delays[d].clock < self.sdc.clocks.len()).collect()).unwrap_or_default();
         if !delays.is_empty() {
@@ -1976,6 +1984,26 @@ mod tests {
     fn a_second_delay_on_the_same_clock_replaces_the_first() {
         let list = [PortDelay::uniform("a", 1.0), PortDelay { clock: 1, ..PortDelay::uniform("a", 2.0) }, PortDelay::uniform("a", 3.0)];
         assert_eq!(port_delays(&list)["a"], [2, 1]);
+    }
+
+    /// Rules (`ArrivalVisitor::seedArrivals` → `seedClkArrivals` on `isLeafPinClock`, any pin;
+    /// `EvalPred::searchTo` stops at a clock's leaf pin): a clock on an instance's output pin
+    /// launches there at its edge times, nothing from the pin's fanin arrives over it, and the
+    /// registers it drives read that clock.
+    #[test]
+    fn a_clock_on_an_instance_pin_seeds_there_and_blocks_its_fanin() {
+        timed_with(
+            |sdc| sdc.clocks[0].source = "b1/X".into(),
+            |s, v| {
+                let x = v("b1/X");
+                assert!(s.paths[x].iter().all(|p| p.tag.is_clock && p.tag.clk_edge.is_some()));
+                assert_eq!(path(s, x, RISE, true).arrival, 0.0);
+                assert_eq!(path(s, x, FALL, true).arrival, 0.5e-9);
+                assert_eq!(s.find_clk(v("f1/CLK")).map(|c| c.name.as_str()), Some("c"));
+                // the port `clk`, no longer a clock, arrives unclocked at b1/A and stops there
+                assert!(s.paths[v("b1/A")].iter().all(|p| !p.tag.is_clock));
+            },
+        );
     }
 
     /// Rule (`seedInputArrival1`): an input delay on a clock's own source port seeds no arrival

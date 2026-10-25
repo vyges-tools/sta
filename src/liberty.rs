@@ -108,6 +108,8 @@ pub struct Port {
     pub fanout_load: Option<f32>,
     /// `max_fanout`, unscaled, when set.
     pub max_fanout: Option<f32>,
+    /// `related_power_pin`: the pg pin whose voltage its switching power is at.
+    pub related_power_pin: Option<String>,
     /// `three_state` (the tristate enable function), as text.
     pub three_state: Option<String>,
     /// `clock_gate_clock_pin : true` (`isClockGateClock`).
@@ -184,6 +186,40 @@ pub struct Cell {
     /// Each `leakage_power` group's `value` × the power scale, in order (groups without one are
     /// skipped, as the reference only warns).
     pub leakage_powers: Vec<f32>,
+    /// The same groups with their `related_pg_pin` and `when` (`readLeakageGrouops`).
+    pub leakage_groups: Vec<LeakagePower>,
+    /// `pg_pin` → its `voltage_name`.
+    pub pg_voltage_names: BTreeMap<String, String>,
+    /// `internal_power` groups (`readInternalPowerGroups`), in read order: per port group (after
+    /// its timing), per port it names, per group, one per `related_pin` (or one without).
+    pub internal_powers: Vec<InternalPower>,
+    /// Per arc set (parallel to `arc_sets`): its timing group's `timing_sense` as written
+    /// (`TimingArcSet::sense` is the attribute, unknown without one — an inferred sense makes
+    /// arcs but is not stored).
+    pub arc_set_senses: Vec<Option<String>>,
+}
+
+/// A `leakage_power` group.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeakagePower {
+    pub related_pg_pin: Option<String>,
+    pub when: Option<String>,
+    /// `value` × the power scale.
+    pub power: f32,
+}
+
+/// An `internal_power` group on `port`, from `related` (none: an input's own).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InternalPower {
+    pub port: String,
+    pub related: Option<String>,
+    pub related_pg_pin: Option<String>,
+    pub when: Option<String>,
+    /// Per `[rise, fall]`: `rise_power` / `fall_power`, or `power` for both; × the energy scale.
+    pub models: [Option<Table>; 2],
+    /// `isPositiveUnate(cell, related, port)`: the first arc set related → port is positive or
+    /// non-unate; true without one (an unknown sense is not).
+    pub positive_unate: bool,
 }
 
 impl Cell {
@@ -366,6 +402,14 @@ pub struct Library {
     pub default_max_fanout: Option<f32>,
     /// `lu_table_template`s: each axis's variable and (scaled) values.
     pub templates: BTreeMap<String, Vec<Axis>>,
+    /// `power_lut_template`s, likewise.
+    pub power_templates: BTreeMap<String, Vec<Axis>>,
+    /// `voltage_unit` (default 1 V).
+    pub volt_scale: f32,
+    /// `voltage_map (name, volts)`, unscaled (`addSupplyVoltage`; a repeated name keeps the last).
+    pub supply_voltages: BTreeMap<String, f32>,
+    /// The `default_operating_conditions`' `voltage` (0 when unset there), when that group exists.
+    pub default_op_voltage: Option<f32>,
     /// Library-level bus types (`type` groups): name -> (bit_from, bit_to).
     pub bus_types: BTreeMap<String, (i32, i32)>,
     pub cells: BTreeMap<String, Cell>,
@@ -405,7 +449,22 @@ fn unit_scale(units: &str, suffix: &str) -> f32 {
 impl Library {
     /// Read a parsed `library` group.
     pub fn read(g: &Group) -> Result<Library, String> {
-        let mut lib = Library { name: g.name().unwrap_or_default(), time_scale: 1e-9, cap_scale: 1e-12, power_scale: 1.0, ..Default::default() };
+        let mut lib = Library { name: g.name().unwrap_or_default(), time_scale: 1e-9, cap_scale: 1e-12, power_scale: 1.0, volt_scale: 1.0, ..Default::default() };
+        if let Some(t) = g.attr_text("voltage_unit") {
+            lib.volt_scale = unit_scale(&t, "V");
+        }
+        for v in g.complex.iter().filter(|(n, _)| n == "voltage_map").map(|(_, v)| v) {
+            if let [name, volts] = v.as_slice() {
+                if let Some(volts) = volts.float() {
+                    lib.supply_voltages.insert(name.text(), volts);
+                }
+            }
+        }
+        if let Some(name) = g.attr_text("default_operating_conditions").filter(|n| !n.is_empty()) {
+            if let Some(oc) = g.groups_of("operating_conditions").find(|oc| oc.name().as_deref() == Some(name.as_str())) {
+                lib.default_op_voltage = Some(oc.attr_float("voltage").unwrap_or(0.0));
+            }
+        }
         if let Some(t) = g.attr_text("leakage_power_unit") {
             lib.power_scale = unit_scale(&t, "W");
         }
@@ -443,7 +502,8 @@ impl Library {
                 }
             }
         }
-        for tg in g.groups_of("lu_table_template") {
+        for (kind, power) in [("lu_table_template", false), ("power_lut_template", true)] {
+        for tg in g.groups_of(kind) {
             let Some(name) = tg.name() else { continue };
             let mut axes = Vec::new();
             for k in 1..=3 {
@@ -453,7 +513,8 @@ impl Library {
                 let scale = if var.is_capacitance() { lib.cap_scale } else { lib.time_scale };
                 axes.push(Axis { var, values: values.into_iter().map(|x| x * scale).collect() });
             }
-            lib.templates.insert(name, axes);
+            if power { lib.power_templates.insert(name, axes) } else { lib.templates.insert(name, axes) };
+        }
         }
         if let Some(style) = g.attr_text("bus_naming_style") {
             if style != "%s[%d]" {
@@ -504,9 +565,16 @@ impl Library {
         }
         cell.leakage_power = cg.attr_float("cell_leakage_power").map(|v| v * self.power_scale);
         cell.leakage_powers = cg.groups_of("leakage_power").filter_map(|lg| lg.attr_float("value")).map(|v| v * self.power_scale).collect();
+        cell.leakage_groups = cg
+            .groups_of("leakage_power")
+            .filter_map(|lg| lg.attr_float("value").map(|v| LeakagePower { related_pg_pin: lg.attr_text("related_pg_pin"), when: lg.attr_text("when"), power: v * self.power_scale }))
+            .collect();
         for pg in cg.groups_of("pg_pin") {
             if let Some(name) = pg.name() {
-                cell.pg_pins.push((name, pg.attr_text("pg_type").unwrap_or_default()));
+                cell.pg_pins.push((name.clone(), pg.attr_text("pg_type").unwrap_or_default()));
+                if let Some(v) = pg.attr_text("voltage_name").filter(|v| !v.is_empty()) {
+                    cell.pg_voltage_names.insert(name, v);
+                }
             }
         }
         if cg.groups.iter().any(|g| g.kind == "bundle") {
@@ -636,14 +704,48 @@ impl Library {
                     if pins.is_empty() && bus_pins.is_empty() {
                         for t in &to_bits {
                             let function = cell.ports.iter().find(|p| &p.name == t).and_then(|p| p.function.clone());
-                            cell.arc_sets.extend(self.read_timing(&cell, t, function.as_deref(), tg, &[])?);
+                            let sets = self.read_timing(&cell, t, function.as_deref(), tg, &[])?;
+                            cell.arc_set_senses.extend(sets.iter().map(|_| tg.attr_text("timing_sense")));
+                            cell.arc_sets.extend(sets);
                         }
                     }
                     for (f, t) in pairs {
                         let function = cell.ports.iter().find(|p| p.name == t).and_then(|p| p.function.clone());
                         let sets = self.read_timing(&cell, &t, function.as_deref(), tg, std::slice::from_ref(&f))?;
+                        cell.arc_set_senses.extend(sets.iter().map(|_| tg.attr_text("timing_sense")));
                         cell.arc_sets.extend(sets);
                     }
+                }
+            }
+            // `readInternalPowerGroups` (the group's timing first): per port, per group.
+            for r in refs {
+                // a bus group's are its bus port's, which no instance pin is
+                let PortRef::Pin(port) = r else { continue };
+                for ig in pg.groups_of("internal_power") {
+                    let mut models: [Option<Table>; 2] = [None, None];
+                    for (rf, word) in [(RISE, "rise_power"), (FALL, "fall_power")] {
+                        if let Some(t) = ig.groups_of(word).next() {
+                            models[rf] = Some(self.read_table_in(t, self.energy_scale(), &self.power_templates)?);
+                        }
+                    }
+                    if let Some(t) = ig.groups_of("power").next() {
+                        let table = self.read_table_in(t, self.energy_scale(), &self.power_templates)?;
+                        models = [Some(table.clone()), Some(table)];
+                    }
+                    let related: Vec<String> = ig.attr_text("related_pin").map(|r| r.split_whitespace().map(String::from).collect()).unwrap_or_default();
+                    let make = |related: Option<String>| InternalPower { port: port.clone(), related, related_pg_pin: ig.attr_text("related_pg_pin"), when: ig.attr_text("when"), models: models.clone(), positive_unate: true };
+                    if related.is_empty() {
+                        cell.internal_powers.push(make(None));
+                    } else {
+                        cell.internal_powers.extend(related.into_iter().map(|r| make(Some(r))));
+                    }
+                }
+            }
+        }
+        for ip in &mut cell.internal_powers {
+            if let Some(from) = &ip.related {
+                if let Some(k) = cell.arc_sets.iter().position(|a| &a.from == from && a.to == ip.port) {
+                    ip.positive_unate = matches!(cell.arc_set_senses[k].as_deref(), Some("positive_unate" | "non_unate"));
                 }
             }
         }
@@ -718,6 +820,7 @@ impl Library {
         let max_capacitance = pg.attr_float("max_capacitance").map(|v| v * self.cap_scale);
         let fanout_load = pg.attr_float("fanout_load");
         let max_fanout = pg.attr_float("max_fanout");
+        let related_power_pin = pg.attr_text("related_power_pin");
         let three_state = pg.attr_text("three_state");
         let is_clock_gate_clock = pg.attr_text("clock_gate_clock_pin").is_some_and(|c| c.eq_ignore_ascii_case("true"));
         let flag = |name: &str| pg.attr_text(name).is_some_and(|v| v.eq_ignore_ascii_case("true"));
@@ -730,6 +833,7 @@ impl Library {
             direction,
             is_clock,
             capacitance,
+            related_power_pin,
             function,
             max_transition,
             max_capacitance,
@@ -959,8 +1063,19 @@ impl Library {
     /// A table: the template's axes, each overridden by the table's own `index_N`
     /// (scaled by the axis variable's unit); values row by row, `× scale`.
     fn read_table(&self, g: &Group, scale: f32) -> Result<Table, String> {
+        self.read_table_in(g, scale, &self.templates)
+    }
+
+    /// `energyScale`: volt² × cap, in float.
+    fn energy_scale(&self) -> f32 {
+        self.volt_scale * self.volt_scale * self.cap_scale
+    }
+
+    /// A table over one of the library's template sets (`lu_table_template`,
+    /// `power_lut_template`).
+    fn read_table_in(&self, g: &Group, scale: f32, templates: &BTreeMap<String, Vec<Axis>>) -> Result<Table, String> {
         let tmpl = g.name().unwrap_or_default();
-        let template = if tmpl == "scalar" { Some(Vec::new()) } else { self.templates.get(&tmpl).cloned() };
+        let template = if tmpl == "scalar" { Some(Vec::new()) } else { templates.get(&tmpl).cloned() };
         let template = template.ok_or_else(|| format!("table template {tmpl} not found"))?;
         let mut axes = Vec::new();
         for (k, ax) in template.iter().enumerate() {
