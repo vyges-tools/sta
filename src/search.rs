@@ -652,6 +652,33 @@ impl<'g, 'a> Search<'g, 'a> {
         }
     }
 
+    /// `SearchPred0::searchFrom` / `searchTo` as the resizer's cone search asks them: not a
+    /// constant (no `set_disable_timing` pin is modelled). Unlike the arrival search's `searchTo`,
+    /// no clock source or path delay pin is excluded.
+    pub fn pred0_from(&self, v: usize) -> bool {
+        !self.graph.is_constant(v)
+    }
+
+    pub fn pred0_to(&self, v: usize) -> bool {
+        !self.graph.is_constant(v)
+    }
+
+    /// `SearchPredCombLogic::searchThru` (the resizer's fan-in / fan-out cones): `SearchPred1` —
+    /// `SearchPred0::searchThru` (not a check, not disabled under the constants, not of sense none,
+    /// not a preset/clear arc, not a bidirect instance path while those are off by default) and no
+    /// disabled loop (a levelized graph has none) — and not a register clock-to-Q or latch D-to-Q
+    /// edge, so a cone stops at sequential cells.
+    pub fn comb_logic_thru(&self, e: usize) -> bool {
+        self.search_thru(e)
+            && !self.graph.bidirect_inst_paths.contains(&e)
+            && !matches!(self.role(e), Some(Role::RegClkToQ) | Some(Role::LatchDtoQ))
+    }
+
+    /// Whether a gate edge into `v` is a register clock-to-Q arc (the resizer's `isRegOutput`).
+    pub fn is_reg_output(&self, v: usize) -> bool {
+        self.graph.in_edges[v].iter().any(|&e| self.role(e) == Some(Role::RegClkToQ))
+    }
+
     /// `hasFanout(vertex, search_thru_)`: a non-check edge to a vertex searched to.
     pub fn has_fanout(&self, v: usize) -> bool {
         self.search_from(v) && self.graph.out_edges[v].iter().any(|&e| self.search_thru(e) && self.search_to(self.graph.edges[e].to))
@@ -694,6 +721,12 @@ impl<'g, 'a> Search<'g, 'a> {
     /// `ClkNetwork::isClock`: the vertex is on a clock's network.
     pub fn is_clock(&self, v: usize) -> bool {
         self.clk_network[v]
+    }
+
+    /// Whether a CLOCK arrival reaches `v` (`Search::clocks(vertex)` is not empty): a data path's
+    /// tag carries its launching clock too, and does not count.
+    pub fn has_clock_arrival(&self, v: usize) -> bool {
+        self.paths[v].iter().any(|p| p.tag.is_clock)
     }
 
     /// `Power::findClk`: the fastest clock among the vertex's arrivals — strictly faster, so of
@@ -1919,6 +1952,28 @@ mod tests {
         let prev = q.prev.expect("from the clock pin");
         assert_eq!((prev.vertex, prev.tag.segment_start, q.tag.segment_start, q.tag.clk_edge), (v("f1/CLK"), true, false, None));
         assert_eq!(q.arrival, 0.0 + g.delay[prev.edge][prev.arc][MAX]);
+    }
+
+    #[test]
+    fn a_comb_logic_cone_stops_at_registers() {
+        // `SearchPredCombLogic`: a cell arc is searched through, a register's clock-to-Q is not,
+        // and neither is a timing check.
+        timed(|s, v| {
+            let edge = |a: &str, b: &str| (0..s.graph.edges.len()).find(|&e| s.graph.edges[e].from == v(a) && s.graph.edges[e].to == v(b)).unwrap();
+            assert!(s.comb_logic_thru(edge("b1/A", "b1/X")));
+            assert!(s.search_thru(edge("f1/CLK", "f1/Q")), "the arrival search goes through it");
+            assert!(!s.comb_logic_thru(edge("f1/CLK", "f1/Q")));
+            assert!(!s.comb_logic_thru(edge("f1/CLK", "f1/D")));
+            assert!(s.is_reg_output(v("f1/Q")) && !s.is_reg_output(v("b1/X")) && !s.is_reg_output(v("out")));
+        });
+    }
+
+    #[test]
+    fn only_a_clock_tag_is_a_clock_arrival() {
+        // A register clock pin a clock reaches has a clock arrival; its Q's data tag names the
+        // launching clock but is not one; with no clock, the CLK pin's segment start is not one.
+        timed(|s, v| assert!(s.has_clock_arrival(v("f1/CLK")) && !s.has_clock_arrival(v("f1/Q"))));
+        timed_with(|sdc| sdc.clocks.clear(), |s, v| assert!(!s.has_clock_arrival(v("f1/CLK")) && !s.paths[v("f1/CLK")].is_empty()));
     }
 
     /// A second, virtual clock `v` (rising 0.3 ns into the same 1 ns period).
