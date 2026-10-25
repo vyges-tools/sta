@@ -111,6 +111,9 @@ pub struct Port {
     pub three_state: Option<String>,
     /// `clock_gate_clock_pin : true` (`isClockGateClock`).
     pub is_clock_gate_clock: bool,
+    /// `clock_gate_enable_pin` / `clock_gate_out_pin` (`isClockGateEnable`, `isClockGateOut`).
+    pub is_clock_gate_enable: bool,
+    pub is_clock_gate_out: bool,
     /// `isolation_cell_data_pin` / `isolation_cell_enable_pin` (`isolationCellData`,
     /// `isolationCellEnable`): `true`/`false` compared case-insensitively, false when unset.
     pub is_isolation_cell_data: bool,
@@ -717,6 +720,8 @@ impl Library {
         let three_state = pg.attr_text("three_state");
         let is_clock_gate_clock = pg.attr_text("clock_gate_clock_pin").is_some_and(|c| c.eq_ignore_ascii_case("true"));
         let flag = |name: &str| pg.attr_text(name).is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        let is_clock_gate_enable = flag("clock_gate_enable_pin");
+        let is_clock_gate_out = flag("clock_gate_out_pin");
         let is_isolation_cell_data = flag("isolation_cell_data_pin");
         let is_isolation_cell_enable = flag("isolation_cell_enable_pin");
         Port {
@@ -731,6 +736,8 @@ impl Library {
             max_fanout,
             three_state,
             is_clock_gate_clock,
+            is_clock_gate_enable,
+            is_clock_gate_out,
             is_isolation_cell_data,
             is_isolation_cell_enable,
             scan_signal_type: ScanSignalType::None,

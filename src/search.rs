@@ -685,6 +685,26 @@ impl<'g, 'a> Search<'g, 'a> {
         self.internal_to_break[v]
     }
 
+    /// `ClkNetwork::isClock`: the vertex is on a clock's network.
+    pub fn is_clock(&self, v: usize) -> bool {
+        self.clk_network[v]
+    }
+
+    /// `Power::findClk`: the fastest clock among the vertex's arrivals — strictly faster, so of
+    /// equal periods the first path's clock.
+    pub fn find_clk(&self, v: usize) -> Option<&crate::sdc::Clock> {
+        let mut clk: Option<&crate::sdc::Clock> = None;
+        for p in &self.paths[v] {
+            if let Some(e) = p.tag.clk_edge {
+                let c = self.edge_clock(e);
+                if clk.is_none_or(|k| c.period < k.period) {
+                    clk = Some(c);
+                }
+            }
+        }
+        clk
+    }
+
     /// The clock of clock edge `e` (`ClockEdge::index`: clock × 2 + transition).
     pub fn edge_clock(&self, e: usize) -> &crate::sdc::Clock {
         &self.sdc.clocks[e / 2]
