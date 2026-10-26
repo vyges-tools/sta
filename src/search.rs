@@ -868,6 +868,32 @@ impl<'g, 'a> Search<'g, 'a> {
         self.graph.delay[e][arc][mm]
     }
 
+    /// `Graph::arcDelay`: edge `e`'s delay on arc `arc` (an index into its arc set) for min/max `mm`.
+    pub fn edge_arc_delay(&self, e: usize, arc: usize, mm: usize) -> f32 {
+        self.arc_delay(e, arc, mm)
+    }
+
+    /// `Search::thruTag`: the tag a path tagged `from` takes through edge `e` to transition
+    /// `to_rf`, as a DATA path — `mutateTag` with the clock info kept, `to_is_clk` and
+    /// `to_is_segment_start` false and no input delay (so a clock tag comes out a data tag on the
+    /// same clock). No search predicate is applied (the caller walks the edges it wants). The
+    /// reference's null (a completed false path or loop) cannot arise: neither is modelled here.
+    pub fn thru_tag(&self, from: &Tag, e: usize, to_rf: usize) -> Option<Tag> {
+        let edge = &self.graph.edges[e];
+        let states = self.mutate_states(from.states, edge.from, edge.to, from.mm);
+        Some(Tag { rf: to_rf, states, is_clock: false, segment_start: false, ..*from })
+    }
+
+    /// `Path::vertexPath(vertex, tag)`: the path of `v` with exactly this tag.
+    pub fn vertex_path(&self, v: usize, tag: &Tag) -> Option<&Path> {
+        self.paths[v].iter().find(|p| p.tag == *tag)
+    }
+
+    /// The arcs of edge `e` from transition `from_rf`, in arc order: (arc index, to transition).
+    pub fn edge_arcs_from(&self, e: usize, from_rf: usize) -> Vec<(usize, usize)> {
+        self.arcs_from(e, from_rf).into_iter().map(|a| (a.index, a.to_rf)).collect()
+    }
+
     /// For the roles this subset has: the tag a path takes through
     /// one arc, the arc's delay, and the arrival it arrives with.
     pub(crate) fn visit_from_path(&self, from_v: usize, from: &Path, e: usize, arc: &ArcRef) -> Option<(Tag, f32, f32)> {
@@ -1955,6 +1981,45 @@ mod tests {
                 assert_eq!(path(s, v("f1/Q"), RISE, false).tag.crpr, None);
             },
         );
+    }
+
+    /// Rule (`Search::thruTag` is the tag data propagation itself takes): through every
+    /// combinational or wire arc out of a data path, the tag `thru_tag` gives is the one the arrival
+    /// search built, and the path at the far vertex is found by it (`Path::vertexPath`).
+    #[test]
+    fn thru_tag_is_the_propagated_data_tag() {
+        timed(|s, _| {
+            let mut checked = 0;
+            for v in 0..s.paths.len() {
+                for from in s.paths[v].iter().filter(|p| !p.tag.is_clock) {
+                    for &e in &s.graph.out_edges[v] {
+                        if !matches!(s.role(e), None | Some(Role::Combinational)) {
+                            continue;
+                        }
+                        for (arc, to_rf) in s.edge_arcs_from(e, from.tag.rf) {
+                            let Some((tag, _, _)) = s.visit_from_path(v, from, e, &ArcRef { index: arc, to_rf }) else { continue };
+                            assert_eq!(s.thru_tag(&from.tag, e, to_rf), Some(tag));
+                            assert!(s.vertex_path(s.graph.edges[e].to, &tag).is_some());
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+            assert!(checked > 0);
+        });
+    }
+
+    /// Rule: a CLOCK tag through `thru_tag` comes out a data tag on the same clock edge — not the
+    /// clock path's own tag, so no clock-network path is found by it.
+    #[test]
+    fn thru_tag_of_a_clock_tag_is_data() {
+        timed(|s, v| {
+            let ck = path(s, v("b1/A"), RISE, true);
+            let e = s.graph.out_edges[v("b1/A")][0];
+            let t = s.thru_tag(&ck.tag, e, RISE).unwrap();
+            assert!(!t.is_clock && t.clk_edge == ck.tag.clk_edge);
+            assert!(s.vertex_path(v("b1/X"), &t).is_none());
+        });
     }
 
     /// Arrivals are float sums along the path: clock edge + buffer + clock-to-Q; an input's is
