@@ -712,7 +712,8 @@ impl<'a> Graph<'a> {
         for (n, net) in netlist.nets.iter().enumerate().filter(|_| whole) {
             // `makeWireEdgesFromPin`: every driver to every load of the net but itself; a
             // bidirect pin is both (its driver vertex drives, its load vertex loads).
-            let vs: Vec<usize> = net.pins.iter().filter_map(|c| index.get(&netlist.pin_name(c)).copied()).flat_map(pin_vertices).collect();
+            let mut buf = String::new();
+            let vs: Vec<usize> = net.pins.iter().filter_map(|c| index.get(netlist.pin_name_into(c, &mut buf)).copied()).flat_map(pin_vertices).collect();
             for &v in &vs {
                 vertex_net[v] = Some(n);
             }
@@ -752,7 +753,8 @@ impl<'a> Graph<'a> {
             }
         }
         for (n, net) in netlist.nets.iter().enumerate().filter(|_| !whole) {
-            let vs: Vec<usize> = net.pins.iter().filter_map(|c| index.get(&netlist.pin_name(c)).copied()).collect();
+            let mut buf = String::new();
+            let vs: Vec<usize> = net.pins.iter().filter_map(|c| index.get(netlist.pin_name_into(c, &mut buf)).copied()).collect();
             for &v in &vs {
                 vertex_net[v] = Some(n);
             }
@@ -1050,8 +1052,9 @@ impl<'a> Graph<'a> {
     fn net_pin_cap(&self, drvr: usize, rf: usize, mm: usize, index: &HashMap<String, usize>) -> f32 {
         let Some(n) = self.vertex_net[drvr] else { return self.pin_cap(drvr, rf, mm) };
         let mut sum = 0.0f32;
+        let mut buf = String::new();
         for c in &self.netlist.nets[n].pins {
-            if let Some(&v) = index.get(&self.netlist.pin_name(c)) {
+            if let Some(&v) = index.get(self.netlist.pin_name_into(c, &mut buf)) {
                 sum += self.pin_cap(v, rf, mm);
             }
         }
