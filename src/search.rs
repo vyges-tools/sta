@@ -110,6 +110,22 @@ pub(crate) struct ArcRef {
     pub(crate) to_rf: usize,
 }
 
+/// `Search::arrivalsChanged`: no stored paths — changed when there are new ones; otherwise
+/// changed unless the tags are the same and every path keeps its arrival (fuzzy equal) and the
+/// fanin path, edge and arc it came from.
+fn arrivals_changed(old: &[Path], new: &[Path]) -> bool {
+    if old.is_empty() {
+        return !new.is_empty();
+    }
+    if old.len() != new.len() {
+        return true;
+    }
+    old.iter().any(|p1| match new.iter().find(|p2| p2.tag == p1.tag) {
+        None => true,
+        Some(p2) => !crate::fuzzy::equal(p1.arrival, p2.arrival) || p1.prev != p2.prev,
+    })
+}
+
 /// Paths keyed by tag, in insertion order until sorted.
 #[derive(Default)]
 struct Bldr {
@@ -1036,17 +1052,59 @@ impl<'g, 'a> Search<'g, 'a> {
         Ok(())
     }
 
-    /// Every vertex in level order.
+    /// `Search::findAllArrivals(thru_latches)`: a pass over the vertices in level order, then the
+    /// latch outputs it postponed, again while any was postponed.
+    ///
+    /// 🔑 Levelization leaves out latch D->Q ([`Graph::levelize_thru`]), so a latch output is not
+    /// timed in the pass (`ArrivalVisitor::visit` postpones it); after the pass each postponed
+    /// output is visited with its D->Q fanin, in vertex id order (`VertexSet`). A later pass
+    /// visits only what a change reached: the fanout of a vertex whose arrivals changed
+    /// (`arrivalsChanged`), and a latch data pin that changed postpones its latch outputs again
+    /// (`postponeLatchDataOutputs`). Passes stop when nothing is postponed.
     pub fn find_arrivals(&mut self) -> Result<(), String> {
-        for v in self.graph.topo_order()? {
-            self.arrival_visit(v);
+        let order = self.graph.topo_order()?;
+        let mut queued = vec![true; self.graph.vertices.len()];
+        let mut pending: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        loop {
+            for &v in &order {
+                if !std::mem::take(&mut queued[v]) {
+                    continue;
+                }
+                if self.is_latch_output(v) {
+                    pending.insert(v);
+                    continue;
+                }
+                self.arrival_pass_visit(v, &mut queued, &mut pending);
+            }
+            if pending.is_empty() {
+                return Ok(());
+            }
+            let mut postponed: Vec<usize> = std::mem::take(&mut pending).into_iter().collect();
+            postponed.sort_by_key(|&v| self.vertex_id[v]);
+            for v in postponed {
+                self.arrival_pass_visit(v, &mut queued, &mut pending);
+            }
         }
-        Ok(())
     }
 
-    /// One vertex's arrivals.
-    fn arrival_visit(&mut self, v: usize) {
-        self.paths[v] = self.arrival_paths(v);
+    /// `ArrivalVisitor::visit(vertex, with_latch_edges)` in a pass: the new paths stored; when they
+    /// changed, the fanout queued for the pass (not across a check or a latch D->Q edge), and a
+    /// latch data pin's latch outputs postponed.
+    fn arrival_pass_visit(&mut self, v: usize, queued: &mut [bool], pending: &mut std::collections::BTreeSet<usize>) {
+        let new = self.arrival_paths(v);
+        let changed = arrivals_changed(&self.paths[v], &new);
+        self.paths[v] = new;
+        if !changed {
+            return;
+        }
+        if self.latch_data[v] {
+            pending.extend(self.latch_outputs_of(v));
+        }
+        for &e in &self.graph.out_edges[v] {
+            if !self.is_check(e) && self.role(e) != Some(Role::LatchDtoQ) {
+                queued[self.graph.edges[e].to] = true;
+            }
+        }
     }
 
     /// The paths a visit of `v` builds from its fanin's paths as they stand (`ArrivalVisitor`:
@@ -1822,6 +1880,74 @@ mod tests {
 
     fn path(s: &Search, v: usize, rf: usize, is_clock: bool) -> Path {
         *s.paths[v].iter().find(|p| p.tag.rf == rf && p.tag.mm == MAX && p.tag.is_clock == is_clock).unwrap()
+    }
+
+    /// A clock-gate loop through a latch: f1's Q is the latch's D, the latch (enabled by the clock)
+    /// gates the clock through an and2, and the gated clock clocks f1 again; f2 captures the latch
+    /// on the clock. In the graph that is a loop, closed only by the latch D->Q edge.
+    const LIB_LATCH: &str = include_str!("../tests/data/latch-loop.lib");
+
+    /// in -> f1/D; gclk -> f1/CLK; f1/Q -> l1/D; clk -> l1/G, g1/A, f2/CLK; l1/Q -> g1/B, f2/D;
+    /// g1/X = gclk; f2/Q -> out. Period 1 ns, propagated, io 0.2 ns.
+    fn latch_loop() -> (Vec<Library>, Netlist, Sdc) {
+        let libs = vec![Library::read(&crate::liberty_parse::parse(LIB_LATCH).unwrap()).unwrap()];
+        let i = |k: usize, p: &str| Conn::Inst(k, p.into());
+        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins }.into();
+        let netlist = Netlist {
+            insts: vec![crate::netlist::inst("f1", "dff"), crate::netlist::inst("l1", "lat"), crate::netlist::inst("g1", "and2"), crate::netlist::inst("f2", "dff")],
+            ports: vec![("clk".into(), PortDir::Input), ("in".into(), PortDir::Input), ("out".into(), PortDir::Output)],
+            nets: vec![
+                net("clk", vec![Conn::Port(0), i(1, "G"), i(2, "A"), i(3, "CLK")]),
+                net("in", vec![Conn::Port(1), i(0, "D")]),
+                net("q1", vec![i(0, "Q"), i(1, "D")]),
+                net("lq", vec![i(1, "Q"), i(2, "B"), i(3, "D")]),
+                net("gclk", vec![i(2, "X"), i(0, "CLK")]),
+                net("out", vec![i(3, "Q"), Conn::Port(2)]),
+            ],
+        };
+        let sdc = Sdc {
+            clocks: vec![Clock::new("c", 1e-9, "clk", true)],
+            input_delays: vec![PortDelay::uniform("in", 0.2e-9)],
+            output_delays: vec![PortDelay::uniform("out", 0.2e-9)],
+            path_delays: Vec::new(),
+        };
+        (libs, netlist, sdc)
+    }
+
+    /// Rules (`Levelize::searchThru`; `Search::findAllArrivals`): levelization leaves out latch
+    /// D->Q, so a loop closed only by one levelizes; the latch output is postponed out of the pass
+    /// and timed after it with its D->Q fanin, and its fanout again in the next pass. Every value
+    /// is the reference's on this design (`instruments/sta/latch-loop`, `get_property
+    /// arrival_{max,min}_{rise,fall}` and `slack_max`): the gated clock carries the latch's data
+    /// path into f1/CLK (0.71 = 0.6 + 0.11), the latch borrows to a zero slack at its D.
+    /// ⚠️ Levelization is witnessed (with D->Q levelized this design is refused); postponing the
+    /// output out of the FIRST pass is not — timed early from its enable alone it is re-timed once
+    /// its D changes, and the arrivals converge to the same values here.
+    #[test]
+    fn a_loop_through_a_latch_is_timed_by_latch_passes() {
+        let (libs, netlist, sdc) = latch_loop();
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        g.topo_order().expect("a loop closed by a latch D->Q edge levelizes");
+        g.find_delays(&HashMap::new(), None).unwrap();
+        let mut s = Search::in_graph_order(&g, &sdc);
+        s.find_arrivals().unwrap();
+        s.find_requireds().unwrap();
+        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        let ns = |x: f32| (x * 1e9 * 1e4).round() / 1e4;
+        for (pin, want) in [
+            ("f1/CLK", [0.71, 0.79, 0.10, 0.39]),
+            ("f1/Q", [0.40, 0.45, 0.40, 0.45]),
+            ("l1/D", [0.40, 0.45, 0.40, 0.45]),
+            ("l1/G", [0.00, 0.50, 0.00, 0.50]),
+            ("l1/Q", [0.60, 0.66, 0.25, 0.26]),
+            ("g1/X", [0.71, 0.79, 0.10, 0.39]),
+            ("f2/D", [0.60, 0.66, 0.25, 0.26]),
+        ] {
+            let got = [s.arrival_rf(v(pin), RISE, MAX), s.arrival_rf(v(pin), FALL, MAX), s.arrival_rf(v(pin), RISE, MIN), s.arrival_rf(v(pin), FALL, MIN)].map(ns);
+            assert_eq!(got, want, "{pin}: arrival max rise/fall, min rise/fall");
+        }
+        assert_eq!(ns(s.slack_of(v("l1/D"), MAX, None)), 0.0, "the latch borrows to zero");
+        assert_eq!(ns(s.slack_of(v("f2/D"), MAX, None)), 0.28);
     }
 
     /// A register reset asynchronously: `RESET_B` with a rising recovery check and the clear arc on

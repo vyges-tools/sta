@@ -836,12 +836,7 @@ impl<'a> Graph<'a> {
     /// root reaches is 0. Levels are in steps of 1 (the reference's are a constant multiple,
     /// which orders the same).
     pub fn levels(&self) -> Result<Vec<i32>, String> {
-        let thru = |e: usize| -> bool {
-            match self.edges[e].kind {
-                EdgeKind::Gate { set } => !self.is_check(e) && !matches!(self.arc_set(e, set).role, Role::RegSetClr | Role::LatchDtoQ) && !self.bidirect_inst_paths.contains(&e),
-                EdgeKind::Wire => !self.bidirect_port_paths.contains(&e),
-            }
-        };
+        let thru = |e: usize| self.levelize_thru(e);
         let order = self.topo_order()?;
         let mut level = vec![-1i32; self.vertices.len()];
         for (v, l) in level.iter_mut().enumerate() {
@@ -863,12 +858,24 @@ impl<'a> Graph<'a> {
         Ok(level.into_iter().map(|l| l.max(0)).collect())
     }
 
-    /// Topological order over the propagating edges (every edge but timing checks).
+    /// `Levelize::searchThru`: the edges levelization follows — every edge but timing checks,
+    /// latch D->Q, the register set/clear arcs the reference leaves disabled by default and the
+    /// bidirect instance/port paths. A latch D->Q edge is left out so a loop through a latch
+    /// (a clock-gate latch whose D is fed from the clock it gates) levelizes; its Q is timed by
+    /// the search's latch passes ([`crate::search::Search::find_arrivals`]).
+    pub fn levelize_thru(&self, e: usize) -> bool {
+        match self.edges[e].kind {
+            EdgeKind::Gate { set } => !self.is_check(e) && !matches!(self.arc_set(e, set).role, Role::RegSetClr | Role::LatchDtoQ) && !self.bidirect_inst_paths.contains(&e),
+            EdgeKind::Wire => !self.bidirect_port_paths.contains(&e),
+        }
+    }
+
+    /// Topological order over the edges levelization follows ([`Graph::levelize_thru`]).
     pub fn topo_order(&self) -> Result<Vec<usize>, String> {
         let n = self.vertices.len();
         let mut indeg = vec![0usize; n];
         for (e, ed) in self.edges.iter().enumerate() {
-            if !self.is_check(e) {
+            if self.levelize_thru(e) {
                 indeg[ed.to] += 1;
             }
         }
@@ -877,7 +884,7 @@ impl<'a> Graph<'a> {
         while let Some(v) = stack.pop() {
             order.push(v);
             for &e in &self.out_edges[v] {
-                if self.is_check(e) {
+                if !self.levelize_thru(e) {
                     continue;
                 }
                 let t = self.edges[e].to;
@@ -899,7 +906,7 @@ impl<'a> Graph<'a> {
     fn loop_names(&self, indeg: &[usize]) -> Vec<String> {
         let mut in_edges = vec![Vec::new(); self.vertices.len()];
         for (e, ed) in self.edges.iter().enumerate() {
-            if !self.is_check(e) && indeg[ed.from] > 0 && indeg[ed.to] > 0 {
+            if self.levelize_thru(e) && indeg[ed.from] > 0 && indeg[ed.to] > 0 {
                 in_edges[ed.to].push(ed.from);
             }
         }
@@ -1189,10 +1196,7 @@ impl<'a> Graph<'a> {
             EdgeKind::Gate { set } => !self.is_check(e) && self.arc_set(e, set).role != Role::RegSetClr && !self.bidirect_inst_paths.contains(&e),
             EdgeKind::Wire => !self.bidirect_port_paths.contains(&e),
         };
-        let levels = |e: usize| match self.edges[e].kind {
-            EdgeKind::Gate { set } => !self.is_check(e) && !matches!(self.arc_set(e, set).role, Role::RegSetClr | Role::LatchDtoQ) && !self.bidirect_inst_paths.contains(&e),
-            EdgeKind::Wire => !self.bidirect_port_paths.contains(&e),
-        };
+        let levels = |e: usize| self.levelize_thru(e);
         let mut reached = vec![false; self.vertices.len()];
         for &v in order {
             reached[v] = !self.in_edges[v].iter().any(|&e| levels(e))
