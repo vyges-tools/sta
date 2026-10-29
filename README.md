@@ -21,7 +21,7 @@ The library, in data-flow order:
   checks and output delays, common-path pessimism removal (CRPR), vertex and net slacks.
 - `fuzzy` — the tolerant comparison every merge uses.
 
-**Stability: experimental (v0.1.0).** The scope is what timing-driven global routing reads: NLDM
+**Stability: stable, actively developed.** The scope is what timing-driven global routing reads: NLDM
 libraries, one clock, setup requireds. Not yet: hold requireds, multiple or generated clocks,
 signal integrity. Bidirect pins, multiply-driven nets and latch data arcs are refused rather than
 timed wrong.
