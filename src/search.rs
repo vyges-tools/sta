@@ -1091,6 +1091,11 @@ impl<'g, 'a> Search<'g, 'a> {
         // A latch's borrow takes the enable clock's uncertainty too (`latchBorrowInfo`'s
         // `open_uncertainty`), which `latch_required` does not carry.
         let uncertain = self.sdc.clocks.iter().any(|c| c.uncertainty.iter().any(Option::is_some) || !c.inter_uncertainties.is_empty());
+        // `latchBorrowInfo` reads the enable's insertion as well, which `latch_required` does not.
+        let inserted = self.sdc.clocks.iter().any(|c| c.insertion.iter().flatten().flatten().any(Option::is_some));
+        if inserted && self.latch_data.iter().any(|&l| l) {
+            return Err("set_clock_latency -source on a design with latches: not modelled".into());
+        }
         if uncertain && self.latch_data.iter().any(|&l| l) {
             return Err("set_clock_uncertainty on a design with latches: not modelled".into());
         }
@@ -1358,7 +1363,8 @@ impl<'g, 'a> Search<'g, 'a> {
                         let clock = &self.sdc.clocks[c];
                         let latency = clock.pin_latency(name, rf, mm).or(clock.latency[rf][mm]).map_or(0, f32::to_bits);
                         let tag = Tag { rf, mm, clk_edge: Some(edge), is_clock: true, crpr: None, states, latency, segment_start: false };
-                        set_arrival(bldr, tag, 0.0 + self.edge_time(edge));
+                        // `seedClkArrival`: insertion (early/late the path's min/max) + edge time
+                        set_arrival(bldr, tag, clock.insertion_of(rf, mm, mm) + self.edge_time(edge));
                     }
                 }
             }
@@ -1382,7 +1388,7 @@ impl<'g, 'a> Search<'g, 'a> {
                     // clock's own latency (`clockLatency(clk, rf, min_max)`, 0 unset)
                     let ck = &self.sdc.clocks[clock];
                     let latency = if ck.propagated { 0.0 } else { ck.latency[edge % 2][mm].unwrap_or(0.0) };
-                    let clk_arrival = (self.edge_time(edge) + 0.0) + latency;
+                    let clk_arrival = (self.edge_time(edge) + ck.insertion_of(edge % 2, mm, mm)) + latency;
                     // `inputDelayTag` → `exceptionFromStates(pin, clk)`: from the port, or its clock
                     // — no tag when a false path from either is complete at the start.
                     if self.sdc.false_from(name, true, mm) {
@@ -1621,15 +1627,17 @@ impl<'g, 'a> Search<'g, 'a> {
         }
     }
 
-    /// `PathEndOutputDelay::tgtClkDelay`'s latency for a path of min/max `mm` captured at
-    /// `tgt_edge`: an ideal clock's own (`clockLatency(clk, rf, tgtClkMinMax)`, the opposite
-    /// min/max under OCV), 0 unset or propagated. No insertion is set.
+    /// `PathEndOutputDelay::tgtClkDelay` for a path of min/max `mm` captured at `tgt_edge`:
+    /// `insertion + latency`, the latency an ideal clock's own (`clockLatency(clk, rf,
+    /// tgtClkMinMax)`, the opposite min/max under OCV), 0 unset or propagated.
     fn output_tgt_latency(&self, tgt_edge: usize, mm: usize) -> f32 {
         let ck = &self.sdc.clocks[tgt_edge / 2];
+        // the insertion of `tgtClkMinMax`, early/late `tgtClkEarlyLate`: both the opposite
+        let insertion = ck.insertion_of(tgt_edge % 2, 1 - mm, 1 - mm);
         if ck.propagated {
-            0.0
+            insertion + 0.0
         } else {
-            ck.latency[tgt_edge % 2][1 - mm].unwrap_or(0.0)
+            insertion + ck.latency[tgt_edge % 2][1 - mm].unwrap_or(0.0)
         }
     }
 
@@ -1651,17 +1659,22 @@ impl<'g, 'a> Search<'g, 'a> {
 
     /// `PathEnd::checkTgtClkDelay` with no insertion set: a propagated clock path's network delay
     /// (its arrival less its edge's time), else (ideal) the path's latency.
+    /// For an ideal clock, `insertion + latency`: the insertion of the target clock path's
+    /// min/max, early/late the check's `tgtClkEarlyLate` — the opposite of the data path's, which
+    /// under OCV is the target path's own.
     fn tgt_clk_delay(&self, p: &Path) -> f32 {
         match p.tag.clk_edge {
             Some(e) if self.propagated(e) => (p.arrival - self.edge_time(e)) - 0.0,
-            Some(_) => f32::from_bits(p.tag.latency),
+            Some(e) => self.edge_clock(e).insertion_of(e % 2, p.tag.mm, p.tag.mm) + f32::from_bits(p.tag.latency),
             None => 0.0,
         }
     }
 
-    /// `Search::clkPathArrival` for an ideal clock (no insertion set): `(0 + edge time) + latency`.
+    /// `Search::clkPathArrival` for an ideal clock: `(insertion + edge time) + latency`, the
+    /// insertion of the path's min/max, early/late the same.
     fn ideal_clk_arrival(&self, tag: &Tag) -> f32 {
-        (0.0 + self.edge_time(tag.clk_edge.expect("a clocked path"))) + f32::from_bits(tag.latency)
+        let edge = tag.clk_edge.expect("a clocked path");
+        (self.edge_clock(edge).insertion_of(edge % 2, tag.mm, tag.mm) + self.edge_time(edge)) + f32::from_bits(tag.latency)
     }
 
     /// `Latches::latchRequired` with no exception (no multicycle, no path delay, no uncertainty, no

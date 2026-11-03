@@ -29,6 +29,9 @@ pub struct Clock {
     /// `set_clock_latency` on the clock (`Sdc::clockLatency(clk, rf, min_max)`), `[rf][min/max]`
     /// where set: an ideal clock's network latency where no pin latency is given.
     pub latency: [[Option<f32>; 2]; 2],
+    /// `set_clock_latency -source` on the clock (`ClockInsertion`), `[rf][min/max][early/late]`
+    /// where set: the source latency, added to the clock's edge wherever its arrival is taken.
+    pub insertion: [[[Option<f32>; 2]; 2]; 2],
 }
 
 /// One `InterClockUncertainty`, kept on its target clock: from the clock `from` (its index in
@@ -62,6 +65,7 @@ impl Clock {
             excluded: Vec::new(),
             slew: [[None; 2]; 2],
             latency: [[None; 2]; 2],
+            insertion: [[[None; 2]; 2]; 2],
         }
     }
 
@@ -70,6 +74,12 @@ impl Clock {
     pub fn pin_latency(&self, pin: &str, rf: usize, mm: usize) -> Option<f32> {
         let find = |specific: bool| self.pin_latencies.iter().find(|l| l.specific == specific && l.pin == pin).and_then(|l| l.delay[rf][mm]);
         find(true).or_else(|| find(false))
+    }
+
+    /// `Search::clockInsertion(clk, pin, rf, min_max, early_late)` with no pin insertion: the
+    /// clock's source latency, 0 unset.
+    pub fn insertion_of(&self, rf: usize, mm: usize, early_late: usize) -> f32 {
+        self.insertion[rf][mm][early_late].unwrap_or(0.0)
     }
 
     /// The time of the clock edge of transition `rf`.
