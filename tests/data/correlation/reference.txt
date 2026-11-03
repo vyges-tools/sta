@@ -1,2 +1,2 @@
-OpenSTA 3.1.0 (e983e15b2cb346badf8f23725fd3914d25312c44 2026-09-26), the OpenROAD project tree
+OpenSTA 3.1.0 (cc9027d65e75b9bfcc58b9b6343dd124dceacb87 2026-10-31), the OpenROAD project tree
 regenerated 2026-11-03

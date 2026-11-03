@@ -1292,7 +1292,7 @@ impl<'g, 'a> Search<'g, 'a> {
                     let prev = Some(Prev { vertex: from_v, tag: from.tag, edge: e, arc: arc.index });
                     let m = bldr.find(&to_tag);
                     if m.is_none_or(|i| better(to_arrival, bldr.paths[i].arrival)) {
-                        let path = Path { tag: to_tag, arrival: to_arrival, required: 0.0, prev };
+                        let path = Path { tag: to_tag, arrival: to_arrival, required: required_init(mm), prev };
                         match m {
                             Some(i) => bldr.paths[i] = path,
                             None => bldr.paths.push(path),
@@ -1424,8 +1424,8 @@ impl<'g, 'a> Search<'g, 'a> {
     /// iterator visits, level by level, only the vertices ENQUEUED — the fanin of a vertex whose
     /// requireds changed (`RequiredCmp::requiredsSave`, `delayEqual`: fuzzily) — each from its
     /// fanout and its path ends (`RequiredVisitor::visit`). A vertex never enqueued keeps the
-    /// required a path is made with, 0 (`Path::required_`): an input port with no fanout reports
-    /// a slack of minus its arrival.
+    /// required a path is made with, [`required_init`] (`Path::required_`, ±INF since OpenSTA
+    /// f861c627): an input port with no fanout reports an infinite slack.
     pub fn find_requireds(&mut self) -> Result<(), String> {
         let order = self.graph.topo_order()?;
         let mut enqueued = vec![false; self.graph.vertices.len()];
@@ -2014,9 +2014,17 @@ impl<'g, 'a> Search<'g, 'a> {
     }
 }
 
+/// The required a path is made with (`Path::required_`): `delayInitValue` of the path's OPPOSITE
+/// min/max — +INF for a max path, −INF for a min path — so a vertex the required search never
+/// reaches reports an INFINITE slack. Upstream OpenSTA f861c627 ("required init", #523); before it
+/// the init was 0 and an unconnected input port reported a slack of minus its arrival.
+pub(crate) fn required_init(mm: usize) -> f32 {
+    if mm == MAX { INF } else { -INF }
+}
+
 /// A seed sets (or replaces) its tag's arrival.
 fn set_arrival(bldr: &mut Bldr, tag: Tag, arrival: f32) {
-    let path = Path { tag, arrival, required: 0.0, prev: None };
+    let path = Path { tag, arrival, required: required_init(tag.mm), prev: None };
     match bldr.find(&tag) {
         Some(i) => bldr.paths[i] = path,
         None => bldr.paths.push(path),
@@ -2112,10 +2120,12 @@ mod tests {
     }
 
     /// Rule (`Search::findRequireds`, a worklist: `seedRequireds` then the fanin of each vertex
-    /// whose requireds changed; `Path::required_` starts at 0): an input port with an input delay
-    /// and no fanout is never an endpoint (no fanin) nor anyone's fanin, so its required stays 0
-    /// and its slack is minus its arrival — the reference's `slack_max` on every unconnected input
-    /// bit of rv_plic_lite (`tests/correlation.rs`). Timed with every vertex visited it was INF.
+    /// whose requireds changed): an input port with an input delay and no fanout is never an
+    /// endpoint (no fanin) nor anyone's fanin, so it keeps the required its path is made with —
+    /// `Path::required_ = delayInitValue(minMax()->opposite())` since OpenSTA f861c627 (#523):
+    /// +INF on a max path, −INF on a min path — and both its setup and hold slacks are INFINITE.
+    /// Before f861c627 the init was 0 and the slack minus the arrival (rv_plic_lite's unconnected
+    /// input bits, `tests/correlation.rs`, moved from −input_delay to INF at the 4155ac31 repin).
     #[test]
     fn an_input_port_with_no_fanout_keeps_the_initial_required() {
         let (libs, mut netlist, mut sdc) = design();
@@ -2129,11 +2139,16 @@ mod tests {
         s.find_requireds().unwrap();
         let v = g.vertices.iter().position(|x| x.name == "spare").unwrap();
         assert!(!s.is_endpoint(v));
-        let slack = s.slack_of(v, MAX, None);
-        assert_eq!(slack, -0.3e-9f32, "required 0 less the arrival");
+        for mm in [MAX, MIN] {
+            let slack = s.slack_of(v, mm, None);
+            assert!(slack >= INF * 0.5, "min/max {mm}: the initial required is ±INF, slack {slack} must be infinite");
+        }
+        assert_eq!(required_init(MAX), INF);
+        assert_eq!(required_init(MIN), -INF);
         // a connected input's required comes from its fanout, as before
         let i = g.vertices.iter().position(|x| x.name == "in").unwrap();
-        assert!(s.slack_of(i, MAX, None) > 0.0);
+        let connected = s.slack_of(i, MAX, None);
+        assert!(connected > 0.0 && connected < INF * 0.5, "a connected input has a finite slack, got {connected}");
     }
 
     fn path(s: &Search, v: usize, rf: usize, is_clock: bool) -> Path {
