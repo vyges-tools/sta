@@ -1,0 +1,7 @@
+create_clock -name clk_i -period 3 -waveform {0 1.2} [get_ports {clk_i}]
+set_input_delay -max 0.7 -clock clk_i [get_ports {tl_i[*]}]
+set_input_delay -min 0.1 -clock clk_i [get_ports {tl_i[*]}]
+set_input_delay 0.3 -clock clk_i [get_ports {intr_src_i[*] rst_ni}]
+set_output_delay 0.8 -clock clk_i [all_outputs]
+set_driving_cell -lib_cell sky130_fd_sc_hd__buf_2 [all_inputs]
+set_load 0.01 [get_ports {irq_o tl_o[*]}]

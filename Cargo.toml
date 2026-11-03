@@ -12,4 +12,18 @@ repository = "https://github.com/vyges-tools/sta"
 name = "vyges_sta"
 path = "src/lib.rs"
 
+[features]
+# A design read by loom (Verilog), mapped into this timer's netlist: `load`. Off by default, so
+# the library itself keeps no dependencies.
+loom = ["dep:vyges-loom"]
+
 [dependencies]
+vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "main", optional = true }
+
+[[example]]
+name = "load_graph"
+required-features = ["loom"]
+
+[[test]]
+name = "correlation"
+required-features = ["loom"]

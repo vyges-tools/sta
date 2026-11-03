@@ -195,9 +195,21 @@ pub struct Search<'g, 'a> {
 /// `ClkNetwork`: from every clock's source, over wires and combinational arcs, never into another
 /// clock's source.
 fn clock_network(graph: &Graph<'_>, sdc: &Sdc) -> Vec<bool> {
+    clock_network_of(graph, sdc, |_| true)
+}
+
+/// `ClkNetwork::isIdealClock` as membership: the [`clock_network`] of the clocks that are not
+/// propagated — what [`Graph::ideal_clock`] holds for a timer that is not told otherwise.
+pub fn ideal_clock_pins(graph: &Graph<'_>, sdc: &Sdc) -> std::collections::HashSet<usize> {
+    let net = clock_network_of(graph, sdc, |c| !c.propagated);
+    net.iter().enumerate().filter(|(_, &on)| on).map(|(v, _)| v).collect()
+}
+
+/// [`clock_network`] from the sources of the clocks `want` keeps.
+fn clock_network_of(graph: &Graph<'_>, sdc: &Sdc, want: impl Fn(&crate::sdc::Clock) -> bool) -> Vec<bool> {
     let n = graph.vertices.len();
     let mut seen = vec![false; n];
-    let sources: Vec<usize> = sdc.clocks.iter().filter(|c| !c.source.is_empty()).filter_map(|c| graph.vertices.iter().position(|v| v.name == c.source)).collect();
+    let sources: Vec<usize> = sdc.clocks.iter().filter(|c| !c.source.is_empty() && want(c)).filter_map(|c| graph.vertices.iter().position(|v| v.name == c.source)).collect();
     let mut queue: std::collections::VecDeque<usize> = sources.iter().copied().collect();
     for &v in &sources {
         seen[v] = true;
@@ -1277,19 +1289,49 @@ impl<'g, 'a> Search<'g, 'a> {
     }
 
     /// Every vertex in reverse level order.
+    ///
+    /// 🔑 As a WORKLIST, the reference's (`Search::findRequireds`): `seedRequireds` gives every
+    /// endpoint the requireds of its own path ends alone (`seedRequired`); then the backward
+    /// iterator visits, level by level, only the vertices ENQUEUED — the fanin of a vertex whose
+    /// requireds changed (`RequiredCmp::requiredsSave`, `delayEqual`: fuzzily) — each from its
+    /// fanout and its path ends (`RequiredVisitor::visit`). A vertex never enqueued keeps the
+    /// required a path is made with, 0 (`Path::required_`): an input port with no fanout reports
+    /// a slack of minus its arrival.
     pub fn find_requireds(&mut self) -> Result<(), String> {
         let order = self.graph.topo_order()?;
+        let mut enqueued = vec![false; self.graph.vertices.len()];
+        for v in 0..self.graph.vertices.len() {
+            if self.is_endpoint(v) {
+                let mut req: Vec<f32> = self.paths[v].iter().map(|p| if p.tag.mm == MAX { INF } else { -INF }).collect();
+                self.visit_path_ends(v, &mut req);
+                self.required_save(v, req, &mut enqueued);
+            }
+        }
         for &v in order.iter().rev() {
-            self.required_visit(v);
+            if enqueued[v] {
+                let req = self.required_values(v);
+                self.required_save(v, req, &mut enqueued);
+            }
         }
         Ok(())
     }
 
-    /// Requireds from the fanout, then the endpoint's path ends.
-    fn required_visit(&mut self, v: usize) {
-        let req = self.required_values(v);
+    /// `RequiredCmp::requiredsSave` and, when a required changed (not fuzzily equal), the fanin
+    /// enqueued over `SearchAdj` (`BfsBkwdIterator::enqueueAdjacentVertices`): every in-edge but a
+    /// timing check, a latch D->Q, a preset/clear arc and a disabled bidirect instance path.
+    fn required_save(&mut self, v: usize, req: Vec<f32>, enqueued: &mut [bool]) {
+        let mut changed = false;
         for (p, r) in self.paths[v].iter_mut().zip(req) {
+            changed |= !crate::fuzzy::equal(p.required, r);
             p.required = r;
+        }
+        if changed {
+            for &e in &self.graph.in_edges[v] {
+                let adj = !self.is_check(e) && !matches!(self.role(e), Some(Role::LatchDtoQ) | Some(Role::RegSetClr)) && !self.graph.bidirect_inst_paths.contains(&e);
+                if adj {
+                    enqueued[self.graph.edges[e].from] = true;
+                }
+            }
         }
     }
 
@@ -1876,6 +1918,31 @@ mod tests {
         s.find_requireds().unwrap();
         let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
         f(&s, &v)
+    }
+
+    /// Rule (`Search::findRequireds`, a worklist: `seedRequireds` then the fanin of each vertex
+    /// whose requireds changed; `Path::required_` starts at 0): an input port with an input delay
+    /// and no fanout is never an endpoint (no fanin) nor anyone's fanin, so its required stays 0
+    /// and its slack is minus its arrival — the reference's `slack_max` on every unconnected input
+    /// bit of rv_plic_lite (`tests/correlation.rs`). Timed with every vertex visited it was INF.
+    #[test]
+    fn an_input_port_with_no_fanout_keeps_the_initial_required() {
+        let (libs, mut netlist, mut sdc) = design();
+        netlist.ports.push(("spare".into(), PortDir::Input));
+        netlist.nets.push(Net { name: "spare".into(), pins: vec![Conn::Port(3)] }.into());
+        sdc.input_delays.push(PortDelay::uniform("spare", 0.3e-9));
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        g.find_delays(&HashMap::new(), None).unwrap();
+        let mut s = Search::in_graph_order(&g, &sdc);
+        s.find_arrivals().unwrap();
+        s.find_requireds().unwrap();
+        let v = g.vertices.iter().position(|x| x.name == "spare").unwrap();
+        assert!(!s.is_endpoint(v));
+        let slack = s.slack_of(v, MAX, None);
+        assert_eq!(slack, -0.3e-9f32, "required 0 less the arrival");
+        // a connected input's required comes from its fanout, as before
+        let i = g.vertices.iter().position(|x| x.name == "in").unwrap();
+        assert!(s.slack_of(i, MAX, None) > 0.0);
     }
 
     fn path(s: &Search, v: usize, rf: usize, is_clock: bool) -> Path {

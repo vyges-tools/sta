@@ -16,6 +16,7 @@
 //! - [`parasitics`]: a net's RC network reduced to a pi model and per-load Elmore delays.
 //! - [`sdc`], [`search`]: the clock and port delays; arrivals, requireds and slacks.
 //! - [`power`]: switching activity and instance power.
+//! - `load` (feature `loom`): a design loom read, laid out as the reference network lays it out.
 
 pub mod bdd;
 pub mod dcalc;
@@ -25,6 +26,8 @@ pub mod graph;
 pub mod incr;
 pub mod liberty;
 pub mod liberty_parse;
+#[cfg(feature = "loom")]
+pub mod load;
 pub mod netlist;
 pub mod parasitics;
 pub mod path_enum;

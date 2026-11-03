@@ -21,5 +21,9 @@ jobs:
           components: clippy
       - name: Test
         run: cargo test --release --verbose
+      - name: Test with the loom loader (and the correlation)
+        run: cargo test --release --features loom --verbose
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy with the loom loader
+        run: cargo clippy --all-targets --features loom -- -D warnings
