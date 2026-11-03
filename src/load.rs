@@ -265,6 +265,12 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
         }
         notes.push(format!("{}: {} (no slack moves with it)", n.command, n.why));
     }
+    // A generated clock's arrivals come from its master through the circuit (the reference's
+    // generated-clock insertion search); taken as an ordinary clock at its pin, it would be timed
+    // wrong, silently. Refused until that search is transcribed.
+    if let Some(c) = s.clocks.iter().find(|c| c.generated.is_some()) {
+        return Err(format!("create_generated_clock {}: not modelled by this timer", c.name));
+    }
     let refused: [(&str, bool); 7] = [
         ("set_case_analysis", !s.case_values.is_empty()),
         ("set_logic_zero / set_logic_one / set_logic_dc", !s.logic_values.is_empty()),
@@ -1510,6 +1516,25 @@ mod tests {
         let nl = Netlist { insts: vec![], ports: vec![("a".into(), Input), ("clk".into(), Input), ("b".into(), Inout), ("y".into(), Output)], nets: vec![] };
         let ss = search_sdc_on(&sdc, &nl, 1e-9, false, false).unwrap();
         assert_eq!(ss.input_delays.iter().map(|d| d.port.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    }
+
+    /// A generated clock is refused, not timed as an ordinary clock at its pin: the reference
+    /// derives its arrivals from the master clock through the circuit, which this timer does not.
+    #[test]
+    fn a_generated_clock_is_refused() {
+        use crate::netlist::{Netlist, PortDir::*};
+        let nl = Netlist { insts: vec![], ports: vec![("clk".into(), Input), ("a".into(), Input)], nets: vec![] };
+        let sdc = vyges_loom::sdc::Sdc::parse(
+            "create_clock -name clk -period 10 [get_ports clk]\ncreate_generated_clock -name div2 -source [get_ports clk] -divide_by 2 [get_ports a]\n",
+        )
+        .unwrap();
+        let err = constraints(&sdc, &nl, &[]).unwrap_err();
+        assert!(err.contains("create_generated_clock div2"), "{err}");
+        let plain = vyges_loom::sdc::Sdc::parse("create_clock -name clk -period 10 [get_ports clk]\n").unwrap();
+        // without the generated clock the same call gets past this refusal (here to the next
+        // check, which wants a library): the refusal fires on generated clocks only
+        let e = constraints(&plain, &nl, &[]).unwrap_err();
+        assert!(!e.contains("create_generated_clock"), "{e}");
     }
 
     /// Rules (`Sdc::allOutputs` / `Sdc::allInputs`): any-output = output or bidirect; any-input =
