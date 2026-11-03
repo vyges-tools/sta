@@ -23,6 +23,9 @@ pub struct Clock {
     /// The clocks (indices in [`Sdc::clocks`]) `set_clock_groups` cuts this one from
     /// (`Sdc::clk_group_exclusions_`, a symmetric pair set): no path between the two is checked.
     pub excluded: Vec<usize>,
+    /// `set_clock_transition` (`Clock::slews_`), `[rf][min/max]` where set: an IDEAL clock's slew
+    /// at the register clock pins it reaches (`Clock::slew`: 0 where unset).
+    pub slew: [[Option<f32>; 2]; 2],
 }
 
 /// One `InterClockUncertainty`, kept on its target clock: from the clock `from` (its index in
@@ -54,6 +57,7 @@ impl Clock {
             uncertainty: [None; 2],
             inter_uncertainties: Vec::new(),
             excluded: Vec::new(),
+            slew: [[None; 2]; 2],
         }
     }
 

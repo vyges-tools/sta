@@ -130,6 +130,9 @@ pub struct Graph<'a> {
     /// slew, 0 (`edgeFromSlew`, `checkEdgeClkSlew`); every other edge reads the graph's slew.
     /// Empty unless a caller sets it — a propagated clock has none.
     pub ideal_clock: std::collections::HashSet<usize>,
+    /// `ClkNetwork::idealClkSlew` at each pin of [`Graph::ideal_clock`] where a clock reaching it
+    /// has a `set_clock_transition`, `[rf][min/max]`; a pin not here takes 0.
+    pub ideal_clock_slew: HashMap<usize, [[f32; 2]; 2]>,
     /// Per instance, the library and cell whose arc sets its OUTPUT-to-output edges still carry:
     /// `replaceEquivCellBefore` swaps the arc sets of the edges leaving an instance's INPUT pins
     /// only, so after an equivalent-arcs replacement an edge from one output to another (a half
@@ -582,7 +585,7 @@ impl<'a> Graph<'a> {
                 let _ = index_cache.set(std::sync::Arc::new(map));
             }
         }
-        Some(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: std::collections::HashSet::new(), bidirect_port_paths: std::collections::HashSet::new(), index_cache, net_slots: None, edit_seq: None, state_seq: None })
+        Some(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: std::collections::HashSet::new(), bidirect_port_paths: std::collections::HashSet::new(), index_cache, net_slots: None, edit_seq: None, state_seq: None })
     }
 
     /// [`Graph::build_with_pins`] with each pin found by its name.
@@ -785,7 +788,7 @@ impl<'a> Graph<'a> {
                 EdgeKind::Wire => vec![[0.0f32; 2]; 2],
             })
             .collect();
-        Ok(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths, bidirect_port_paths, index_cache: std::sync::OnceLock::new(), net_slots: None, edit_seq: None, state_seq: None })
+        Ok(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths, bidirect_port_paths, index_cache: std::sync::OnceLock::new(), net_slots: None, edit_seq: None, state_seq: None })
     }
 
     /// Whether vertex `v` is a top-level port's (an instance's vertex may have no library too:
@@ -1334,7 +1337,8 @@ impl<'a> Graph<'a> {
                 for (k, arc) in arcs.iter().enumerate() {
                     let Model::Gate(model) = &arc.model else { continue };
                     let rf = arc.to_rf;
-                    let in_slew = if ideal_clk_to_q { 0.0 } else { self.slew[from][arc.from_rf][mm] };
+                    // `edgeFromSlew`: an ideal clock's slew for a register clk->q edge
+                    let in_slew = if ideal_clk_to_q { self.ideal_clk_slew(from, arc.from_rf, mm) } else { self.slew[from][arc.from_rf][mm] };
                     if loads[rf][mm].is_none() {
                         loads[rf][mm] = Some(self.parasitic_load(v, rf, mm, parasitics, index));
                     }
@@ -1410,6 +1414,11 @@ impl<'a> Graph<'a> {
         Ok(())
     }
 
+    /// `ClkNetwork::idealClkSlew(pin, rf, min_max)`: the slew of the ideal clocks at the pin.
+    fn ideal_clk_slew(&self, v: usize, rf: usize, mm: usize) -> f32 {
+        self.ideal_clock_slew.get(&v).map_or(0.0, |s| s[rf][mm])
+    }
+
     /// One timing check edge's delays (`findCheckEdgeDelays`), from the slews at both ends.
     pub fn find_check_edge_delays(&mut self, e: usize) {
         let EdgeKind::Gate { set } = self.edges[e].kind else { return };
@@ -1418,7 +1427,8 @@ impl<'a> Graph<'a> {
         for (k, arc) in arcs.iter().enumerate() {
             let Model::Check(table) = &arc.model else { continue };
             for mm in [MIN, MAX] {
-                let clk_slew = if self.ideal_clock.contains(&from) { 0.0 } else { self.slew[from][arc.from_rf][1 - mm] };
+                // `checkEdgeClkSlew`: under OCV the opposite min/max (`checkClkSlewMinMax`)
+                let clk_slew = if self.ideal_clock.contains(&from) { self.ideal_clk_slew(from, arc.from_rf, 1 - mm) } else { self.slew[from][arc.from_rf][1 - mm] };
                 let data_slew = self.slew[to][arc.to_rf][mm];
                 let pick = |a: usize| match table.axes.get(a).map(|x| x.var) {
                     Some(crate::table::AxisVar::RelatedPinTransition) => clk_slew,

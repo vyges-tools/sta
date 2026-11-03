@@ -205,6 +205,37 @@ pub fn ideal_clock_pins(graph: &Graph<'_>, sdc: &Sdc) -> std::collections::HashS
     net.iter().enumerate().filter(|(_, &on)| on).map(|(v, _)| v).collect()
 }
 
+/// `ClkNetwork::idealClkSlew` at every ideal clock pin, when any clock has a
+/// `set_clock_transition`: per transition and min/max, of the ideal clocks reaching the pin the
+/// largest slew for max and the smallest for min (`MinMax::compare` from `initValue`), an unset
+/// one counting 0 (`Clock::slew`). Empty with no clock transition: every pin takes 0.
+pub fn ideal_clock_slews(graph: &Graph<'_>, sdc: &Sdc) -> HashMap<usize, [[f32; 2]; 2]> {
+    let mut out: HashMap<usize, [[f32; 2]; 2]> = HashMap::new();
+    if !sdc.clocks.iter().any(|c| c.slew.iter().flatten().any(Option::is_some)) {
+        return out;
+    }
+    // `MinMax::initValue`: INF for min, -INF for max
+    let mut init = [[0.0f32; 2]; 2];
+    for row in &mut init {
+        (row[MIN], row[MAX]) = (INF, -INF);
+    }
+    for (k, c) in sdc.clocks.iter().enumerate().filter(|(_, c)| !c.propagated) {
+        let net = clock_network_of(graph, sdc, |o| o.name == sdc.clocks[k].name);
+        for v in (0..net.len()).filter(|&v| net[v]) {
+            let s = out.entry(v).or_insert(init);
+            for rf in [0, 1] {
+                for mm in [MIN, MAX] {
+                    let slew = c.slew[rf][mm].unwrap_or(0.0);
+                    if (mm == MAX && slew > s[rf][mm]) || (mm == MIN && slew < s[rf][mm]) {
+                        s[rf][mm] = slew;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// [`clock_network`] from the sources of the clocks `want` keeps.
 fn clock_network_of(graph: &Graph<'_>, sdc: &Sdc, want: impl Fn(&crate::sdc::Clock) -> bool) -> Vec<bool> {
     let n = graph.vertices.len();

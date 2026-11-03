@@ -265,9 +265,8 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
         }
         notes.push(format!("{}: {} (no slack moves with it)", n.command, n.why));
     }
-    let refused: [(&str, bool); 10] = [
+    let refused: [(&str, bool); 9] = [
         ("set_clock_latency on the clock source or without pins", s.clock_latencies.iter().any(|l| l.accessor != "get_pins")),
-        ("set_clock_transition", !s.clock_transitions.is_empty()),
         ("set_case_analysis", !s.case_values.is_empty()),
         ("set_logic_zero / set_logic_one / set_logic_dc", !s.logic_values.is_empty()),
         ("set_disable_timing", !s.disabled_timing.is_empty()),
@@ -304,6 +303,7 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
     let mut sdc = search_sdc_on(&s, nl, lib0.time_scale, false, false)?;
     clock_uncertainties(&uncertainties, &mut sdc.clocks, lib0.time_scale)?;
     clock_groups(&groups, &mut sdc.clocks)?;
+    clock_transitions(&s.clock_transitions, &mut sdc.clocks, lib0.time_scale, &mut notes)?;
     let falses = timing_exceptions(&exceptions, &s, nl)?;
     if !falses.is_empty() && !sdc.path_delays.is_empty() {
         return Err("set_false_path / set_multicycle_path with set_max_delay / set_min_delay: not modelled (the ids across them are the order they were made in)".into());
@@ -351,6 +351,45 @@ fn clock_groups(cgs: &[vyges_loom::sdc::ClockGroups], clocks: &mut [crate::sdc::
     let names: Vec<String> = clocks.iter().map(|c| c.name.clone()).collect();
     for (i, c) in clocks.iter_mut().enumerate() {
         c.excluded = (0..names.len()).filter(|&j| j != i && vyges_loom::sdc::clocks_unrelated(&resolved, &names[i], &names[j])).collect();
+    }
+    Ok(())
+}
+
+/// Every `set_clock_transition` in order (`set_clock_slew_cmd`): the value (`time_ui_sta`) on
+/// each named clock for `-rise` / `-fall` (else both) and `-min` / `-max` (else both), a later
+/// command overwriting what it sets. A virtual clock takes none (Warning 419, a note here).
+fn clock_transitions(ts: &[vyges_loom::sdc::EnvCmd], clocks: &mut [crate::sdc::Clock], time_scale: f32, notes: &mut Vec<String>) -> Result<(), String> {
+    use crate::liberty::{FALL, MAX, MIN, RISE};
+    for t in ts {
+        if let Some(f) = t.flags.iter().find(|f| !matches!(f.as_str(), "-rise" | "-fall" | "-min" | "-max")) {
+            return Err(format!("set_clock_transition {f}: not modelled"));
+        }
+        if !matches!(t.accessor.as_str(), "get_clocks" | "all_clocks" | "") {
+            return Err(format!("set_clock_transition on [{} ...]: not modelled (clocks are)", t.accessor));
+        }
+        let has = |f: &str| t.flags.iter().any(|x| x == f);
+        let rfs: &[usize] = match (has("-rise"), has("-fall")) {
+            (true, false) => &[RISE],
+            (false, true) => &[FALL],
+            _ => &[RISE, FALL],
+        };
+        let mms: &[usize] = match (has("-min"), has("-max")) {
+            (true, false) => &[MIN],
+            (false, true) => &[MAX],
+            _ => &[MIN, MAX],
+        };
+        let value = crate::sdc::user_to_sta(t.value, time_scale);
+        for c in clocks.iter_mut().filter(|c| t.objects.iter().any(|n| vyges_loom::sdc::object_matches(n, &c.name))) {
+            if c.source.is_empty() {
+                notes.push(format!("set_clock_transition on the virtual clock {}: none taken (Warning 419)", c.name));
+                continue;
+            }
+            for &rf in rfs {
+                for &mm in mms {
+                    c.slew[rf][mm] = Some(value);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -605,6 +644,7 @@ pub fn time_design_for(libs: &[Library], nl: &Netlist, sdc: &crate::sdc::Sdc, en
     let mut g = crate::graph::Graph::build(libs, nl)?;
     g.sdc = env;
     g.ideal_clock = crate::search::ideal_clock_pins(&g, sdc);
+    g.ideal_clock_slew = crate::search::ideal_clock_slews(&g, sdc);
     g.find_delays(&HashMap::new(), None)?;
     let mut s = Search::in_graph_order(&g, sdc);
     s.constraints_modelled()?;
@@ -1254,6 +1294,22 @@ mod tests {
         assert_eq!(cut("set_clock_groups -asynchronous -group {a} -group {nope}\n"), vec![vec![1, 2], vec![0], vec![0]]);
         assert_eq!(cut("set_clock_groups -asynchronous -allow_paths -group {a} -group {b}\n"), vec![Vec::<usize>::new(); 3]);
         assert_eq!(cut("set_clock_groups -name g -asynchronous -group {a} -group {b}\nset_clock_groups -name g -asynchronous -allow_paths -group {a} -group {b}\n"), vec![Vec::<usize>::new(); 3]);
+    }
+
+    /// Rules (`set_clock_transition` in `Sdc.tcl`, `Clock::setSlew`): `-rise` / `-fall` and
+    /// `-min` / `-max` pick what is set (neither: both), a later command overwrites only those; a
+    /// virtual clock takes none (Warning 419).
+    #[test]
+    fn clock_transitions_set_what_their_flags_name() {
+        use crate::liberty::{FALL, MAX, MIN, RISE};
+        let ns = |v: f64| Some(crate::sdc::user_to_sta(v, 1e-9));
+        let s = vyges_loom::sdc::Sdc::parse("create_clock -name a -period 2 [get_ports ca]\ncreate_clock -name v -period 3\nset_clock_transition 0.15 [all_clocks]\nset_clock_transition -rise -max 0.25 [get_clocks a]\n").unwrap();
+        let mut clocks = vec![crate::sdc::Clock::new("a", 2e-9, "ca", false), crate::sdc::Clock::new("v", 3e-9, "", false)];
+        let mut notes = Vec::new();
+        clock_transitions(&s.clock_transitions, &mut clocks, 1e-9, &mut notes).unwrap();
+        assert_eq!((clocks[0].slew[RISE][MAX], clocks[0].slew[RISE][MIN], clocks[0].slew[FALL][MAX]), (ns(0.25), ns(0.15), ns(0.15)));
+        assert_eq!(clocks[1].slew, [[None; 2]; 2], "virtual: none");
+        assert_eq!(notes.len(), 1);
     }
 
     /// Rule (`set_multicycle_path` in `Sdc.tcl`): one exception per command — `-setup` alone is
