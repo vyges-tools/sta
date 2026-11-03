@@ -265,8 +265,7 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
         }
         notes.push(format!("{}: {} (no slack moves with it)", n.command, n.why));
     }
-    let refused: [(&str, bool); 8] = [
-        ("set_clock_latency on the clock source or without pins", s.clock_latencies.iter().any(|l| l.accessor != "get_pins")),
+    let refused: [(&str, bool); 7] = [
         ("set_case_analysis", !s.case_values.is_empty()),
         ("set_logic_zero / set_logic_one / set_logic_dc", !s.logic_values.is_empty()),
         ("set_disable_timing", !s.disabled_timing.is_empty()),
@@ -1039,8 +1038,9 @@ fn search_sdc_with(
     // latency from that pin on. On clocks, `-source`, `-early` / `-late`, or on a propagated clock
     // (where the pin would turn it ideal) — refused.
     for l in &s.clock_latencies {
-        if l.accessor != "get_pins" {
-            return Err(format!("set_clock_latency on [{} …]: not modelled (pins are)", l.accessor));
+        let on_clocks = matches!(l.accessor.as_str(), "get_clocks" | "all_clocks");
+        if l.accessor != "get_pins" && !on_clocks {
+            return Err(format!("set_clock_latency on [{} …]: not modelled (pins and clocks are)", l.accessor));
         }
         if let Some(f) = l.flags.iter().find(|f| !matches!(f.as_str(), "-rise" | "-fall" | "-min" | "-max")) {
             return Err(format!("set_clock_latency {f}: not modelled"));
@@ -1060,6 +1060,21 @@ fn search_sdc_with(
             None => (0..clocks.len()).collect(),
         };
         let v = crate::sdc::user_to_sta(l.value, time_scale);
+        if on_clocks {
+            // `Sdc::setClockLatency(clk, nullptr, …)`: on each clock named
+            for c in clocks.iter_mut().filter(|c| l.objects.iter().any(|n| vyges_loom::sdc::object_matches(n, &c.name))) {
+                // a latency on a propagated clock makes its source ideal (`seedClkArrival`)
+                if c.propagated {
+                    return Err("set_clock_latency on a propagated clock: not modelled".into());
+                }
+                for &rf in &rfs {
+                    for &mm in &mms {
+                        c.latency[rf][mm] = Some(v);
+                    }
+                }
+            }
+            continue;
+        }
         for k in targets {
             let c: &mut Clock = &mut clocks[k];
             if c.propagated {
@@ -1357,6 +1372,30 @@ mod tests {
         assert_eq!(cut("set_clock_groups -asynchronous -group {a} -group {nope}\n"), vec![vec![1, 2], vec![0], vec![0]]);
         assert_eq!(cut("set_clock_groups -asynchronous -allow_paths -group {a} -group {b}\n"), vec![Vec::<usize>::new(); 3]);
         assert_eq!(cut("set_clock_groups -name g -asynchronous -group {a} -group {b}\nset_clock_groups -name g -asynchronous -allow_paths -group {a} -group {b}\n"), vec![Vec::<usize>::new(); 3]);
+    }
+
+    /// Rules (`Sdc::setClockLatency(clk, nullptr, …)`): a latency on clocks is the clock's own,
+    /// `-rise` / `-fall` and `-min` / `-max` picking what is set; of a network latency and
+    /// `set_propagated_clock` on one clock, the later removes the earlier.
+    #[test]
+    fn a_clock_latency_lands_on_its_clocks() {
+        use crate::liberty::{FALL, MAX, MIN, RISE};
+        let ns = |v: f64| Some(crate::sdc::user_to_sta(v, 1e-9));
+        let src = "module ord2 (ck, a, y);\n input ck, a; output y; wire n1;\n BUF drv (.A(a), .X(n1));\n BUF lz (.A(n1), .X(y));\nendmodule\n";
+        let nl = netlist(&vyges_loom::netlist::parse_compact(src).unwrap(), &[lib()]).unwrap();
+        let read = |text: &str| {
+            let s = vyges_loom::sdc::Sdc::parse(&format!("create_clock -name c -period 2 [get_ports ck]\ncreate_clock -name v -period 2\n{text}")).unwrap();
+            search_sdc_on(&s, &nl, 1e-9, false, false)
+        };
+        let sdc = read("set_clock_latency 0.3 [all_clocks]\nset_clock_latency -max -rise 0.45 [get_clocks c]\n").unwrap();
+        assert_eq!((sdc.clocks[0].latency[RISE][MAX], sdc.clocks[0].latency[RISE][MIN], sdc.clocks[0].latency[FALL][MAX]), (ns(0.45), ns(0.3), ns(0.3)));
+        assert_eq!(sdc.clocks[1].latency[RISE][MAX], ns(0.3), "a virtual clock takes one too");
+        // `Sdc::setClockLatency` removes an earlier `set_propagated_clock` on the clock (loom)
+        let later = read("set_propagated_clock [get_clocks c]\nset_clock_latency 0.3 [get_clocks c]\n").unwrap();
+        assert_eq!((later.clocks[0].propagated, later.clocks[0].latency[RISE][MAX]), (false, ns(0.3)), "the later latency wins");
+        // `Sdc::setPropagatedClock` → `removeClockLatency(clk)`: and the other way round
+        let later = read("set_clock_latency 0.3 [get_clocks c]\nset_propagated_clock [get_clocks c]\n").unwrap();
+        assert_eq!((later.clocks[0].propagated, later.clocks[0].latency[RISE][MAX]), (true, None), "the later propagation wins");
     }
 
     /// Rules (`set_timing_derate` in `Sdc.tcl`): `-early` is min, `-late` max, exactly one

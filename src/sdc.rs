@@ -26,6 +26,9 @@ pub struct Clock {
     /// `set_clock_transition` (`Clock::slews_`), `[rf][min/max]` where set: an IDEAL clock's slew
     /// at the register clock pins it reaches (`Clock::slew`: 0 where unset).
     pub slew: [[Option<f32>; 2]; 2],
+    /// `set_clock_latency` on the clock (`Sdc::clockLatency(clk, rf, min_max)`), `[rf][min/max]`
+    /// where set: an ideal clock's network latency where no pin latency is given.
+    pub latency: [[Option<f32>; 2]; 2],
 }
 
 /// One `InterClockUncertainty`, kept on its target clock: from the clock `from` (its index in
@@ -58,6 +61,7 @@ impl Clock {
             inter_uncertainties: Vec::new(),
             excluded: Vec::new(),
             slew: [[None; 2]; 2],
+            latency: [[None; 2]; 2],
         }
     }
 

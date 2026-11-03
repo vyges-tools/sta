@@ -1353,8 +1353,10 @@ impl<'g, 'a> Search<'g, 'a> {
                     let states = self.sdc.exception_from_states(name, true, mm);
                     for rf in [0, 1] {
                         let edge = 2 * c + rf;
-                        // a latency on the clock's own pin (no clock-wide latency here)
-                        let latency = self.sdc.clocks[c].pin_latency(name, rf, mm).map_or(0, f32::to_bits);
+                        // `seedClkArrival`: a latency on the clock's own pin, else the clock's
+                        // (`clockLatency(clk, pin)`, then `clockLatency(clk)`)
+                        let clock = &self.sdc.clocks[c];
+                        let latency = clock.pin_latency(name, rf, mm).or(clock.latency[rf][mm]).map_or(0, f32::to_bits);
                         let tag = Tag { rf, mm, clk_edge: Some(edge), is_clock: true, crpr: None, states, latency, segment_start: false };
                         set_arrival(bldr, tag, 0.0 + self.edge_time(edge));
                     }
@@ -1376,7 +1378,11 @@ impl<'g, 'a> Search<'g, 'a> {
                 }
                 let edge = 2 * clock;
                 for mm in [MIN, MAX] {
-                    let clk_arrival = self.edge_time(edge);
+                    // `inputDelayClkArrival`: the edge, + the insertion (none set), + an ideal
+                    // clock's own latency (`clockLatency(clk, rf, min_max)`, 0 unset)
+                    let ck = &self.sdc.clocks[clock];
+                    let latency = if ck.propagated { 0.0 } else { ck.latency[edge % 2][mm].unwrap_or(0.0) };
+                    let clk_arrival = (self.edge_time(edge) + 0.0) + latency;
                     // `inputDelayTag` → `exceptionFromStates(pin, clk)`: from the port, or its clock
                     // — no tag when a false path from either is complete at the start.
                     if self.sdc.false_from(name, true, mm) {
@@ -1553,7 +1559,8 @@ impl<'g, 'a> Search<'g, 'a> {
                         let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MAX);
                         let mcp = self.mcp_adjustment(path, name, src_edge, tgt_edge, MAX);
                         let margin = self.sdc.output_delays[d].delay[path.tag.rf][MAX];
-                        Self::required_set(req, i, (((tgt_time + (0.0 + 0.0)) + unc) + mcp) - margin, MAX);
+                        let latency = self.output_tgt_latency(tgt_edge, MAX);
+                        Self::required_set(req, i, (((tgt_time + (0.0 + latency)) + unc) + mcp) - margin, MAX);
                     }
                 }
                 continue;
@@ -1611,6 +1618,18 @@ impl<'g, 'a> Search<'g, 'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// `PathEndOutputDelay::tgtClkDelay`'s latency for a path of min/max `mm` captured at
+    /// `tgt_edge`: an ideal clock's own (`clockLatency(clk, rf, tgtClkMinMax)`, the opposite
+    /// min/max under OCV), 0 unset or propagated. No insertion is set.
+    fn output_tgt_latency(&self, tgt_edge: usize, mm: usize) -> f32 {
+        let ck = &self.sdc.clocks[tgt_edge / 2];
+        if ck.propagated {
+            0.0
+        } else {
+            ck.latency[tgt_edge % 2][1 - mm].unwrap_or(0.0)
         }
     }
 
@@ -1820,7 +1839,8 @@ impl<'g, 'a> Search<'g, 'a> {
                     let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MIN);
                     let mcp = self.mcp_adjustment(path, &self.graph.vertices[v].name, src_edge, tgt_edge, MIN);
                     let margin = -self.sdc.output_delays[d].delay[path.tag.rf][MIN];
-                    Self::required_set(req, i, (((tgt_time + (0.0 + 0.0)) + unc) + mcp) + margin, MIN);
+                    let latency = self.output_tgt_latency(tgt_edge, MIN);
+                    Self::required_set(req, i, (((tgt_time + (0.0 + latency)) + unc) + mcp) + margin, MIN);
                 }
             }
             return;
