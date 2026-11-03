@@ -528,6 +528,12 @@ impl Timing {
 /// at the ideal slew, arrivals and requireds from [`constraints`]. `wns` / `tns` are over the
 /// endpoints' setup slacks (`Search::wnsSlacks`; `tns` the sum of the negative ones).
 pub fn time_design(libs: &[Library], nl: &Netlist, sdc: &crate::sdc::Sdc, env: crate::graph::SdcEnv) -> Result<Timing, String> {
+    time_design_for(libs, nl, sdc, env, crate::liberty::MAX)
+}
+
+/// [`time_design`] for min (`MIN`: hold, `report_worst_slack -min`, `report_tns -min`,
+/// `slack_min`) or max (`MAX`).
+pub fn time_design_for(libs: &[Library], nl: &Netlist, sdc: &crate::sdc::Sdc, env: crate::graph::SdcEnv, mm: usize) -> Result<Timing, String> {
     use crate::search::Search;
     let mut g = crate::graph::Graph::build(libs, nl)?;
     g.sdc = env;
@@ -541,7 +547,7 @@ pub fn time_design(libs: &[Library], nl: &Netlist, sdc: &crate::sdc::Sdc, env: c
     // under 0 added in DOUBLE (`DelayDbl`), narrowed to float once (`delayDblAsDelay`)
     let (mut wns, mut tns) = (crate::search::INF, 0.0f64);
     for v in (0..g.vertices.len()).filter(|&v| s.is_endpoint(v)) {
-        let slack = s.wns_slack(v, true);
+        let slack = s.wns_slack(v, mm == crate::liberty::MAX);
         if crate::fuzzy::less(slack, wns) {
             wns = slack;
         }
@@ -552,7 +558,7 @@ pub fn time_design(libs: &[Library], nl: &Netlist, sdc: &crate::sdc::Sdc, env: c
     let tns = tns as f32;
     let pin_slacks = (0..g.vertices.len())
         .filter_map(|v| {
-            let slack = s.slack_of(v, crate::liberty::MAX, None);
+            let slack = s.slack_of(v, mm, None);
             (slack < crate::search::INF).then(|| (g.vertices[v].name.clone(), slack))
         })
         .collect();

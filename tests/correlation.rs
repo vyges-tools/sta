@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The timer against the reference on a real design and library (`tests/data/correlation`): a
 //! 1,699-cell sky130 netlist of our own, five constraint variants, and for each the reference's
-//! worst slack, total negative slack and every pin's setup slack. Equal line for line — the
+//! worst slack, total negative slack and every pin's slack, setup and hold. Equal line for line — the
 //! values to the six digits the reference prints, and the same pins with a slack.
 //!
 //! What it covers: the loom readers mapped into the timer (`load`), delay calculation with ideal
@@ -19,14 +19,14 @@ fn libs() -> Vec<Library> {
     vec![Library::read(&vyges_sta::liberty_parse::parse(&text).expect("parses")).expect("reads")]
 }
 
-/// Our report for one variant, sorted as the golden is (byte order).
-fn ours(libs: &[Library], variant: &str) -> Vec<String> {
+/// Our report for one variant, setup (`MAX`) or hold (`MIN`), sorted as the golden is (byte order).
+fn ours(libs: &[Library], variant: &str, mm: usize) -> Vec<String> {
     let design = vyges_loom::netlist::load_compact(&format!("{D}rv_plic_lite.v")).expect("the netlist reads");
     let nl = vyges_sta::load::netlist(&design, libs).expect("every construct maps");
     let text = std::fs::read_to_string(format!("{D}{variant}.sdc")).expect("the constraints are in the repository");
     let sdc = vyges_loom::sdc::Sdc::parse_with(&text, &vyges_sta::load::sdc_design(&nl, libs)).expect("the constraints read");
     let (search_sdc, env, _notes) = vyges_sta::load::constraints(&sdc, &nl, libs).expect("every constraint maps");
-    let t = vyges_sta::load::time_design(libs, &nl, &search_sdc, env).expect("the design times");
+    let t = vyges_sta::load::time_design_for(libs, &nl, &search_sdc, env, mm).expect("the design times");
     let mut lines = t.report_lines(libs[0].time_scale);
     lines.sort();
     lines
@@ -37,11 +37,13 @@ fn every_variant_matches_the_reference_line_for_line() {
     let libs = libs();
     let mut failed = Vec::new();
     for variant in ["base", "tight", "env", "drive", "max_delay", "uncertainty", "false_path"] {
-        let golden: Vec<String> = std::fs::read_to_string(format!("{D}{variant}.golden")).expect("the golden is in the repository").lines().map(String::from).collect();
-        let ours = ours(&libs, variant);
-        if ours != golden {
-            let first = golden.iter().zip(&ours).find(|(g, o)| g != o);
-            failed.push(format!("{variant}: {} golden lines, {} ours; first difference {first:?}", golden.len(), ours.len()));
+        for (mm, file) in [(vyges_sta::liberty::MAX, format!("{variant}.golden")), (vyges_sta::liberty::MIN, format!("{variant}.hold.golden"))] {
+            let golden: Vec<String> = std::fs::read_to_string(format!("{D}{file}")).expect("the golden is in the repository").lines().map(String::from).collect();
+            let ours = ours(&libs, variant, mm);
+            if ours != golden {
+                let first = golden.iter().zip(&ours).find(|(g, o)| g != o);
+                failed.push(format!("{file}: {} golden lines, {} ours; first difference {first:?}", golden.len(), ours.len()));
+            }
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
