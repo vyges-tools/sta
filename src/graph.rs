@@ -98,6 +98,16 @@ impl std::ops::Deref for NetlistRef<'_> {
     }
 }
 
+/// `DeratingFactorsGlobal`'s factors, `[type][clock/data][rf][early/late]`: the type
+/// [`DERATE_CELL_DELAY`], [`DERATE_CELL_CHECK`] or [`DERATE_NET_DELAY`] (`TimingDerateType`
+/// order), [`DERATE_CLK`] or [`DERATE_DATA`] (`PathClkOrData`); early is MIN, late MAX.
+pub type DerateFactors = [[[[Option<f32>; 2]; 2]; 2]; 3];
+pub const DERATE_CELL_DELAY: usize = 0;
+pub const DERATE_CELL_CHECK: usize = 1;
+pub const DERATE_NET_DELAY: usize = 2;
+pub const DERATE_CLK: usize = 0;
+pub const DERATE_DATA: usize = 1;
+
 pub struct Graph<'a> {
     pub libs: &'a [Library],
     pub netlist: NetlistRef<'a>,
@@ -168,6 +178,9 @@ type ParasiticLoad<'p> = (f32, f32, Option<(crate::parasitics::PiElmore, &'p [St
 /// The SDC loads and drives delay calculation reads (`Sdc::connectedCap`, `seedDrvrSlew`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SdcEnv {
+    /// The design-wide `set_timing_derate` factors (`DeratingFactorsGlobal`), where any is set.
+    /// None: every factor 1.
+    pub derates: Option<Box<DerateFactors>>,
     /// `set_load` on a net (`setNetWireCap`), keyed — as `drvr_pin_wire_cap_map_` is — by each of
     /// the net's DRIVER pins when it was set: per min/max, the wire cap and `-subtract_pin_load`.
     pub net_wire_cap: HashMap<String, [Option<(f32, bool)>; 2]>,
@@ -1412,6 +1425,30 @@ impl<'a> Graph<'a> {
             }
         }
         Ok(())
+    }
+
+    /// `Search::timingDerate`: the factor on edge `e`'s arc `k` for a clock (`is_clk`) or data
+    /// path of min/max `mm` (early/late) — a wire's the net delay factor of the arc's TO
+    /// transition, a timing check's the cell check factor of its TO transition, any other arc's
+    /// the cell delay factor of its FROM transition; 1 where unset (`timingDerateNet` /
+    /// `timingDerateInstance` with no net, instance or cell factor).
+    pub fn timing_derate(&self, e: usize, k: usize, is_clk: bool, mm: usize) -> f32 {
+        let Some(d) = &self.sdc.derates else { return 1.0 };
+        let clk_data = if is_clk { DERATE_CLK } else { DERATE_DATA };
+        let (kind, rf) = match self.edges[e].kind {
+            // a wire's arc `k` carries transition `k` through unchanged
+            EdgeKind::Wire => (DERATE_NET_DELAY, k),
+            EdgeKind::Gate { set } => {
+                let arc_set = self.arc_set(e, set);
+                let arc = &arc_set.arcs[k];
+                if matches!(arc_set.role, Role::Setup | Role::Hold | Role::Recovery | Role::Removal) {
+                    (DERATE_CELL_CHECK, arc.to_rf)
+                } else {
+                    (DERATE_CELL_DELAY, arc.from_rf)
+                }
+            }
+        };
+        d[kind][clk_data][rf][mm].unwrap_or(1.0)
     }
 
     /// `ClkNetwork::idealClkSlew(pin, rf, min_max)`: the slew of the ideal clocks at the pin.

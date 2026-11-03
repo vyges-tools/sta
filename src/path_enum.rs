@@ -205,7 +205,9 @@ impl Enum<'_, '_, '_> {
         let mut arrival = clk_path_arrival(s, from_v, from);
         for i in (0..=bd).rev() {
             let (pe, pa) = nodes[i].prev.expect("set above");
-            arrival += s.graph.delay[pe][pa][nodes[i].tag.mm];
+            // `PathEnum::updatePathHeadDelays` → `deratedDelay`, clock or data as the path is
+            let mm = nodes[i].tag.mm;
+            arrival += s.derated_delay(pe, pa, nodes[i].tag.is_clock, mm, mm);
             nodes[i].arrival = arrival;
         }
         let slack = end.required - nodes[0].arrival;

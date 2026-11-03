@@ -930,6 +930,19 @@ impl<'g, 'a> Search<'g, 'a> {
         self.graph.delay[e][arc][mm]
     }
 
+    /// `Search::deratedDelay`: the arc's delay at the analysis point of `dcalc_mm` times the
+    /// `set_timing_derate` factor of a clock (`is_clk`) or data path of min/max `mm`
+    /// (`delayProduct`). With no derate the factor is 1 and the delay unchanged.
+    pub(crate) fn derated_delay(&self, e: usize, arc: usize, is_clk: bool, mm: usize, dcalc_mm: usize) -> f32 {
+        self.graph.delay[e][arc][dcalc_mm] * self.graph.timing_derate(e, arc, is_clk, mm)
+    }
+
+    /// A timing check arc's margin (`PathEndCheck::margin` and the like): the derated delay of a
+    /// data path (`is_clk` false).
+    fn check_margin(&self, e: usize, arc: usize, mm: usize) -> f32 {
+        self.derated_delay(e, arc, false, mm, mm)
+    }
+
     /// `Graph::arcDelay`: edge `e`'s delay on arc `arc` (an index into its arc set) for min/max `mm`.
     pub fn edge_arc_delay(&self, e: usize, arc: usize, mm: usize) -> f32 {
         self.arc_delay(e, arc, mm)
@@ -964,8 +977,11 @@ impl<'g, 'a> Search<'g, 'a> {
             return None;
         }
         let mm = from.tag.mm;
-        let delay = self.arc_delay(e, arc.index, mm);
         let role = self.role(e);
+        // `ArrivalVisitor::visitFromPath`: a clock path through the clock network derates as clock
+        // (`to_propagates_clk`, no stop here); a launch, a latch D->Q and a data path as data.
+        let is_clk = from.tag.is_clock && !matches!(role, Some(Role::RegClkToQ | Role::LatchEnToQ | Role::LatchDtoQ));
+        let delay = self.derated_delay(e, arc.index, is_clk, mm, mm);
         match role {
             // A latch's EN -> Q launches as a register's CLK -> Q (`genericRole() == regClkToQ`).
             Some(Role::RegClkToQ | Role::LatchEnToQ) => {
@@ -1013,7 +1029,8 @@ impl<'g, 'a> Search<'g, 'a> {
             _ if from.tag.is_clock => {
                 // A clock path through a clock-network arc.
                 let to_is_clk = matches!(role, None | Some(Role::Combinational));
-                let opp = self.arc_delay(e, arc.index, 1 - mm);
+                // `arc_delay_opp`: the other analysis point's delay, derated for THIS min/max
+                let opp = self.derated_delay(e, arc.index, is_clk, mm, 1 - mm);
                 let min_max_eq = crate::fuzzy::equal(delay, opp);
                 let from_is_reg_clk = self.is_reg_clk[from_v];
                 // `thruClkInfo`: the CRPR path set here is dropped again by `ClkInfo` for a clock
@@ -1571,14 +1588,14 @@ impl<'g, 'a> Search<'g, 'a> {
                         // DISABLE path; the required is `latchRequired`'s, the check arc the margin.
                         if self.latch_data[v] && self.sdc.path_delay_to(path.tag.states, name, true, MAX).is_none() {
                             let enable = self.latch_other_path(tgt_v, tgt);
-                            let (required, _, _) = self.latch_required(path, tgt_v, enable, Some(tgt), self.arc_delay(e, k, MAX));
+                            let (required, _, _) = self.latch_required(path, tgt_v, enable, Some(tgt), self.check_margin(e, k, MAX));
                             Self::required_set(req, i, required, MAX);
                             continue;
                         }
                         if let Some(id) = self.sdc.path_delay_to(path.tag.states, name, true, MAX) {
                             let latency = self.tgt_clk_delay(tgt);
                             let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MAX);
-                            let required = self.path_delay_required(path, id, self.arc_delay(e, k, MAX), latency, unc, self.check_crpr(path, tgt_v, tgt));
+                            let required = self.path_delay_required(path, id, self.check_margin(e, k, MAX), latency, unc, self.check_crpr(path, tgt_v, tgt));
                             Self::required_set(req, i, required, MAX);
                             continue;
                         }
@@ -1588,7 +1605,7 @@ impl<'g, 'a> Search<'g, 'a> {
                         let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MAX);
                         let mcp = self.mcp_adjustment(path, name, src_edge, tgt_edge, MAX);
                         let tgt_clk_arrival = (((0.0 + latency) + self.accting(src_edge, tgt_edge).required[ACCT_SETUP]) + unc) + mcp;
-                        let margin = self.arc_delay(e, k, MAX);
+                        let margin = self.check_margin(e, k, MAX);
                         let crpr = self.check_crpr(path, tgt_v, tgt);
                         Self::required_set(req, i, (tgt_clk_arrival - (margin + 0.0)) + crpr, MAX);
                     }
@@ -1687,7 +1704,7 @@ impl<'g, 'a> Search<'g, 'a> {
             let EdgeKind::Gate { set } = self.graph.edges[e].kind else { continue };
             for (k, arc) in self.graph.arc_set(e, set).arcs.iter().enumerate() {
                 if arc.to_rf == data_rf && arc.from_rf == dis.tag.rf {
-                    return self.arc_delay(e, k, dis.tag.mm);
+                    return self.check_margin(e, k, dis.tag.mm);
                 }
             }
         }
@@ -1712,7 +1729,7 @@ impl<'g, 'a> Search<'g, 'a> {
         if !crate::fuzzy::greater(borrow, 0.0) {
             return None;
         }
-        let delay = self.arc_delay(e, arc.index, MAX);
+        let delay = self.derated_delay(e, arc.index, false, MAX, MAX);
         let en_edge = en.tag.clk_edge.expect("a clock path");
         let crpr = self.propagated(en_edge).then_some(CrprPath { vertex: en_v, rf: en.tag.rf, mm: en.tag.mm, clk_edge: en_edge });
         let en_pin = &self.graph.vertices[en_v].name;
@@ -1736,7 +1753,7 @@ impl<'g, 'a> Search<'g, 'a> {
                     continue;
                 }
                 if let Some(id) = self.sdc.path_delay_to(path.tag.states, &self.graph.vertices[v].name, false, path.tag.mm) {
-                    Self::required_set(req, i, self.path_delay_required(path, id, self.arc_delay(e, k, path.tag.mm), 0.0, 0.0, 0.0), path.tag.mm);
+                    Self::required_set(req, i, self.path_delay_required(path, id, self.check_margin(e, k, path.tag.mm), 0.0, 0.0, 0.0), path.tag.mm);
                 }
             }
         }
@@ -1831,14 +1848,14 @@ impl<'g, 'a> Search<'g, 'a> {
                     // `visitCheckEnd`: a path delay completing here overrides the check.
                     if let Some(id) = self.sdc.path_delay_to(path.tag.states, &self.graph.vertices[v].name, true, MIN) {
                         let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MIN);
-                        let required = self.path_delay_required(path, id, self.arc_delay(e, k, MIN), latency, unc, self.check_crpr(path, tgt_v, tgt));
+                        let required = self.path_delay_required(path, id, self.check_margin(e, k, MIN), latency, unc, self.check_crpr(path, tgt_v, tgt));
                         Self::required_set(req, i, required, MIN);
                         continue;
                     }
                     let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MIN);
                     let mcp = self.mcp_adjustment(path, &self.graph.vertices[v].name, src_edge, tgt_edge, MIN);
                     let tgt_clk_arrival = (((0.0 + latency) + self.accting(src_edge, tgt_edge).required[ACCT_HOLD]) + unc) + mcp;
-                    let margin = self.arc_delay(e, k, MIN);
+                    let margin = self.check_margin(e, k, MIN);
                     let crpr = self.check_crpr(path, tgt_v, tgt);
                     Self::required_set(req, i, (tgt_clk_arrival + (margin - 0.0)) + (0.0 - crpr), MIN);
                 }

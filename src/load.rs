@@ -265,14 +265,13 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
         }
         notes.push(format!("{}: {} (no slack moves with it)", n.command, n.why));
     }
-    let refused: [(&str, bool); 9] = [
+    let refused: [(&str, bool); 8] = [
         ("set_clock_latency on the clock source or without pins", s.clock_latencies.iter().any(|l| l.accessor != "get_pins")),
         ("set_case_analysis", !s.case_values.is_empty()),
         ("set_logic_zero / set_logic_one / set_logic_dc", !s.logic_values.is_empty()),
         ("set_disable_timing", !s.disabled_timing.is_empty()),
         ("set_sense / set_clock_sense", !s.senses.is_empty()),
         ("set_disable_clock_gating_check", !s.disabled_gating_checks.is_empty()),
-        ("set_timing_derate", !s.derates.is_empty()),
         ("group_path / set_path_margin", !s.other_exceptions.is_empty()),
         ("a command kept as written", !s.kept.is_empty()),
     ];
@@ -300,6 +299,9 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
     // clock groups likewise: per clock below (`async_groups` is their merged projection)
     let groups = std::mem::take(&mut s.clock_groups);
     s.async_groups.clear();
+    // derates too: onto the graph below (`late_derate` / `early_derate` are their projection)
+    let derates = timing_derates(&std::mem::take(&mut s.derates))?;
+    (s.late_derate, s.early_derate) = (None, None);
     let mut sdc = search_sdc_on(&s, nl, lib0.time_scale, false, false)?;
     clock_uncertainties(&uncertainties, &mut sdc.clocks, lib0.time_scale)?;
     clock_groups(&groups, &mut sdc.clocks)?;
@@ -309,7 +311,8 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
         return Err("set_false_path / set_multicycle_path with set_max_delay / set_min_delay: not modelled (the ids across them are the order they were made in)".into());
     }
     sdc.path_delays.extend(falses);
-    let env = sdc_env(&s, libs, nl)?;
+    let mut env = sdc_env(&s, libs, nl)?;
+    env.derates = derates;
     Ok((sdc, env, notes))
 }
 
@@ -358,6 +361,66 @@ fn clock_groups(cgs: &[vyges_loom::sdc::ClockGroups], clocks: &mut [crate::sdc::
 /// Every `set_clock_transition` in order (`set_clock_slew_cmd`): the value (`time_ui_sta`) on
 /// each named clock for `-rise` / `-fall` (else both) and `-min` / `-max` (else both), a later
 /// command overwriting what it sets. A virtual clock takes none (Warning 419, a note here).
+/// Every `set_timing_derate` without objects as the reference sets it (`set_timing_derate` in
+/// `Sdc.tcl` → `DeratingFactorsGlobal::setFactor`): `-early` (min) or `-late` (max), one required;
+/// `-clock` / `-data` (neither: both); `-rise` / `-fall` (neither: both); the types named among
+/// `-cell_delay`, `-cell_check`, `-net_delay`, and with none of them cell and net delays but NOT
+/// cell checks. A later command overwrites what it sets. The factor is the command's `float`.
+/// Objects (cells, instances, nets) are refused. None with no command.
+fn timing_derates(ds: &[vyges_loom::sdc::EnvCmd]) -> Result<Option<Box<crate::graph::DerateFactors>>, String> {
+    use crate::graph::{DERATE_CELL_CHECK, DERATE_CELL_DELAY, DERATE_CLK, DERATE_DATA, DERATE_NET_DELAY};
+    use crate::liberty::{FALL, MAX, MIN, RISE};
+    if ds.is_empty() {
+        return Ok(None);
+    }
+    let mut f: crate::graph::DerateFactors = [[[[None; 2]; 2]; 2]; 3];
+    for d in ds {
+        let known = ["-rise", "-fall", "-early", "-late", "-clock", "-data", "-net_delay", "-cell_delay", "-cell_check"];
+        if let Some(x) = d.flags.iter().find(|x| !known.contains(&x.as_str())) {
+            return Err(format!("set_timing_derate {x}: not modelled"));
+        }
+        if !d.objects.is_empty() || !d.accessor.is_empty() {
+            return Err("set_timing_derate on cells, instances or nets: not modelled (design-wide factors are)".into());
+        }
+        let has = |x: &str| d.flags.iter().any(|y| y == x);
+        let mm = match (has("-early"), has("-late")) {
+            (true, false) => MIN,
+            (false, true) => MAX,
+            (true, true) => return Err("set_timing_derate: only one of -early and -late can be specified (110)".into()),
+            (false, false) => return Err("set_timing_derate: -early or -late must be specified (111)".into()),
+        };
+        let paths: &[usize] = match (has("-clock"), has("-data")) {
+            (true, false) => &[DERATE_CLK],
+            (false, true) => &[DERATE_DATA],
+            _ => &[DERATE_CLK, DERATE_DATA],
+        };
+        let rfs: &[usize] = match (has("-rise"), has("-fall")) {
+            (true, false) => &[RISE],
+            (false, true) => &[FALL],
+            _ => &[RISE, FALL],
+        };
+        let mut kinds: Vec<usize> = Vec::new();
+        for (flag, k) in [("-net_delay", DERATE_NET_DELAY), ("-cell_delay", DERATE_CELL_DELAY), ("-cell_check", DERATE_CELL_CHECK)] {
+            if has(flag) {
+                kinds.push(k);
+            }
+        }
+        if kinds.is_empty() {
+            kinds = vec![DERATE_NET_DELAY, DERATE_CELL_DELAY];
+        }
+        // `check_float`, then the command's `float derate`
+        let value = d.value as f32;
+        for &k in &kinds {
+            for &p in paths {
+                for &rf in rfs {
+                    f[k][p][rf][mm] = Some(value);
+                }
+            }
+        }
+    }
+    Ok(Some(Box::new(f)))
+}
+
 fn clock_transitions(ts: &[vyges_loom::sdc::EnvCmd], clocks: &mut [crate::sdc::Clock], time_scale: f32, notes: &mut Vec<String>) -> Result<(), String> {
     use crate::liberty::{FALL, MAX, MIN, RISE};
     for t in ts {
@@ -1294,6 +1357,24 @@ mod tests {
         assert_eq!(cut("set_clock_groups -asynchronous -group {a} -group {nope}\n"), vec![vec![1, 2], vec![0], vec![0]]);
         assert_eq!(cut("set_clock_groups -asynchronous -allow_paths -group {a} -group {b}\n"), vec![Vec::<usize>::new(); 3]);
         assert_eq!(cut("set_clock_groups -name g -asynchronous -group {a} -group {b}\nset_clock_groups -name g -asynchronous -allow_paths -group {a} -group {b}\n"), vec![Vec::<usize>::new(); 3]);
+    }
+
+    /// Rules (`set_timing_derate` in `Sdc.tcl`): `-early` is min, `-late` max, exactly one
+    /// required; with no type flag cell and net delays are derated but NOT cell checks; neither
+    /// `-clock` nor `-data` is both, neither `-rise` nor `-fall` both; a later command overwrites
+    /// only what it names. (The `derate` correlation variant witnesses cell delays and checks;
+    /// `-clock` is unwitnessed there, the design's clock reaching its registers over wires alone.)
+    #[test]
+    fn timing_derates_set_what_their_flags_name() {
+        use crate::graph::{DERATE_CELL_CHECK, DERATE_CELL_DELAY, DERATE_CLK, DERATE_DATA, DERATE_NET_DELAY};
+        use crate::liberty::{FALL, MAX, MIN, RISE};
+        let read = |text: &str| timing_derates(&vyges_loom::sdc::Sdc::parse(text).unwrap().derates);
+        let f = read("set_timing_derate -late 1.05\nset_timing_derate -late -cell_delay -rise -data 1.08\n").unwrap().unwrap();
+        assert_eq!((f[DERATE_CELL_DELAY][DERATE_DATA][RISE][MAX], f[DERATE_CELL_DELAY][DERATE_CLK][RISE][MAX], f[DERATE_NET_DELAY][DERATE_DATA][FALL][MAX]), (Some(1.08), Some(1.05), Some(1.05)));
+        assert_eq!((f[DERATE_CELL_CHECK][DERATE_DATA][RISE][MAX], f[DERATE_CELL_DELAY][DERATE_DATA][RISE][MIN]), (None, None), "no check, no early");
+        assert!(read("set_timing_derate 1.05\n").unwrap_err().contains("111"));
+        assert!(read("set_timing_derate -early -late 1.05\n").unwrap_err().contains("110"));
+        assert!(read("").unwrap().is_none());
     }
 
     /// Rules (`set_clock_transition` in `Sdc.tcl`, `Clock::setSlew`): `-rise` / `-fall` and
