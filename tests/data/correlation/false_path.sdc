@@ -1,0 +1,8 @@
+create_clock -name clk_i -period 2.5 [get_ports {clk_i}]
+set_input_delay 0.4 -clock clk_i [all_inputs]
+set_output_delay 0.6 -clock clk_i [all_outputs]
+set_false_path -from [get_ports rst_ni]
+set_false_path -to [get_ports irq_o]
+set_false_path -from [get_ports {tl_i[*]}] -to [get_ports {tl_o[*]}]
+set_false_path -hold -from [get_ports {tl_i[1*]}]
+set_false_path -from [get_ports -quiet {no_such_port}] -to [get_ports {tl_o[0]}]

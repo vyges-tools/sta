@@ -106,6 +106,10 @@ pub struct PathDelay {
     /// Not `-probe`: an internal `-from` / `-to` pin breaks the search there.
     pub break_path: bool,
     pub delay: f32,
+    /// `set_false_path` (a `FalsePath`), not a delay: kept with the path delays because the
+    /// reference ranks every exception by one priority (`ExceptionPath::typePriority`). `delay`,
+    /// `ignore_clk_latency` and `break_path` mean nothing for it.
+    pub false_path: bool,
 }
 
 impl PathDelay {
@@ -119,7 +123,8 @@ impl PathDelay {
         self.to_pins.iter().any(|p| p == pin) || (clocked && self.to_clock) || (self.to_pins.is_empty() && !self.to_clock)
     }
 
-    /// `pathDelayPriority() + fromThruToPriority()`: the type's base (path delays: 3000) PLUS
+    /// `typePriority() + fromThruToPriority()`: the type's base (false paths 4000, path delays
+    /// 3000) PLUS
     /// `-from` pins 1<<6, `-to` pins 1<<5, `-from` clocks 1<<3, `-to` clocks 1<<2 — added, not OR'd
     /// (3000 has bits 3 and 5 set).
     fn priority(&self) -> i32 {
@@ -136,11 +141,22 @@ impl PathDelay {
         if self.to_clock {
             p |= 1 << 2;
         }
-        3000 + p
+        (if self.false_path { 4000 } else { 3000 }) + p
+    }
+
+    /// `ExceptionState::isComplete` at the start: a false path with no `-to` (and no `-through`,
+    /// none here) is complete out of the gate — the path it starts is never made.
+    fn complete_false(&self) -> bool {
+        self.false_path && self.to_pins.is_empty() && !self.to_clock
     }
 
     /// `PathDelay::tighterThan`: a min delay is tighter when larger, a max delay when smaller.
+    /// A false path is never tighter (`FalsePath::tighterThan`): of two at one priority, the
+    /// first found stays.
     fn tighter_than(&self, other: &PathDelay) -> bool {
+        if self.false_path || other.false_path {
+            return false;
+        }
         if self.min_max == crate::liberty::MIN {
             self.delay > other.delay
         } else {
@@ -202,13 +218,35 @@ impl Sdc {
         }
     }
 
+    /// `Sdc::exceptionFromStates` returning false: a false path of this min/max complete at the
+    /// start (no `-to`) whose `-from` names `pin` — or, for a path the clock launches (`clk`),
+    /// the clock. No path starts there (`inputDelayTag` / `fromRegClkTag` make no tag). The
+    /// clock's own network paths are seeded regardless (`exceptionFromClkStates`).
+    pub fn false_from(&self, pin: &str, clk: bool, mm: usize) -> bool {
+        self.path_delays.iter().any(|pd| {
+            pd.min_max == mm && pd.complete_false() && (pd.from_pins.iter().any(|p| p == pin) || (clk && pd.from_clock && pd.from_pins.is_empty()))
+        })
+    }
+
+    /// `VisitPathEnds::falsePathTo` → `Search::exceptionTo(false_path, path, pin, rf, clk_edge =
+    /// null, min_max)`: of the FALSE PATHS alone, one of the path's states complete at `pin`, or
+    /// one whose first point is a `-to` naming the pin. Read before any end is visited, so a match
+    /// makes no end at the pin at all — check, output delay, path delay or gated clock. No clock
+    /// edge is passed, so `-to` the clock never matches here.
+    pub fn false_path_to(&self, states: States, pin: &str, mm: usize) -> bool {
+        let to = |pd: &PathDelay| pd.false_path && pd.min_max == mm && pd.to_matches(pin, false);
+        states.ids().any(|id| to(&self.path_delays[id]))
+            || self.path_delays.iter().any(|pd| !pd.has_from() && !pd.to_pins.is_empty() && to(pd))
+    }
+
     /// `Sdc::exceptionFromStates`: the states a path starting at `pin` (and, launched by the clock,
-    /// at `clk`) carries — every path delay of this min/max whose `-from` names the pin, then every
-    /// one whose `-from` names the clock. No false paths here, so a search always continues from it.
+    /// at `clk`) carries — every exception of this min/max whose `-from` names the pin, then every
+    /// one whose `-from` names the clock. A false path complete at the start is not a state: it
+    /// stops the path ([`Sdc::false_from`], which callers ask first).
     pub fn exception_from_states(&self, pin: &str, clk: bool, mm: usize) -> States {
         let mut s = 0u64;
         for (id, pd) in self.path_delays.iter().enumerate() {
-            if pd.min_max == mm && (pd.from_pins.iter().any(|p| p == pin) || (clk && pd.from_clock && pd.from_pins.is_empty())) {
+            if pd.min_max == mm && !pd.complete_false() && (pd.from_pins.iter().any(|p| p == pin) || (clk && pd.from_clock && pd.from_pins.is_empty())) {
                 s |= 1 << id;
             }
         }
@@ -219,18 +257,21 @@ impl Sdc {
     /// `-to` naming `pin` (clocks do not count) and is of this min/max.
     pub fn is_complete_to_pin(&self, id: usize, pin: &str, mm: usize) -> bool {
         let pd = &self.path_delays[id];
-        pd.min_max == mm && pd.to_pins.iter().any(|p| p == pin)
+        !pd.false_path && pd.min_max == mm && pd.to_pins.iter().any(|p| p == pin)
     }
 
     /// `Search::exceptionTo(any, path, pin, rf, clk_edge, min_max)` over path delays: the highest
     /// priority — ties to the tighter — of the path's states complete at `pin` (a state with no
     /// `-to` completes anywhere), then of the exceptions whose FIRST point is a `-to` matching the
     /// pin or the target clock. `clocked`: the end has a target clock edge.
+    ///
+    /// False paths are not candidates: a false path at the pin has already stopped the end
+    /// ([`Sdc::false_path_to`]), and one that does not match here could not win.
     pub fn path_delay_to(&self, states: States, pin: &str, clocked: bool, mm: usize) -> Option<usize> {
         let mut best: Option<usize> = None;
         let consider = |id: usize, best: &mut Option<usize>| {
             let pd = &self.path_delays[id];
-            if pd.min_max != mm || !pd.to_matches(pin, clocked) {
+            if pd.false_path || pd.min_max != mm || !pd.to_matches(pin, clocked) {
                 return;
             }
             let better = match *best {
@@ -423,6 +464,36 @@ mod tests {
     use super::*;
     use crate::liberty::{FALL, MAX, MIN, RISE};
 
+    fn false_path(from: &[&str], to: &[&str], mm: usize) -> PathDelay {
+        PathDelay { from_pins: from.iter().map(|p| p.to_string()).collect(), from_clock: false, to_pins: to.iter().map(|p| p.to_string()).collect(), to_clock: false, min_max: mm, ignore_clk_latency: false, break_path: false, delay: 0.0, false_path: true }
+    }
+
+    /// Rules (`Sdc::exceptionFromStates`, `VisitPathEnds::falsePathTo`): a false path with no
+    /// `-to` is complete at its start — it is no state, and the start makes no tag
+    /// (`false_from`); one with a `-to` rides on the tag as a state and stops the end at its `-to`
+    /// pin, as does one whose first point is that `-to`. Each only for its own min/max, and never
+    /// a path delay candidate (`pathDelayTo` asks for path delays alone).
+    #[test]
+    fn a_false_path_stops_the_start_or_the_end_it_names() {
+        let mut max_delay = false_path(&["a"], &["y"], MAX);
+        (max_delay.false_path, max_delay.delay) = (false, 1e-9);
+        let sdc = Sdc {
+            clocks: vec![],
+            input_delays: vec![],
+            output_delays: vec![],
+            path_delays: vec![false_path(&["rst"], &[], MAX), false_path(&["a"], &["y"], MAX), false_path(&[], &["z"], MIN), max_delay],
+        };
+        assert!(sdc.false_from("rst", false, MAX) && !sdc.false_from("rst", false, MIN), "complete at the start, max only");
+        assert!(!sdc.false_from("a", false, MAX), "a -to: not complete at the start");
+        assert_eq!(sdc.exception_from_states("rst", false, MAX), States::NONE, "a complete false path is no state");
+        let from_a = sdc.exception_from_states("a", false, MAX);
+        assert_eq!(from_a, States(0b1010), "the false path and the max delay from a");
+        assert!(sdc.false_path_to(from_a, "y", MAX), "its state completes at y");
+        assert!(!sdc.false_path_to(States::NONE, "y", MAX), "a path not from a carries no state");
+        assert!(!sdc.false_path_to(from_a, "z", MAX) && sdc.false_path_to(States::NONE, "z", MIN), "first point -to z: any path, min only");
+        assert_eq!(sdc.path_delay_to(from_a, "y", false, MAX), Some(3), "the max delay, though the false path ranks higher");
+    }
+
     /// Rule (`PathEnd::checkClkUncertainty`): an inter-clock uncertainty from the source edge's
     /// clock to the target edge's, for the two edges and the check's min/max, replaces the
     /// target clock's own (it does not add); none set for those edges, or an unclocked path, and
@@ -481,7 +552,7 @@ mod tests {
     /// only the delay's own min/max matches.
     #[test]
     fn path_delay_to_takes_the_highest_priority_then_the_tighter() {
-        let pd = |to_pins: &[&str], to_clock: bool, delay: f32| PathDelay { from_pins: vec!["r1/CLK".into()], from_clock: false, to_pins: to_pins.iter().map(|p| p.to_string()).collect(), to_clock, min_max: MAX, ignore_clk_latency: true, break_path: true, delay };
+        let pd = |to_pins: &[&str], to_clock: bool, delay: f32| PathDelay { from_pins: vec!["r1/CLK".into()], from_clock: false, to_pins: to_pins.iter().map(|p| p.to_string()).collect(), to_clock, min_max: MAX, ignore_clk_latency: true, break_path: true, delay, false_path: false };
         let sdc = Sdc { clocks: vec![Clock::new("c", 2.0, "clk", true)], input_delays: Vec::new(), output_delays: Vec::new(), path_delays: vec![pd(&[], true, 1.0), pd(&["r3/D"], false, 3.0), pd(&["r3/D"], false, 2.0)] };
         let all = States(0b111);
         assert_eq!(sdc.path_delay_to(all, "r3/D", true, MAX), Some(2));

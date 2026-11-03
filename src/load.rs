@@ -274,7 +274,7 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
         ("set_sense / set_clock_sense", !s.senses.is_empty()),
         ("set_disable_clock_gating_check", !s.disabled_gating_checks.is_empty()),
         ("set_timing_derate", !s.derates.is_empty()),
-        ("set_false_path / set_multicycle_path", !s.exceptions.is_empty()),
+        ("set_multicycle_path", s.exceptions.iter().any(|e| e.kind != vyges_loom::sdc::ExcKind::FalsePath)),
         ("set_clock_groups", !s.clock_groups.is_empty() || !s.async_groups.is_empty()),
         ("group_path / set_path_margin", !s.other_exceptions.is_empty()),
         ("a command kept as written", !s.kept.is_empty()),
@@ -297,8 +297,16 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
     // uncertainties are applied per clock below; the search's design-wide refusal is for rsz
     let uncertainties = std::mem::take(&mut s.uncertainties);
     (s.setup_uncertainty, s.hold_uncertainty) = (0.0, 0.0);
+    // false paths go to the search with the path delays (one priority ranks them); the search's
+    // design-wide refusal of exceptions is for rsz
+    let exceptions = std::mem::take(&mut s.exceptions);
     let mut sdc = search_sdc_on(&s, nl, lib0.time_scale, false, false)?;
     clock_uncertainties(&uncertainties, &mut sdc.clocks, lib0.time_scale)?;
+    let falses = false_paths(&exceptions, &s, nl)?;
+    if !falses.is_empty() && !sdc.path_delays.is_empty() {
+        return Err("set_false_path with set_max_delay / set_min_delay: not modelled (the ids across the two are the order they were made in)".into());
+    }
+    sdc.path_delays.extend(falses);
     let env = sdc_env(&s, libs, nl)?;
     Ok((sdc, env, notes))
 }
@@ -397,6 +405,84 @@ fn clock_uncertainties(us: &[vyges_loom::sdc::ClockUncertainty], clocks: &mut [c
         }
     }
     Ok(())
+}
+
+/// Every `set_false_path` as the reference makes it (`FalsePath`), in file order: `-from` and
+/// `-to` on ports or pins (patterns matched against the netlist, as `get_ports` / `get_pins` do)
+/// or on the one clock; `-setup` alone is the max paths', `-hold` alone the min paths', else one
+/// for each. `-through`, the edge forms (`-rise_from`, `-rise`, …), `-reset_path`, instances and
+/// several clocks are refused.
+fn false_paths(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc, nl: &Netlist) -> Result<Vec<crate::sdc::PathDelay>, String> {
+    use crate::liberty::{MAX, MIN};
+    let mut pins: Vec<String> = Vec::new();
+    for net in &nl.nets {
+        for c in &net.pins {
+            if let Conn::Inst(i, port) = c {
+                pins.push(format!("{}/{port}", nl.insts[*i].0));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for e in es {
+        if let Some(f) = e.flags.iter().find(|f| !matches!(f.as_str(), "-setup" | "-hold")) {
+            return Err(format!("set_false_path {f}: not modelled"));
+        }
+        if let Some((f, _)) = e.args.iter().find(|(f, _)| f != "-from" && f != "-to") {
+            return Err(format!("set_false_path {f}: not modelled"));
+        }
+        let side = |flag: &str| -> Result<(Vec<String>, bool), String> {
+            let (mut names, mut clock) = (Vec::new(), false);
+            for (_, o) in e.args.iter().filter(|(f, _)| f == flag) {
+                match o.accessor.as_str() {
+                    "get_ports" => {
+                        for n in &o.names {
+                            names.extend(nl.ports.iter().map(|(p, _)| p).filter(|p| vyges_loom::sdc::object_matches(n, p)).cloned());
+                        }
+                    }
+                    "get_pins" => {
+                        for n in &o.names {
+                            names.extend(pins.iter().filter(|p| vyges_loom::sdc::object_matches(n, p)).cloned());
+                        }
+                    }
+                    "get_clocks" if s.clocks.len() == 1 && o.names.iter().all(|n| vyges_loom::sdc::object_matches(n, &s.clocks[0].name)) => clock = true,
+                    other => return Err(format!("set_false_path {flag} [{other} {}]: not modelled (ports, pins or the one clock are)", o.names.join(" "))),
+                }
+            }
+            names.dedup();
+            Ok((names, clock))
+        };
+        let (from_pins, from_clock) = side("-from")?;
+        let (to_pins, to_clock) = side("-to")?;
+        // Warnings 471 / 473: a side given whose objects match nothing makes no exception at all
+        // (read as no side, `-from [get_ports -quiet nope]` would cut every path)
+        let given = |flag: &str| e.args.iter().any(|(f, _)| f == flag);
+        if (given("-from") && from_pins.is_empty() && !from_clock) || (given("-to") && to_pins.is_empty() && !to_clock) {
+            continue;
+        }
+        if !given("-from") && !given("-to") {
+            return Err("set_false_path with no -from / -to: not modelled".into());
+        }
+        let has = |f: &str| e.flags.iter().any(|x| x == f);
+        let mms: &[usize] = match (has("-setup"), has("-hold")) {
+            (true, false) => &[MAX],
+            (false, true) => &[MIN],
+            _ => &[MIN, MAX],
+        };
+        for &mm in mms {
+            out.push(crate::sdc::PathDelay {
+                from_pins: from_pins.clone(),
+                from_clock,
+                to_pins: to_pins.clone(),
+                to_clock,
+                min_max: mm,
+                ignore_clk_latency: false,
+                break_path: false,
+                delay: 0.0,
+                false_path: true,
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// A `-from` / `-to` side as `get_clocks_warn` reads it: names are clocks.
@@ -961,6 +1047,7 @@ pub fn path_delays(s: &vyges_loom::sdc::Sdc, time_scale: f32) -> Result<Vec<crat
             ignore_clk_latency: flag("-ignore_clock_latency"),
             break_path: !flag("-probe"),
             delay: crate::sdc::user_to_sta(d.value, time_scale),
+            false_path: false,
         });
     }
     if out.len() > 1 {
@@ -1052,6 +1139,28 @@ mod tests {
         assert!(read("set_clock_uncertainty 0.1 [get_pins r/CK]\n").unwrap_err().contains("not modelled"));
     }
 
+
+    /// Rules (`Sdc::makeFalsePath` / `makeExceptionFrom`, probed on the reference with
+    /// `rv_plic_lite`): `-setup` is the max paths, `-hold` the min ones, neither both; a side
+    /// given whose objects match nothing warns (471 `-from`, 473 `-to`) and makes NO exception —
+    /// the slacks were the ones without the command, not those of a path cut everywhere.
+    #[test]
+    fn false_paths_split_by_min_max_and_skip_an_empty_side() {
+        use crate::liberty::{MAX, MIN};
+        let src = "module ord2 (a, y);\n input a; output y; wire n1;\n BUF drv (.A(a), .X(n1));\n BUF lz (.A(n1), .X(y));\nendmodule\n";
+        let nl = netlist(&vyges_loom::netlist::parse_compact(src).unwrap(), &[lib()]).unwrap();
+        let read = |text: &str| {
+            let s = vyges_loom::sdc::Sdc::parse(text).unwrap();
+            false_paths(&s.exceptions, &s, &nl)
+        };
+        let f = read("set_false_path -setup -from [get_ports a] -to [get_pins lz/X]\n").unwrap();
+        assert_eq!(f.len(), 1);
+        assert_eq!((f[0].min_max, f[0].from_pins.clone(), f[0].to_pins.clone()), (MAX, vec!["a".to_string()], vec!["lz/X".to_string()]));
+        let f = read("set_false_path -to [get_ports y]\n").unwrap();
+        assert_eq!(f.iter().map(|p| p.min_max).collect::<Vec<_>>(), vec![MIN, MAX]);
+        assert!(read("set_false_path -from [get_ports -quiet nope]\nset_false_path -from [get_ports a] -to [get_ports -quiet nope2]\n").unwrap().is_empty(), "an empty side: no exception");
+        assert!(read("set_false_path -from [get_ports a] -through [get_pins lz/A]\n").unwrap_err().contains("not modelled"));
+    }
 
     /// The constraints a flow generates — every input and output delayed through `[all_inputs]` /
     /// `[all_outputs]` — read for the timing search: expanded to the design's ports, the clock's
