@@ -634,11 +634,12 @@ impl<'g, 'a> Search<'g, 'a> {
             let crpr = self.check_crpr(path, clk_v, tgt);
             // `clockGatingMargin`: no `set_clock_gating_check`, 0.
             let margin = 0.0f32;
+            let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, mm);
             if mm == MAX {
-                let tgt_clk_arrival = (0.0 + latency) + acct.required[ACCT_SETUP];
+                let tgt_clk_arrival = ((0.0 + latency) + acct.required[ACCT_SETUP]) + unc;
                 Self::required_set(req, i, (tgt_clk_arrival - margin) + crpr, MAX);
             } else {
-                let tgt_clk_arrival = (0.0 + latency) + acct.required[crate::sdc::ACCT_GCLK_HOLD];
+                let tgt_clk_arrival = ((0.0 + latency) + acct.required[crate::sdc::ACCT_GCLK_HOLD]) + unc;
                 Self::required_set(req, i, (tgt_clk_arrival + margin) + (0.0 - crpr), MIN);
             }
         }
@@ -1029,6 +1030,12 @@ impl<'g, 'a> Search<'g, 'a> {
         if self.sdc.path_delays.len() > 64 {
             return Err(format!("{} path delays: not modelled (64 are)", self.sdc.path_delays.len()));
         }
+        // A latch's borrow takes the enable clock's uncertainty too (`latchBorrowInfo`'s
+        // `open_uncertainty`), which `latch_required` does not carry.
+        let uncertain = self.sdc.clocks.iter().any(|c| c.uncertainty.iter().any(Option::is_some) || !c.inter_uncertainties.is_empty());
+        if uncertain && self.latch_data.iter().any(|&l| l) {
+            return Err("set_clock_uncertainty on a design with latches: not modelled".into());
+        }
         let find = |pin: &str| self.graph.vertices.iter().position(|x| x.name == pin);
         for pd in &self.sdc.path_delays {
             let cmd = if pd.min_max == MAX { "set_max_delay" } else { "set_min_delay" };
@@ -1401,7 +1408,7 @@ impl<'g, 'a> Search<'g, 'a> {
             // (`pathDelayTo`, no target clock), whatever the path's clock.
             if ods.is_empty() && !checks {
                 if let Some(id) = self.sdc.path_delay_to(path.tag.states, name, false, path.tag.mm) {
-                    Self::required_set(req, i, self.path_delay_required(path, id, 0.0, 0.0, 0.0), path.tag.mm);
+                    Self::required_set(req, i, self.path_delay_required(path, id, 0.0, 0.0, 0.0, 0.0), path.tag.mm);
                 }
                 continue;
             }
@@ -1423,9 +1430,11 @@ impl<'g, 'a> Search<'g, 'a> {
                 // value for this transition.
                 for &d in ods {
                     if self.sdc.output_delays[d].exists[path.tag.rf][MAX] {
-                        let tgt_time = self.accting(src_edge, 2 * self.sdc.output_delays[d].clock).required[ACCT_SETUP];
+                        let tgt_edge = 2 * self.sdc.output_delays[d].clock;
+                        let tgt_time = self.accting(src_edge, tgt_edge).required[ACCT_SETUP];
+                        let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MAX);
                         let margin = self.sdc.output_delays[d].delay[path.tag.rf][MAX];
-                        Self::required_set(req, i, (tgt_time + (0.0 + 0.0)) - margin, MAX);
+                        Self::required_set(req, i, ((tgt_time + (0.0 + 0.0)) + unc) - margin, MAX);
                     }
                 }
                 continue;
@@ -1461,14 +1470,16 @@ impl<'g, 'a> Search<'g, 'a> {
                         }
                         if let Some(id) = self.sdc.path_delay_to(path.tag.states, name, true, MAX) {
                             let latency = self.tgt_clk_delay(tgt);
-                            let required = self.path_delay_required(path, id, self.arc_delay(e, k, MAX), latency, self.check_crpr(path, tgt_v, tgt));
+                            let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MAX);
+                            let required = self.path_delay_required(path, id, self.arc_delay(e, k, MAX), latency, unc, self.check_crpr(path, tgt_v, tgt));
                             Self::required_set(req, i, required, MAX);
                             continue;
                         }
                         // The check's required time.
                         // An ideal clock's target has no network latency (`targetClkDelay`).
                         let latency = self.tgt_clk_delay(tgt);
-                        let tgt_clk_arrival = (0.0 + latency) + self.accting(src_edge, tgt_edge).required[ACCT_SETUP];
+                        let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MAX);
+                        let tgt_clk_arrival = ((0.0 + latency) + self.accting(src_edge, tgt_edge).required[ACCT_SETUP]) + unc;
                         let margin = self.arc_delay(e, k, MAX);
                         let crpr = self.check_crpr(path, tgt_v, tgt);
                         Self::required_set(req, i, (tgt_clk_arrival - (margin + 0.0)) + crpr, MAX);
@@ -1608,7 +1619,7 @@ impl<'g, 'a> Search<'g, 'a> {
                     continue;
                 }
                 if let Some(id) = self.sdc.path_delay_to(path.tag.states, &self.graph.vertices[v].name, false, path.tag.mm) {
-                    Self::required_set(req, i, self.path_delay_required(path, id, self.arc_delay(e, k, path.tag.mm), 0.0, 0.0), path.tag.mm);
+                    Self::required_set(req, i, self.path_delay_required(path, id, self.arc_delay(e, k, path.tag.mm), 0.0, 0.0, 0.0), path.tag.mm);
                 }
             }
         }
@@ -1620,13 +1631,14 @@ impl<'g, 'a> Search<'g, 'a> {
     /// time (`targetClkArrivalNoCrpr`: delay + uncertainty) + the check's CRPR (negated for
     /// hold, `checkCrpr`) + the delay − the source offset (−the source edge's time, which the
     /// arrival includes and the delay does not). Then less a max path's margin, plus a min's.
-    fn path_delay_required(&self, path: &Path, id: usize, margin: f32, latency: f32, crpr: f32) -> f32 {
+    /// `unc` is the target's `checkClkUncertainty` (0 with no target clock).
+    fn path_delay_required(&self, path: &Path, id: usize, margin: f32, latency: f32, unc: f32, crpr: f32) -> f32 {
         let pd = &self.sdc.path_delays[id];
         let with_delay = if pd.ignore_clk_latency {
             self.path_clk_path_arrival(path) + pd.delay
         } else {
             let check_crpr = if path.tag.mm == MAX { crpr } else { 0.0 - crpr };
-            let tgt_clk_arrival = (latency + 0.0) + check_crpr;
+            let tgt_clk_arrival = (latency + unc) + check_crpr;
             let src_clk_offset = path.tag.clk_edge.map_or(0.0, |e| -self.edge_time(e));
             (tgt_clk_arrival + pd.delay) - src_clk_offset
         };
@@ -1666,9 +1678,11 @@ impl<'g, 'a> Search<'g, 'a> {
         if !ods.is_empty() {
             for &d in ods {
                 if self.sdc.output_delays[d].exists[path.tag.rf][MIN] {
-                    let tgt_time = self.accting(src_edge, 2 * self.sdc.output_delays[d].clock).required[ACCT_HOLD];
+                    let tgt_edge = 2 * self.sdc.output_delays[d].clock;
+                    let tgt_time = self.accting(src_edge, tgt_edge).required[ACCT_HOLD];
+                    let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MIN);
                     let margin = -self.sdc.output_delays[d].delay[path.tag.rf][MIN];
-                    Self::required_set(req, i, (tgt_time + (0.0 + 0.0)) + margin, MIN);
+                    Self::required_set(req, i, ((tgt_time + (0.0 + 0.0)) + unc) + margin, MIN);
                 }
             }
             return;
@@ -1692,11 +1706,13 @@ impl<'g, 'a> Search<'g, 'a> {
                     let latency = self.tgt_clk_delay(tgt);
                     // `visitCheckEnd`: a path delay completing here overrides the check.
                     if let Some(id) = self.sdc.path_delay_to(path.tag.states, &self.graph.vertices[v].name, true, MIN) {
-                        let required = self.path_delay_required(path, id, self.arc_delay(e, k, MIN), latency, self.check_crpr(path, tgt_v, tgt));
+                        let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MIN);
+                        let required = self.path_delay_required(path, id, self.arc_delay(e, k, MIN), latency, unc, self.check_crpr(path, tgt_v, tgt));
                         Self::required_set(req, i, required, MIN);
                         continue;
                     }
-                    let tgt_clk_arrival = (0.0 + latency) + self.accting(src_edge, tgt_edge).required[ACCT_HOLD];
+                    let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MIN);
+                    let tgt_clk_arrival = ((0.0 + latency) + self.accting(src_edge, tgt_edge).required[ACCT_HOLD]) + unc;
                     let margin = self.arc_delay(e, k, MIN);
                     let crpr = self.check_crpr(path, tgt_v, tgt);
                     Self::required_set(req, i, (tgt_clk_arrival + (margin - 0.0)) + (0.0 - crpr), MIN);

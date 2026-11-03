@@ -36,7 +36,7 @@ fn ours(libs: &[Library], variant: &str) -> Vec<String> {
 fn every_variant_matches_the_reference_line_for_line() {
     let libs = libs();
     let mut failed = Vec::new();
-    for variant in ["base", "tight", "env", "drive", "max_delay"] {
+    for variant in ["base", "tight", "env", "drive", "max_delay", "uncertainty"] {
         let golden: Vec<String> = std::fs::read_to_string(format!("{D}{variant}.golden")).expect("the golden is in the repository").lines().map(String::from).collect();
         let ours = ours(&libs, variant);
         if ours != golden {

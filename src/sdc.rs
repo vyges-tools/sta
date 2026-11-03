@@ -15,6 +15,19 @@ pub struct Clock {
     /// `set_clock_latency` on pins (network latency), each `delay[rf][min/max]` where set:
     /// `specific` for one given with this clock (`-clock`), else one on the pin for every clock.
     pub pin_latencies: Vec<PinLatency>,
+    /// `set_clock_uncertainty` on the clock (`Clock::uncertainties`), `[min, max]` where set: the
+    /// hold (min) and setup (max) uncertainty of the checks this clock captures.
+    pub uncertainty: [Option<f32>; 2],
+    /// `set_clock_uncertainty -from/-to` with this clock as the TARGET (`Sdc::clockUncertainty`).
+    pub inter_uncertainties: Vec<InterClockUncertainty>,
+}
+
+/// One `InterClockUncertainty`, kept on its target clock: from the clock `from` (its index in
+/// [`Sdc::clocks`]), `value[src_rf][tgt_rf][min/max]` where set.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterClockUncertainty {
+    pub from: usize,
+    pub value: [[[Option<f32>; 2]; 2]; 2],
 }
 
 /// One `ClockLatency` on a pin.
@@ -28,7 +41,16 @@ pub struct PinLatency {
 impl Clock {
     /// A clock with the default waveform `{0, period / 2}`.
     pub fn new(name: &str, period: f32, source: &str, propagated: bool) -> Clock {
-        Clock { name: name.into(), period, waveform: [0.0, period / 2.0], source: source.into(), propagated, pin_latencies: Vec::new() }
+        Clock {
+            name: name.into(),
+            period,
+            waveform: [0.0, period / 2.0],
+            source: source.into(),
+            propagated,
+            pin_latencies: Vec::new(),
+            uncertainty: [None; 2],
+            inter_uncertainties: Vec::new(),
+        }
     }
 
     /// `Sdc::clockLatency(clk, pin, rf, min_max)`: the latency given with this clock on the pin,
@@ -163,6 +185,23 @@ pub struct Sdc {
 }
 
 impl Sdc {
+    /// `PathEnd::checkClkUncertainty` for a check of min/max `mm` capturing at the clock edge
+    /// `tgt_edge`: the inter-clock uncertainty from the source edge's clock (`checkInterClk-
+    /// Uncertainty`; none for an unclocked path), else the target clock's own
+    /// (`checkTgtClkUncertainty`), else 0 — negated for a setup (max) check, which it tightens.
+    pub fn check_clk_uncertainty(&self, src_edge: Option<usize>, tgt_edge: usize, mm: usize) -> f32 {
+        let tgt = &self.clocks[tgt_edge / 2];
+        let inter = src_edge.and_then(|s| {
+            tgt.inter_uncertainties.iter().find(|u| u.from == s / 2).and_then(|u| u.value[s % 2][tgt_edge % 2][mm])
+        });
+        let u = inter.or(tgt.uncertainty[mm]).unwrap_or(0.0);
+        if mm == crate::liberty::MAX {
+            -u
+        } else {
+            u
+        }
+    }
+
     /// `Sdc::exceptionFromStates`: the states a path starting at `pin` (and, launched by the clock,
     /// at `clk`) carries — every path delay of this min/max whose `-from` names the pin, then every
     /// one whose `-from` names the clock. No false paths here, so a search always continues from it.
@@ -382,7 +421,29 @@ pub fn pulse_width(clock: &Clock, rf: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::liberty::{FALL, MAX, RISE};
+    use crate::liberty::{FALL, MAX, MIN, RISE};
+
+    /// Rule (`PathEnd::checkClkUncertainty`): an inter-clock uncertainty from the source edge's
+    /// clock to the target edge's, for the two edges and the check's min/max, replaces the
+    /// target clock's own (it does not add); none set for those edges, or an unclocked path, and
+    /// the target clock's own applies; a setup (max) value is negated, a hold (min) one is not.
+    #[test]
+    fn check_uncertainty_is_the_pair_else_the_target_clock() {
+        let mut a = Clock::new("a", 2e-9, "ca", false);
+        a.uncertainty = [Some(0.03e-9), Some(0.1e-9)];
+        let mut b = Clock::new("b", 3e-9, "", false);
+        b.uncertainty = [None, Some(0.3e-9)];
+        let mut v = [[[None; 2]; 2]; 2];
+        v[RISE][FALL][MAX] = Some(0.2e-9);
+        b.inter_uncertainties.push(InterClockUncertainty { from: 0, value: v });
+        let sdc = Sdc { clocks: vec![a, b], input_delays: vec![], output_delays: vec![], path_delays: vec![] };
+        let edge = |clk: usize, rf: usize| 2 * clk + rf;
+        assert_eq!(sdc.check_clk_uncertainty(Some(edge(0, RISE)), edge(1, FALL), MAX), -0.2e-9, "the pair, negated for setup");
+        assert_eq!(sdc.check_clk_uncertainty(Some(edge(0, RISE)), edge(1, RISE), MAX), -0.3e-9, "no pair value for that edge: b's own");
+        assert_eq!(sdc.check_clk_uncertainty(None, edge(1, FALL), MAX), -0.3e-9, "unclocked: b's own");
+        assert_eq!(sdc.check_clk_uncertainty(Some(edge(1, RISE)), edge(0, RISE), MIN), 0.03e-9, "hold: a's own, not negated");
+        assert_eq!(sdc.check_clk_uncertainty(Some(edge(0, RISE)), edge(1, FALL), MIN), 0.0, "neither set for hold");
+    }
 
     /// Rise to rise: one period; rise to fall: half a period; fall to rise: a full period from the
     /// source cycle start (the fall edge's arrival already carries its half period).

@@ -265,7 +265,7 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
         }
         notes.push(format!("{}: {} (no slack moves with it)", n.command, n.why));
     }
-    let refused: [(&str, bool); 13] = [
+    let refused: [(&str, bool); 12] = [
         ("set_clock_latency on the clock source or without pins", s.clock_latencies.iter().any(|l| l.accessor != "get_pins")),
         ("set_clock_transition", !s.clock_transitions.is_empty()),
         ("set_case_analysis", !s.case_values.is_empty()),
@@ -274,7 +274,6 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
         ("set_sense / set_clock_sense", !s.senses.is_empty()),
         ("set_disable_clock_gating_check", !s.disabled_gating_checks.is_empty()),
         ("set_timing_derate", !s.derates.is_empty()),
-        ("set_clock_uncertainty", !s.uncertainties.is_empty() || s.setup_uncertainty != 0.0 || s.hold_uncertainty != 0.0),
         ("set_false_path / set_multicycle_path", !s.exceptions.is_empty()),
         ("set_clock_groups", !s.clock_groups.is_empty() || !s.async_groups.is_empty()),
         ("group_path / set_path_margin", !s.other_exceptions.is_empty()),
@@ -293,11 +292,120 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
     if s.max_capacitance.is_some() || !s.max_capacitance_objects.is_empty() {
         notes.push("set_max_capacitance: a design-rule limit, read and not checked".into());
     }
-    let s = expanded_ports(s, nl, &mut notes)?;
+    let mut s = expanded_ports(s, nl, &mut notes)?;
     let lib0 = libs.first().ok_or("constraints before any liberty library")?;
-    let sdc = search_sdc_on(&s, nl, lib0.time_scale, false, false)?;
+    // uncertainties are applied per clock below; the search's design-wide refusal is for rsz
+    let uncertainties = std::mem::take(&mut s.uncertainties);
+    (s.setup_uncertainty, s.hold_uncertainty) = (0.0, 0.0);
+    let mut sdc = search_sdc_on(&s, nl, lib0.time_scale, false, false)?;
+    clock_uncertainties(&uncertainties, &mut sdc.clocks, lib0.time_scale)?;
     let env = sdc_env(&s, libs, nl)?;
     Ok((sdc, env, notes))
+}
+
+/// `set_clock_uncertainty` as the reference's command sets it, in file order, the later value
+/// replacing the earlier for the same target and min/max (`ClockUncertainties::setValue`):
+/// `-setup` alone sets the max (setup) value, `-hold` alone the min, else both. On clocks
+/// (`get_clocks`, `all_clocks`, or a bare clock name — `parse_clk_port_pin_arg` takes a clock
+/// first): the clock's own. With `-from`/`-to` (`-rise_from`, `-fall_to`, … or `-rise`/`-fall`
+/// after `-to`): each pair's inter-clock value. On pins or ports: refused.
+fn clock_uncertainties(us: &[vyges_loom::sdc::ClockUncertainty], clocks: &mut [crate::sdc::Clock], time_scale: f32) -> Result<(), String> {
+    let names: Vec<String> = clocks.iter().map(|c| c.name.clone()).collect();
+    let clocks_of = |o: &vyges_loom::sdc::Objects| -> Result<Vec<usize>, String> {
+        let names: Vec<usize> = match o.accessor.as_str() {
+            "all_clocks" => (0..names.len()).collect(),
+            "get_clocks" | "" => {
+                let mut out = Vec::new();
+                for n in &o.names {
+                    let hits: Vec<usize> = (0..names.len()).filter(|&k| vyges_loom::sdc::object_matches(n, &names[k])).collect();
+                    if hits.is_empty() && o.accessor.is_empty() {
+                        return Err(format!("set_clock_uncertainty on {n}: a pin or port uncertainty, not modelled (clocks are)"));
+                    }
+                    for k in hits {
+                        if !out.contains(&k) {
+                            out.push(k);
+                        }
+                    }
+                }
+                out
+            }
+            other => return Err(format!("set_clock_uncertainty on [{other} …]: not modelled (clocks are)")),
+        };
+        Ok(names)
+    };
+    for u in us {
+        let mm: &[usize] = match (u.setup, u.hold) {
+            (true, false) => &[crate::liberty::MAX],
+            (false, true) => &[crate::liberty::MIN],
+            _ => &[crate::liberty::MIN, crate::liberty::MAX],
+        };
+        let v = crate::sdc::user_to_sta(u.value, time_scale);
+        if u.from.is_empty() && u.to.is_empty() {
+            let mut targets = Vec::new();
+            for o in &u.written {
+                for k in clocks_of(o)? {
+                    if !targets.contains(&k) {
+                        targets.push(k);
+                    }
+                }
+            }
+            for k in targets {
+                for &m in mm {
+                    clocks[k].uncertainty[m] = Some(v);
+                }
+            }
+            continue;
+        }
+        let rfs = |r: bool, f: bool| -> Vec<usize> {
+            match (r, f) {
+                (true, false) => vec![crate::liberty::RISE],
+                (false, true) => vec![crate::liberty::FALL],
+                _ => vec![crate::liberty::RISE, crate::liberty::FALL],
+            }
+        };
+        let side = |keys: &[&str]| -> Vec<&vyges_loom::sdc::Objects> { u.written_sides.iter().filter(|(k, _)| keys.contains(&k.as_str())).map(|(_, o)| o).collect() };
+        let has = |f: &str| u.flags.iter().any(|x| x == f);
+        let from_key = u.written_sides.iter().map(|(k, _)| k.as_str()).find(|k| k.ends_with("from")).unwrap_or("-from");
+        let to_key = u.written_sides.iter().map(|(k, _)| k.as_str()).find(|k| k.ends_with("to")).unwrap_or("-to");
+        let src_rfs = rfs(from_key == "-rise_from", from_key == "-fall_from");
+        let tgt_rfs = if to_key == "-to" { rfs(has("-rise"), has("-fall")) } else { rfs(to_key == "-rise_to", to_key == "-fall_to") };
+        let mut froms = Vec::new();
+        for o in side(&["-from", "-rise_from", "-fall_from"]) {
+            froms.extend(clocks_of(&clock_side(o))?);
+        }
+        let mut tos = Vec::new();
+        for o in side(&["-to", "-rise_to", "-fall_to"]) {
+            tos.extend(clocks_of(&clock_side(o))?);
+        }
+        for &f in &froms {
+            for &t in &tos {
+                let i = match clocks[t].inter_uncertainties.iter().position(|x| x.from == f) {
+                    Some(i) => i,
+                    None => {
+                        clocks[t].inter_uncertainties.push(crate::sdc::InterClockUncertainty { from: f, value: [[[None; 2]; 2]; 2] });
+                        clocks[t].inter_uncertainties.len() - 1
+                    }
+                };
+                for &sr in &src_rfs {
+                    for &tr in &tgt_rfs {
+                        for &m in mm {
+                            clocks[t].inter_uncertainties[i].value[sr][tr][m] = Some(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A `-from` / `-to` side as `get_clocks_warn` reads it: names are clocks.
+fn clock_side(o: &vyges_loom::sdc::Objects) -> vyges_loom::sdc::Objects {
+    let mut o = o.clone();
+    if o.accessor.is_empty() {
+        o.accessor = "get_clocks".into();
+    }
+    o
 }
 
 /// One design timed for setup: the worst and total negative slack over the endpoints and every
@@ -917,6 +1025,31 @@ mod tests {
         refused("module t (a, y); input a; output y; NAND2 b (.A(a), .B(a), .Y(y)); endmodule\n", "in no library");
         refused("module t (a, y); input a; output y; BUF b (.A(a), .Z(y)); endmodule\n", "no port Z");
         refused("module s (a, y); input a; output y; BUF b (.A(a), .X(y)); endmodule\nmodule t (a, y); input a; output y; s u (.a(a), .y(y)); endmodule\n", "hierarchy");
+    }
+
+    /// Rule (`set_clock_uncertainty` in the reference's `sdc/Sdc.tcl`): `-setup` alone sets the
+    /// max value, `-hold` alone the min, neither both; a later command replaces an earlier one's
+    /// value for the same clock and min/max; `-from/-to` sets the pair (`-rise_from` / `-fall_to`
+    /// one edge each); on a pin it is a pin uncertainty, which this timer refuses.
+    #[test]
+    fn clock_uncertainties_land_on_their_clocks() {
+        use crate::liberty::{FALL, MAX, MIN, RISE};
+        let ns = |v: f64| crate::sdc::user_to_sta(v, 1e-9);
+        let read = |text: &str| -> Result<Vec<crate::sdc::Clock>, String> {
+            let s = vyges_loom::sdc::Sdc::parse(&format!("create_clock -name a -period 2 [get_ports ca]\ncreate_clock -name b -period 3\n{text}")).unwrap();
+            let mut clocks = vec![crate::sdc::Clock::new("a", 2e-9, "ca", false), crate::sdc::Clock::new("b", 3e-9, "", false)];
+            clock_uncertainties(&s.uncertainties, &mut clocks, 1e-9).map(|_| clocks)
+        };
+        let c = read("set_clock_uncertainty 0.3 [all_clocks]\nset_clock_uncertainty -setup 0.1 [get_clocks a]\n").unwrap();
+        assert_eq!(c[0].uncertainty, [Some(ns(0.3)), Some(ns(0.1))], "a: hold kept, setup replaced");
+        assert_eq!(c[1].uncertainty, [Some(ns(0.3)), Some(ns(0.3))]);
+        let c = read("set_clock_uncertainty -hold 0.02 -rise_from [get_clocks a] -fall_to [get_clocks b]\n").unwrap();
+        assert_eq!(c[1].inter_uncertainties.len(), 1);
+        let u = &c[1].inter_uncertainties[0];
+        assert_eq!((u.from, u.value[RISE][FALL][MIN], u.value[RISE][FALL][MAX], u.value[FALL][FALL][MIN]), (0, Some(ns(0.02)), None, None));
+        let c = read("set_clock_uncertainty -setup 0.2 -from a -to b -rise\n").unwrap();
+        assert_eq!((c[1].inter_uncertainties[0].value[FALL][RISE][MAX], c[1].inter_uncertainties[0].value[FALL][FALL][MAX]), (Some(ns(0.2)), None), "-rise after -to: the target's rise edge");
+        assert!(read("set_clock_uncertainty 0.1 [get_pins r/CK]\n").unwrap_err().contains("not modelled"));
     }
 
 
