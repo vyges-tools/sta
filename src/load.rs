@@ -265,7 +265,7 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
         }
         notes.push(format!("{}: {} (no slack moves with it)", n.command, n.why));
     }
-    let refused: [(&str, bool); 12] = [
+    let refused: [(&str, bool); 11] = [
         ("set_clock_latency on the clock source or without pins", s.clock_latencies.iter().any(|l| l.accessor != "get_pins")),
         ("set_clock_transition", !s.clock_transitions.is_empty()),
         ("set_case_analysis", !s.case_values.is_empty()),
@@ -274,7 +274,6 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
         ("set_sense / set_clock_sense", !s.senses.is_empty()),
         ("set_disable_clock_gating_check", !s.disabled_gating_checks.is_empty()),
         ("set_timing_derate", !s.derates.is_empty()),
-        ("set_multicycle_path", s.exceptions.iter().any(|e| e.kind != vyges_loom::sdc::ExcKind::FalsePath)),
         ("set_clock_groups", !s.clock_groups.is_empty() || !s.async_groups.is_empty()),
         ("group_path / set_path_margin", !s.other_exceptions.is_empty()),
         ("a command kept as written", !s.kept.is_empty()),
@@ -302,9 +301,9 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
     let exceptions = std::mem::take(&mut s.exceptions);
     let mut sdc = search_sdc_on(&s, nl, lib0.time_scale, false, false)?;
     clock_uncertainties(&uncertainties, &mut sdc.clocks, lib0.time_scale)?;
-    let falses = false_paths(&exceptions, &s, nl)?;
+    let falses = timing_exceptions(&exceptions, &s, nl)?;
     if !falses.is_empty() && !sdc.path_delays.is_empty() {
-        return Err("set_false_path with set_max_delay / set_min_delay: not modelled (the ids across the two are the order they were made in)".into());
+        return Err("set_false_path / set_multicycle_path with set_max_delay / set_min_delay: not modelled (the ids across them are the order they were made in)".into());
     }
     sdc.path_delays.extend(falses);
     let env = sdc_env(&s, libs, nl)?;
@@ -407,12 +406,14 @@ fn clock_uncertainties(us: &[vyges_loom::sdc::ClockUncertainty], clocks: &mut [c
     Ok(())
 }
 
-/// Every `set_false_path` as the reference makes it (`FalsePath`), in file order: `-from` and
-/// `-to` on ports or pins (patterns matched against the netlist, as `get_ports` / `get_pins` do)
-/// or on the one clock; `-setup` alone is the max paths', `-hold` alone the min paths', else one
-/// for each. `-through`, the edge forms (`-rise_from`, `-rise`, …), `-reset_path`, instances and
-/// several clocks are refused.
-fn false_paths(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc, nl: &Netlist) -> Result<Vec<crate::sdc::PathDelay>, String> {
+/// Every `set_false_path` (`FalsePath`) and `set_multicycle_path` (`MultiCyclePath`) as the
+/// reference makes it, in file order: `-from` and `-to` on ports or pins (patterns matched against
+/// the netlist, as `get_ports` / `get_pins` do) or on the one clock. A false path of `-setup` alone
+/// is the max paths', `-hold` alone the min paths', else one for each; a multicycle path is one
+/// exception of `-setup`, `-hold` or neither (`set_multicycle_path` in `Sdc.tcl`: `-end` unless
+/// `-hold` alone or `-start`). `-through`, the edge forms (`-rise_from`, `-rise`, …),
+/// `-reset_path`, instances and several clocks are refused.
+fn timing_exceptions(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc, nl: &Netlist) -> Result<Vec<crate::sdc::PathDelay>, String> {
     use crate::liberty::{MAX, MIN};
     let mut pins: Vec<String> = Vec::new();
     for net in &nl.nets {
@@ -424,11 +425,17 @@ fn false_paths(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc, nl: 
     }
     let mut out = Vec::new();
     for e in es {
-        if let Some(f) = e.flags.iter().find(|f| !matches!(f.as_str(), "-setup" | "-hold")) {
-            return Err(format!("set_false_path {f}: not modelled"));
+        let multiplier = match e.kind {
+            vyges_loom::sdc::ExcKind::FalsePath => None,
+            vyges_loom::sdc::ExcKind::Multicycle(n) => Some(i32::try_from(n).map_err(|_| format!("set_multicycle_path {n}: out of range"))?),
+        };
+        let cmd = if multiplier.is_some() { "set_multicycle_path" } else { "set_false_path" };
+        let allowed = |f: &str| matches!(f, "-setup" | "-hold") || (multiplier.is_some() && matches!(f, "-start" | "-end"));
+        if let Some(f) = e.flags.iter().find(|f| !allowed(f)) {
+            return Err(format!("{cmd} {f}: not modelled"));
         }
         if let Some((f, _)) = e.args.iter().find(|(f, _)| f != "-from" && f != "-to") {
-            return Err(format!("set_false_path {f}: not modelled"));
+            return Err(format!("{cmd} {f}: not modelled"));
         }
         let side = |flag: &str| -> Result<(Vec<String>, bool), String> {
             let (mut names, mut clock) = (Vec::new(), false);
@@ -445,7 +452,7 @@ fn false_paths(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc, nl: 
                         }
                     }
                     "get_clocks" if s.clocks.len() == 1 && o.names.iter().all(|n| vyges_loom::sdc::object_matches(n, &s.clocks[0].name)) => clock = true,
-                    other => return Err(format!("set_false_path {flag} [{other} {}]: not modelled (ports, pins or the one clock are)", o.names.join(" "))),
+                    other => return Err(format!("{cmd} {flag} [{other} {}]: not modelled (ports, pins or the one clock are)", o.names.join(" "))),
                 }
             }
             names.dedup();
@@ -460,9 +467,29 @@ fn false_paths(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc, nl: 
             continue;
         }
         if !given("-from") && !given("-to") {
-            return Err("set_false_path with no -from / -to: not modelled".into());
+            return Err(format!("{cmd} with no -from / -to: not modelled"));
         }
         let has = |f: &str| e.flags.iter().any(|x| x == f);
+        if let Some(n) = multiplier {
+            let (setup, hold) = (has("-setup"), has("-hold"));
+            if has("-start") && has("-end") {
+                return Err("set_multicycle_path: cannot use -start with -end (446)".into());
+            }
+            let use_end_clk = if has("-start") { false } else if has("-end") { true } else { !(hold && !setup) };
+            out.push(crate::sdc::PathDelay {
+                from_pins,
+                from_clock,
+                to_pins,
+                to_clock,
+                min_max: if hold && !setup { MIN } else { MAX },
+                ignore_clk_latency: false,
+                break_path: false,
+                delay: 0.0,
+                false_path: false,
+                multicycle: Some(crate::sdc::Multicycle { multiplier: n, use_end_clk, all: setup == hold }),
+            });
+            continue;
+        }
         let mms: &[usize] = match (has("-setup"), has("-hold")) {
             (true, false) => &[MAX],
             (false, true) => &[MIN],
@@ -479,6 +506,7 @@ fn false_paths(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc, nl: 
                 break_path: false,
                 delay: 0.0,
                 false_path: true,
+                multicycle: None,
             });
         }
     }
@@ -1054,6 +1082,7 @@ pub fn path_delays(s: &vyges_loom::sdc::Sdc, time_scale: f32) -> Result<Vec<crat
             break_path: !flag("-probe"),
             delay: crate::sdc::user_to_sta(d.value, time_scale),
             false_path: false,
+            multicycle: None,
         });
     }
     if out.len() > 1 {
@@ -1157,7 +1186,7 @@ mod tests {
         let nl = netlist(&vyges_loom::netlist::parse_compact(src).unwrap(), &[lib()]).unwrap();
         let read = |text: &str| {
             let s = vyges_loom::sdc::Sdc::parse(text).unwrap();
-            false_paths(&s.exceptions, &s, &nl)
+            timing_exceptions(&s.exceptions, &s, &nl)
         };
         let f = read("set_false_path -setup -from [get_ports a] -to [get_pins lz/X]\n").unwrap();
         assert_eq!(f.len(), 1);
@@ -1166,6 +1195,30 @@ mod tests {
         assert_eq!(f.iter().map(|p| p.min_max).collect::<Vec<_>>(), vec![MIN, MAX]);
         assert!(read("set_false_path -from [get_ports -quiet nope]\nset_false_path -from [get_ports a] -to [get_ports -quiet nope2]\n").unwrap().is_empty(), "an empty side: no exception");
         assert!(read("set_false_path -from [get_ports a] -through [get_pins lz/A]\n").unwrap_err().contains("not modelled"));
+    }
+
+    /// Rule (`set_multicycle_path` in `Sdc.tcl`): one exception per command — `-setup` alone is
+    /// max, `-hold` alone min, else neither (`all`); `-end` unless `-hold` alone or `-start`.
+    #[test]
+    fn a_multicycle_path_reads_as_the_reference_makes_it() {
+        use crate::liberty::{MAX, MIN};
+        let src = "module ord2 (a, y);\n input a; output y; wire n1;\n BUF drv (.A(a), .X(n1));\n BUF lz (.A(n1), .X(y));\nendmodule\n";
+        let nl = netlist(&vyges_loom::netlist::parse_compact(src).unwrap(), &[lib()]).unwrap();
+        let read = |text: &str| {
+            let s = vyges_loom::sdc::Sdc::parse(text).unwrap();
+            timing_exceptions(&s.exceptions, &s, &nl).unwrap()
+        };
+        let one = |text: &str| {
+            let f = read(text);
+            assert_eq!(f.len(), 1, "{text}");
+            let m = f[0].multicycle.expect("a multicycle path");
+            (f[0].min_max, m.multiplier, m.use_end_clk, m.all)
+        };
+        assert_eq!(one("set_multicycle_path 2 -from [get_ports a]\n"), (MAX, 2, true, true));
+        assert_eq!(one("set_multicycle_path -setup 3 -to [get_ports y]\n"), (MAX, 3, true, false));
+        assert_eq!(one("set_multicycle_path -hold 1 -to [get_ports y]\n"), (MIN, 1, false, false));
+        assert_eq!(one("set_multicycle_path -hold -end 1 -to [get_ports y]\n"), (MIN, 1, true, false));
+        assert_eq!(one("set_multicycle_path -setup -start 2 -to [get_ports y]\n"), (MAX, 2, false, false));
     }
 
     /// The constraints a flow generates — every input and output delayed through `[all_inputs]` /

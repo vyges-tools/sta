@@ -110,6 +110,20 @@ pub struct PathDelay {
     /// reference ranks every exception by one priority (`ExceptionPath::typePriority`). `delay`,
     /// `ignore_clk_latency` and `break_path` mean nothing for it.
     pub false_path: bool,
+    /// `set_multicycle_path` (a `MultiCyclePath`), not a delay, ranked with the rest as false
+    /// paths are. `min_max` is `MAX` for `-setup`, `MIN` for `-hold`; [`Multicycle::all`] for
+    /// neither.
+    pub multicycle: Option<Multicycle>,
+}
+
+/// A multicycle path's own fields (`MultiCyclePath`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Multicycle {
+    pub multiplier: i32,
+    /// `-end` (the default but for `-hold` alone): periods of the capture clock, else the launch's.
+    pub use_end_clk: bool,
+    /// Neither `-setup` nor `-hold` (`MinMaxAll::all()`).
+    pub all: bool,
 }
 
 impl PathDelay {
@@ -127,6 +141,37 @@ impl PathDelay {
     /// 3000) PLUS
     /// `-from` pins 1<<6, `-to` pins 1<<5, `-from` clocks 1<<3, `-to` clocks 1<<2 — added, not OR'd
     /// (3000 has bits 3 and 5 set).
+    /// `ExceptionPath::matches(min_max, exactly)`: its own min/max — but a multicycle path matches
+    /// every min path too when not asked exactly (`set_multicycle_path -setup` decides the hold
+    /// check's accounting, so it rides on min tags).
+    fn matches(&self, mm: usize, exactly: bool) -> bool {
+        match self.multicycle {
+            Some(m) => m.all || self.min_max == mm || (!exactly && mm == crate::liberty::MIN),
+            None => self.min_max == mm,
+        }
+    }
+
+    /// `MultiCyclePath::pathMultiplier(min_max)`: 0 for a min path under a multicycle of neither
+    /// `-setup` nor `-hold`.
+    fn path_multiplier(&self, mm: usize) -> i32 {
+        match self.multicycle {
+            Some(m) if m.all && mm == crate::liberty::MIN => 0,
+            Some(m) => m.multiplier,
+            None => 0,
+        }
+    }
+
+    /// `ExceptionPath::priority(min_max)`: [`PathDelay::priority`], and for a multicycle path +1
+    /// when it is of neither `-setup` nor `-hold`, +2 when of this min/max
+    /// (`MultiCyclePath::priority`).
+    fn priority_for(&self, mm: usize) -> i32 {
+        match self.multicycle {
+            Some(m) if m.all => self.priority() + 1,
+            Some(_) if self.min_max == mm => self.priority() + 2,
+            _ => self.priority(),
+        }
+    }
+
     fn priority(&self) -> i32 {
         let mut p = 0;
         if !self.from_pins.is_empty() {
@@ -141,7 +186,14 @@ impl PathDelay {
         if self.to_clock {
             p |= 1 << 2;
         }
-        (if self.false_path { 4000 } else { 3000 }) + p
+        let base = if self.false_path {
+            4000
+        } else if self.multicycle.is_some() {
+            2000
+        } else {
+            3000
+        };
+        base + p
     }
 
     /// `ExceptionState::isComplete` at the start: a false path with no `-to` (and no `-through`,
@@ -156,6 +208,10 @@ impl PathDelay {
     fn tighter_than(&self, other: &PathDelay) -> bool {
         if self.false_path || other.false_path {
             return false;
+        }
+        // `MultiCyclePath::tighterThan`: the smaller multiplier (`pathMultiplier()`, the raw one).
+        if let Some(m) = self.multicycle {
+            return m.multiplier < other.multicycle.map_or(0, |o| o.multiplier);
         }
         if self.min_max == crate::liberty::MIN {
             self.delay > other.delay
@@ -246,7 +302,7 @@ impl Sdc {
     pub fn exception_from_states(&self, pin: &str, clk: bool, mm: usize) -> States {
         let mut s = 0u64;
         for (id, pd) in self.path_delays.iter().enumerate() {
-            if pd.min_max == mm && !pd.complete_false() && (pd.from_pins.iter().any(|p| p == pin) || (clk && pd.from_clock && pd.from_pins.is_empty())) {
+            if pd.matches(mm, false) && !pd.complete_false() && (pd.from_pins.iter().any(|p| p == pin) || (clk && pd.from_clock && pd.from_pins.is_empty())) {
                 s |= 1 << id;
             }
         }
@@ -257,7 +313,7 @@ impl Sdc {
     /// `-to` naming `pin` (clocks do not count) and is of this min/max.
     pub fn is_complete_to_pin(&self, id: usize, pin: &str, mm: usize) -> bool {
         let pd = &self.path_delays[id];
-        !pd.false_path && pd.min_max == mm && pd.to_pins.iter().any(|p| p == pin)
+        !pd.false_path && pd.multicycle.is_none() && pd.min_max == mm && pd.to_pins.iter().any(|p| p == pin)
     }
 
     /// `Search::exceptionTo(any, path, pin, rf, clk_edge, min_max)` over path delays: the highest
@@ -268,17 +324,29 @@ impl Sdc {
     /// False paths are not candidates: a false path at the pin has already stopped the end
     /// ([`Sdc::false_path_to`]), and one that does not match here could not win.
     pub fn path_delay_to(&self, states: States, pin: &str, clocked: bool, mm: usize) -> Option<usize> {
+        self.exception_to(states, pin, clocked, mm, false, &|pd| !pd.false_path && pd.multicycle.is_none())
+    }
+
+    /// `Search::exceptionTo(multi_cycle, …, match_min_max_exactly)`: the multicycle path ruling a
+    /// check of min/max `mm` at `pin` — at a check, below any path delay (2000 against 3000).
+    pub fn multicycle_to(&self, states: States, pin: &str, clocked: bool, mm: usize, exactly: bool) -> Option<usize> {
+        self.exception_to(states, pin, clocked, mm, exactly, &|pd| pd.multicycle.is_some())
+    }
+
+    /// `Search::exceptionTo` over the exceptions `kind` admits.
+    fn exception_to(&self, states: States, pin: &str, clocked: bool, mm: usize, exactly: bool, kind: &dyn Fn(&PathDelay) -> bool) -> Option<usize> {
         let mut best: Option<usize> = None;
         let consider = |id: usize, best: &mut Option<usize>| {
             let pd = &self.path_delays[id];
-            if pd.false_path || pd.min_max != mm || !pd.to_matches(pin, clocked) {
+            if !kind(pd) || !pd.matches(mm, exactly) || !pd.to_matches(pin, clocked) {
                 return;
             }
             let better = match *best {
                 None => true,
                 Some(b) => {
                     let bp = &self.path_delays[b];
-                    pd.priority() > bp.priority() || (pd.priority() == bp.priority() && pd.tighter_than(bp))
+                    let (p, q) = (pd.priority_for(mm), bp.priority_for(mm));
+                    p > q || (p == q && pd.tighter_than(bp))
                 }
             };
             if better {
@@ -301,6 +369,41 @@ impl Sdc {
             }
         }
         best
+    }
+}
+
+impl Sdc {
+    /// `PathEndClkConstrainedMcp::checkMcpAdjustment` for a check of min/max `mm` at `pin` whose
+    /// ruling multicycle is `id` (none: 0), the path launched at `src_edge` (unclocked: the target
+    /// edge stands in) and captured at `tgt_edge`. Setup: (multiplier − 1) periods. Hold: the
+    /// setup multicycle's (multiplier − 1) periods less the hold one's multiplier periods — the
+    /// other of the two found exactly (`findHoldMcps`), each period the capture clock's under
+    /// `-end`, the launch's under `-start`. Added to the target clock arrival after the
+    /// uncertainty (`targetClkArrivalNoCrpr`).
+    pub fn multicycle_adjustment(&self, id: Option<usize>, states: States, pin: &str, src_edge: Option<usize>, tgt_edge: usize, mm: usize) -> f32 {
+        use crate::liberty::{MAX, MIN};
+        let Some(id) = id else { return 0.0 };
+        let src_edge = src_edge.unwrap_or(tgt_edge);
+        let period = |pd: &PathDelay| {
+            let m = pd.multicycle.expect("a multicycle path");
+            self.clocks[(if m.use_end_clk { tgt_edge } else { src_edge }) / 2].period
+        };
+        let pd = &self.path_delays[id];
+        if mm == MAX {
+            // `checkSetupMcpAdjustment`: `mcp->minMax()->matches(max)`, default cycles 1
+            return if pd.matches(MAX, true) { (pd.path_multiplier(MAX) - 1) as f32 * period(pd) } else { 0.0 };
+        }
+        let (setup, hold) = if pd.matches(MIN, true) {
+            (self.multicycle_to(states, pin, true, MAX, true), Some(id))
+        } else {
+            (Some(id), self.multicycle_to(states, pin, true, MIN, true))
+        };
+        match (setup.map(|i| &self.path_delays[i]), hold.map(|i| &self.path_delays[i])) {
+            (Some(s), Some(h)) => (s.path_multiplier(MAX) - 1) as f32 * period(s) - h.path_multiplier(MIN) as f32 * period(h),
+            (None, Some(h)) => -h.path_multiplier(mm) as f32 * period(h),
+            (Some(s), None) => (s.path_multiplier(mm) - 1) as f32 * period(s),
+            (None, None) => 0.0,
+        }
     }
 }
 
@@ -465,7 +568,7 @@ mod tests {
     use crate::liberty::{FALL, MAX, MIN, RISE};
 
     fn false_path(from: &[&str], to: &[&str], mm: usize) -> PathDelay {
-        PathDelay { from_pins: from.iter().map(|p| p.to_string()).collect(), from_clock: false, to_pins: to.iter().map(|p| p.to_string()).collect(), to_clock: false, min_max: mm, ignore_clk_latency: false, break_path: false, delay: 0.0, false_path: true }
+        PathDelay { from_pins: from.iter().map(|p| p.to_string()).collect(), from_clock: false, to_pins: to.iter().map(|p| p.to_string()).collect(), to_clock: false, min_max: mm, ignore_clk_latency: false, break_path: false, delay: 0.0, false_path: true, multicycle: None }
     }
 
     /// Rules (`Sdc::exceptionFromStates`, `VisitPathEnds::falsePathTo`): a false path with no
@@ -492,6 +595,40 @@ mod tests {
         assert!(!sdc.false_path_to(States::NONE, "y", MAX), "a path not from a carries no state");
         assert!(!sdc.false_path_to(from_a, "z", MAX) && sdc.false_path_to(States::NONE, "z", MIN), "first point -to z: any path, min only");
         assert_eq!(sdc.path_delay_to(from_a, "y", false, MAX), Some(3), "the max delay, though the false path ranks higher");
+    }
+
+    fn multicycle(from: &[&str], to: &[&str], mm: usize, multiplier: i32, use_end_clk: bool, all: bool) -> PathDelay {
+        PathDelay { false_path: false, multicycle: Some(Multicycle { multiplier, use_end_clk, all }), ..false_path(from, to, mm) }
+    }
+
+    /// Rules (`MultiCyclePath::matches` / `priority(min_max)` / `pathMultiplier`,
+    /// `PathEndClkConstrainedMcp::checkMcpAdjustment` + `findHoldMcps`): setup moves the capture
+    /// edge (multiplier − 1) periods; hold takes the setup multicycle's (multiplier − 1) periods
+    /// less the hold one's multiplier periods. A `-setup` multicycle rides on min tags, so it sets
+    /// the hold accounting alone; of neither `-setup` nor `-hold`, its hold multiplier is 0. At one
+    /// set of points the min/max's own outranks one of neither (+2 against +1). `-start` counts
+    /// the launch clock's periods.
+    #[test]
+    fn a_multicycle_moves_setup_and_takes_hold_with_it() {
+        let mut fast = Clock::new("f", 2e-9, "cf", false);
+        fast.waveform = [0.0, 1e-9];
+        let slow = Clock::new("s", 5e-9, "cs", false);
+        let at = |path_delays: Vec<PathDelay>| Sdc { clocks: vec![fast.clone(), slow.clone()], input_delays: vec![], output_delays: vec![], path_delays };
+        let (src, tgt) = (Some(0), 2);
+        let adj = |sdc: &Sdc, mm: usize| {
+            let states = sdc.exception_from_states("a", false, mm);
+            let id = sdc.multicycle_to(states, "y", true, mm, false);
+            sdc.multicycle_adjustment(id, states, "y", src, tgt, mm)
+        };
+        let setup3 = at(vec![multicycle(&["a"], &[], MAX, 3, true, false)]);
+        assert_eq!((adj(&setup3, MAX), adj(&setup3, MIN)), (10e-9, 10e-9), "-setup 3 -end: two capture periods, for hold too");
+        let both = at(vec![multicycle(&["a"], &[], MAX, 3, true, false), multicycle(&["a"], &[], MIN, 1, false, false)]);
+        assert_eq!(adj(&both, MIN), 10e-9 - 2e-9, "-hold 1 (-start by default): one launch period back");
+        let all = at(vec![multicycle(&["a"], &[], MAX, 3, true, true)]);
+        assert_eq!((adj(&all, MAX), adj(&all, MIN)), (10e-9, 10e-9), "neither: hold multiplier 0");
+        let ranked = at(vec![multicycle(&["a"], &[], MAX, 2, true, true), multicycle(&["a"], &[], MAX, 4, false, false)]);
+        assert_eq!(adj(&ranked, MAX), 3.0 * 2e-9, "-setup 4 -start outranks the one of neither; launch periods");
+        assert_eq!(at(vec![multicycle(&["a"], &[], MIN, 1, false, false)]).multicycle_to(States(1), "y", true, MAX, false), None, "a -hold multicycle never rules setup");
     }
 
     /// Rule (`PathEnd::checkClkUncertainty`): an inter-clock uncertainty from the source edge's
@@ -552,7 +689,7 @@ mod tests {
     /// only the delay's own min/max matches.
     #[test]
     fn path_delay_to_takes_the_highest_priority_then_the_tighter() {
-        let pd = |to_pins: &[&str], to_clock: bool, delay: f32| PathDelay { from_pins: vec!["r1/CLK".into()], from_clock: false, to_pins: to_pins.iter().map(|p| p.to_string()).collect(), to_clock, min_max: MAX, ignore_clk_latency: true, break_path: true, delay, false_path: false };
+        let pd = |to_pins: &[&str], to_clock: bool, delay: f32| PathDelay { from_pins: vec!["r1/CLK".into()], from_clock: false, to_pins: to_pins.iter().map(|p| p.to_string()).collect(), to_clock, min_max: MAX, ignore_clk_latency: true, break_path: true, delay, false_path: false, multicycle: None };
         let sdc = Sdc { clocks: vec![Clock::new("c", 2.0, "clk", true)], input_delays: Vec::new(), output_delays: Vec::new(), path_delays: vec![pd(&[], true, 1.0), pd(&["r3/D"], false, 3.0), pd(&["r3/D"], false, 2.0)] };
         let all = States(0b111);
         assert_eq!(sdc.path_delay_to(all, "r3/D", true, MAX), Some(2));
