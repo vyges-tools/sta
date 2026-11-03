@@ -265,7 +265,7 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
         }
         notes.push(format!("{}: {} (no slack moves with it)", n.command, n.why));
     }
-    let refused: [(&str, bool); 11] = [
+    let refused: [(&str, bool); 10] = [
         ("set_clock_latency on the clock source or without pins", s.clock_latencies.iter().any(|l| l.accessor != "get_pins")),
         ("set_clock_transition", !s.clock_transitions.is_empty()),
         ("set_case_analysis", !s.case_values.is_empty()),
@@ -274,7 +274,6 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
         ("set_sense / set_clock_sense", !s.senses.is_empty()),
         ("set_disable_clock_gating_check", !s.disabled_gating_checks.is_empty()),
         ("set_timing_derate", !s.derates.is_empty()),
-        ("set_clock_groups", !s.clock_groups.is_empty() || !s.async_groups.is_empty()),
         ("group_path / set_path_margin", !s.other_exceptions.is_empty()),
         ("a command kept as written", !s.kept.is_empty()),
     ];
@@ -299,8 +298,12 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
     // false paths go to the search with the path delays (one priority ranks them); the search's
     // design-wide refusal of exceptions is for rsz
     let exceptions = std::mem::take(&mut s.exceptions);
+    // clock groups likewise: per clock below (`async_groups` is their merged projection)
+    let groups = std::mem::take(&mut s.clock_groups);
+    s.async_groups.clear();
     let mut sdc = search_sdc_on(&s, nl, lib0.time_scale, false, false)?;
     clock_uncertainties(&uncertainties, &mut sdc.clocks, lib0.time_scale)?;
+    clock_groups(&groups, &mut sdc.clocks)?;
     let falses = timing_exceptions(&exceptions, &s, nl)?;
     if !falses.is_empty() && !sdc.path_delays.is_empty() {
         return Err("set_false_path / set_multicycle_path with set_max_delay / set_min_delay: not modelled (the ids across them are the order they were made in)".into());
@@ -316,6 +319,42 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
 /// (`get_clocks`, `all_clocks`, or a bare clock name — `parse_clk_port_pin_arg` takes a clock
 /// first): the clock's own. With `-from`/`-to` (`-rise_from`, `-fall_to`, … or `-rise`/`-fall`
 /// after `-to`): each pair's inter-clock value. On pins or ports: refused.
+/// Every `set_clock_groups` as the reference applies it (`Sdc::makeClkGroupExclusions`): each
+/// `-group`'s names resolved against the defined clocks (`get_clocks_warn`: a name matching none
+/// is dropped, and a group left empty is not made); then, per command not `-asynchronous
+/// -allow_paths`, clocks in different groups are cut apart, and a command of ONE group cuts its
+/// clocks from every other clock ([`vyges_loom::sdc::clocks_unrelated`], over the resolved
+/// groups). A clock in two groups of one command is refused: the reference cuts it from the
+/// clocks of both.
+fn clock_groups(cgs: &[vyges_loom::sdc::ClockGroups], clocks: &mut [crate::sdc::Clock]) -> Result<(), String> {
+    let mut resolved = Vec::new();
+    for cg in cgs {
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        for g in &cg.groups {
+            let mut names: Vec<String> = Vec::new();
+            for c in clocks.iter() {
+                if g.iter().any(|n| vyges_loom::sdc::object_matches(n, &c.name)) {
+                    names.push(c.name.clone());
+                }
+            }
+            if !names.is_empty() {
+                groups.push(names);
+            }
+        }
+        for c in clocks.iter() {
+            if groups.iter().filter(|g| g.contains(&c.name)).count() > 1 {
+                return Err(format!("set_clock_groups: clock {} in two groups of one command: not modelled", c.name));
+            }
+        }
+        resolved.push(vyges_loom::sdc::ClockGroups { groups, ..cg.clone() });
+    }
+    let names: Vec<String> = clocks.iter().map(|c| c.name.clone()).collect();
+    for (i, c) in clocks.iter_mut().enumerate() {
+        c.excluded = (0..names.len()).filter(|&j| j != i && vyges_loom::sdc::clocks_unrelated(&resolved, &names[i], &names[j])).collect();
+    }
+    Ok(())
+}
+
 fn clock_uncertainties(us: &[vyges_loom::sdc::ClockUncertainty], clocks: &mut [crate::sdc::Clock], time_scale: f32) -> Result<(), String> {
     let names: Vec<String> = clocks.iter().map(|c| c.name.clone()).collect();
     let clocks_of = |o: &vyges_loom::sdc::Objects| -> Result<Vec<usize>, String> {
@@ -1195,6 +1234,26 @@ mod tests {
         assert_eq!(f.iter().map(|p| p.min_max).collect::<Vec<_>>(), vec![MIN, MAX]);
         assert!(read("set_false_path -from [get_ports -quiet nope]\nset_false_path -from [get_ports a] -to [get_ports -quiet nope2]\n").unwrap().is_empty(), "an empty side: no exception");
         assert!(read("set_false_path -from [get_ports a] -through [get_pins lz/A]\n").unwrap_err().contains("not modelled"));
+    }
+
+    /// Rules (`Sdc::makeClkGroupExclusions`, `get_clocks_warn`; witnessed by the `clock_groups`
+    /// correlation variant): clocks in different groups of one command are cut apart; one group
+    /// cuts its clocks from every other; a name matching no clock is dropped, and a group left
+    /// empty is not made — so `-group {a} -group {nope}` is one group and cuts `a` from all;
+    /// `-asynchronous -allow_paths` cuts nothing; a command of an existing `-name` replaces it.
+    #[test]
+    fn clock_groups_cut_the_clocks_the_reference_cuts() {
+        let cut = |text: &str| -> Vec<Vec<usize>> {
+            let s = vyges_loom::sdc::Sdc::parse(&format!("create_clock -name a -period 2 [get_ports ca]\ncreate_clock -name b -period 3\ncreate_clock -name c -period 4\n{text}")).unwrap();
+            let mut clocks: Vec<crate::sdc::Clock> = ["a", "b", "c"].iter().map(|n| crate::sdc::Clock::new(n, 2e-9, "", false)).collect();
+            clock_groups(&s.clock_groups, &mut clocks).unwrap();
+            clocks.into_iter().map(|c| c.excluded).collect()
+        };
+        assert_eq!(cut("set_clock_groups -asynchronous -group {a} -group {b}\n"), vec![vec![1], vec![0], vec![]]);
+        assert_eq!(cut("set_clock_groups -logically_exclusive -group {c}\n"), vec![vec![2], vec![2], vec![0, 1]]);
+        assert_eq!(cut("set_clock_groups -asynchronous -group {a} -group {nope}\n"), vec![vec![1, 2], vec![0], vec![0]]);
+        assert_eq!(cut("set_clock_groups -asynchronous -allow_paths -group {a} -group {b}\n"), vec![Vec::<usize>::new(); 3]);
+        assert_eq!(cut("set_clock_groups -name g -asynchronous -group {a} -group {b}\nset_clock_groups -name g -asynchronous -allow_paths -group {a} -group {b}\n"), vec![Vec::<usize>::new(); 3]);
     }
 
     /// Rule (`set_multicycle_path` in `Sdc.tcl`): one exception per command — `-setup` alone is

@@ -627,7 +627,8 @@ impl<'g, 'a> Search<'g, 'a> {
         let clk_rf = if mm == MAX { leading } else { 1 - leading };
         for tgt in &self.paths[clk_v] {
             let Some(tgt_edge) = tgt.tag.clk_edge else { continue };
-            if tgt.tag.mm != 1 - mm || tgt.tag.rf != clk_rf || !tgt.tag.is_clock {
+            // `visitGatedClkEnd`: `sameClockGroup(src_clk, clk)`
+            if tgt.tag.mm != 1 - mm || tgt.tag.rf != clk_rf || !tgt.tag.is_clock || !self.sdc.same_clock_group(src_edge / 2, tgt_edge / 2) {
                 continue;
             }
             let acct = self.accting(src_edge, tgt_edge);
@@ -1496,6 +1497,10 @@ impl<'g, 'a> Search<'g, 'a> {
                 for &d in ods {
                     if self.sdc.output_delays[d].exists[path.tag.rf][MAX] {
                         let tgt_edge = 2 * self.sdc.output_delays[d].clock;
+                        // `visitOutputDelayEnd1`: `sameClockGroup(src, tgt)`
+                        if !self.sdc.same_clock_group(src_edge / 2, tgt_edge / 2) {
+                            continue;
+                        }
                         let tgt_time = self.accting(src_edge, tgt_edge).required[ACCT_SETUP];
                         let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MAX);
                         let mcp = self.mcp_adjustment(path, name, src_edge, tgt_edge, MAX);
@@ -1526,6 +1531,11 @@ impl<'g, 'a> Search<'g, 'a> {
                         // `visitCheckEnd`: a path delay completing here overrides the check —
                         // `PathEndPathDelay` with the check's arc as its margin.
                         let tgt_edge = tgt.tag.clk_edge.expect("a clock path has an edge");
+                        // `visitCheckEnd`: `sameClockGroup(src_clk, tgt_clk)` for a check, a
+                        // latch check and a path delay alike (the path is clocked here)
+                        if !self.sdc.same_clock_group(src_edge / 2, tgt_edge / 2) {
+                            continue;
+                        }
                         // `PathEndLatchCheck`: at a latch's data pin, the check's target is the
                         // DISABLE path; the required is `latchRequired`'s, the check arc the margin.
                         if self.latch_data[v] && self.sdc.path_delay_to(path.tag.states, name, true, MAX).is_none() {
@@ -1755,6 +1765,9 @@ impl<'g, 'a> Search<'g, 'a> {
             for &d in ods {
                 if self.sdc.output_delays[d].exists[path.tag.rf][MIN] {
                     let tgt_edge = 2 * self.sdc.output_delays[d].clock;
+                    if !self.sdc.same_clock_group(src_edge / 2, tgt_edge / 2) {
+                        continue;
+                    }
                     let tgt_time = self.accting(src_edge, tgt_edge).required[ACCT_HOLD];
                     let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MIN);
                     let mcp = self.mcp_adjustment(path, &self.graph.vertices[v].name, src_edge, tgt_edge, MIN);
@@ -1780,6 +1793,9 @@ impl<'g, 'a> Search<'g, 'a> {
                         continue;
                     }
                     let tgt_edge = tgt.tag.clk_edge.expect("a clock path has an edge");
+                    if !self.sdc.same_clock_group(src_edge / 2, tgt_edge / 2) {
+                        continue;
+                    }
                     let latency = self.tgt_clk_delay(tgt);
                     // `visitCheckEnd`: a path delay completing here overrides the check.
                     if let Some(id) = self.sdc.path_delay_to(path.tag.states, &self.graph.vertices[v].name, true, MIN) {

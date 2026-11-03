@@ -20,6 +20,9 @@ pub struct Clock {
     pub uncertainty: [Option<f32>; 2],
     /// `set_clock_uncertainty -from/-to` with this clock as the TARGET (`Sdc::clockUncertainty`).
     pub inter_uncertainties: Vec<InterClockUncertainty>,
+    /// The clocks (indices in [`Sdc::clocks`]) `set_clock_groups` cuts this one from
+    /// (`Sdc::clk_group_exclusions_`, a symmetric pair set): no path between the two is checked.
+    pub excluded: Vec<usize>,
 }
 
 /// One `InterClockUncertainty`, kept on its target clock: from the clock `from` (its index in
@@ -50,6 +53,7 @@ impl Clock {
             pin_latencies: Vec::new(),
             uncertainty: [None; 2],
             inter_uncertainties: Vec::new(),
+            excluded: Vec::new(),
         }
     }
 
@@ -272,6 +276,13 @@ impl Sdc {
         } else {
             u
         }
+    }
+
+    /// `Sdc::sameClockGroup(src, tgt)`: no `set_clock_groups` cuts the two clocks apart. Asked
+    /// at every clocked check, output delay and gated clock end (`VisitPathEnds`), path delays
+    /// included; an end it fails is not made.
+    pub fn same_clock_group(&self, src: usize, tgt: usize) -> bool {
+        !self.clocks[src].excluded.contains(&tgt)
     }
 
     /// `Sdc::exceptionFromStates` returning false: a false path of this min/max complete at the
