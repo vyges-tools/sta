@@ -825,13 +825,10 @@ fn is_any_input(d: Direction) -> bool {
 }
 
 /// `findExprOutPort`: the first port the expression names (left before right) that is an output.
-fn find_expr_out_port<'c>(expr: &'c FuncExpr, cell: &Cell) -> Option<&'c str> {
-    match expr {
-        FuncExpr::Port(p) => cell.port(p).filter(|x| is_any_output(x.direction)).map(|_| p.as_str()),
-        FuncExpr::Not(e) => find_expr_out_port(e, cell),
-        FuncExpr::And(l, r) | FuncExpr::Or(l, r) | FuncExpr::Xor(l, r) => find_expr_out_port(l, cell).or_else(|| find_expr_out_port(r, cell)),
-        FuncExpr::One | FuncExpr::Zero => None,
-    }
+/// The weight of an input pin's internal power group: the probability of its `when`
+/// (`evalActivity(when).duty`), 1 without one.
+pub fn input_group_duty(when: Option<&FuncExpr>, pins: &impl InstPins) -> f32 {
+    when.map_or(1.0, |w| eval_activity(w, pins).duty)
 }
 
 fn has_port(expr: &FuncExpr, port: &str) -> bool {
@@ -891,16 +888,17 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
                 self.find_output_internal_power(i, cell, port, activity, load_cap, pw, r);
             }
             if is_any_input(port.direction) {
-                self.find_input_internal_power(i, v, cell, link, port, activity, load_cap, pw, r);
+                self.find_input_internal_power(i, v, cell, port, activity, load_cap, pw, r);
             }
         }
     }
 
     /// `findInputInternalPower`: each group on the port, its energy averaged over the
-    /// transitions × its `when` duty (the output's Boolean difference when the output's function
-    /// names the port) × the pin's density.
+    /// transitions × the probability of its `when` (1 without one) × the pin's density. Upstream
+    /// OpenSTA cc9027d weighs every group by P(when); before, a `when` naming an output whose
+    /// function names the port took that function's Boolean difference on the port instead.
     #[allow(clippy::too_many_arguments)]
-    fn find_input_internal_power(&mut self, i: usize, v: usize, cell: &'a Cell, link: &Cell, port: &crate::liberty::Port, activity: Activity, load_cap: f32, pw: &PowerInputs<'_>, r: &mut InstPower) {
+    fn find_input_internal_power(&mut self, i: usize, v: usize, cell: &'a Cell, port: &crate::liberty::Port, activity: Activity, load_cap: f32, pw: &PowerInputs<'_>, r: &mut InstPower) {
         let pwrs: Vec<&crate::liberty::InternalPower> = cell.internal_powers.iter().filter(|ip| ip.port == port.name).collect();
         if pwrs.is_empty() {
             return;
@@ -919,21 +917,7 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
             if rf_count > 0 {
                 energy /= rf_count as f32;
             }
-            let mut duty = 1.0f32;
-            if let Some(when) = pwr.when.as_deref().and_then(|w| FuncExpr::parse(w).ok()) {
-                // the scene port the `when` names, then the link cell's port of that name
-                match find_expr_out_port(&when, cell) {
-                    Some(out) => {
-                        if let Some(out_port) = link.port(out) {
-                            match out_port.function.as_deref().and_then(|f| FuncExpr::parse(f).ok()) {
-                                Some(func) if has_port(&func, &port.name) => duty = eval_diff_duty(&func, &port.name, &InstView { p: self, inst: i }),
-                                _ => duty = self.eval_activity_on(&when, i).duty,
-                            }
-                        }
-                    }
-                    None => duty = self.eval_activity_on(&when, i).duty,
-                }
-            }
+            let duty = input_group_duty(pwr.when.as_deref().and_then(|w| FuncExpr::parse(w).ok()).as_ref(), &InstView { p: self, inst: i });
             internal += energy * duty * activity.density;
         }
         r.internal += internal;
@@ -1367,6 +1351,17 @@ mod tests {
         assert_eq!(Activity::new(9e-11, 0.5, Origin::Input).density, 0.0);
         assert_eq!(Activity::new(-9e-11, 0.5, Origin::Input).density, 0.0);
         assert_eq!(Activity::new(1e-10, 0.5, Origin::Input).density, 1e-10);
+    }
+
+    // An input pin's internal power group is weighed by the probability of its `when` (upstream
+    // OpenSTA cc9027d), even when the `when` names an output whose function names the pin (the
+    // Boolean difference on the pin, before); 1 without a `when`.
+    #[test]
+    fn an_input_group_is_weighed_by_its_when() {
+        let p = pins(&[("A", 1e7, 0.5), ("B", 2e7, 0.25), ("Z", 1e7, 0.125)]);
+        assert_eq!(input_group_duty(Some(&f("!Z & B")), &p), 0.875 * 0.25);
+        assert_eq!(input_group_duty(Some(&f("A")), &p), 0.5);
+        assert_eq!(input_group_duty(None, &p), 1.0);
     }
 
     // The sensitizing duty of A in A&B is B's duty.
