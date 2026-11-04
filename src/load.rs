@@ -1502,6 +1502,24 @@ mod tests {
         refused("module s (a, y); input a; output y; BUF b (.A(a), .X(y)); endmodule\nmodule t (a, y); input a; output y; s u (.a(a), .y(y)); endmodule\n", "hierarchy");
     }
 
+    /// A clock sense is not modelled by this timer, so a file with one is refused, naming it:
+    /// `set_clock_sense`, `set_sense -type clock`, and `set_sense` without `-type` (read as clock,
+    /// the SDC 2.1 default). `set_sense -type data` is refused too, as a command not applied.
+    #[test]
+    fn a_clock_sense_is_refused_naming_it() {
+        let d = vyges_loom::netlist::parse_compact("module t (a, y); input a; output y; BUF b (.A(a), .X(y)); endmodule\n").unwrap();
+        let nl = netlist(&d, &[lib()]).unwrap();
+        let refusal = |line: &str| {
+            let s = vyges_loom::sdc::Sdc::parse(&format!("create_clock -name c -period 2 [get_ports a]\n{line}\n")).unwrap();
+            constraints_with(&s, &nl, &[lib()], None).err().unwrap_or_default()
+        };
+        for line in ["set_sense -stop_propagation [get_pins b/X]", "set_sense -type clock -positive [get_pins b/X]", "set_clock_sense -negative [get_pins b/X]"] {
+            assert_eq!(refusal(line), "set_sense / set_clock_sense: not modelled by this timer", "{line}");
+        }
+        let data = refusal("set_sense -type data -positive [get_pins b/X]");
+        assert!(data.starts_with("set_sense (rejected: -type data is not modelled"), "{data}");
+    }
+
     /// Rule (`set_clock_uncertainty` in the reference's `sdc/Sdc.tcl`): `-setup` alone sets the
     /// max value, `-hold` alone the min, neither both; a later command replaces an earlier one's
     /// value for the same clock and min/max; `-from/-to` sets the pair (`-rise_from` / `-fall_to`
