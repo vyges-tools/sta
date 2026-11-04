@@ -225,7 +225,7 @@ pub fn sdc_design(nl: &Netlist, libs: &[Library]) -> vyges_loom::sdc::SdcDesign 
     }
     // `libs` (the group names an operating condition or wire load model is looked up in): this
     // reader's libraries do not keep them, so those lookups are not checked here
-    vyges_loom::sdc::SdcDesign { ports, insts: nl.insts.iter().map(|i| (**i).clone()).collect(), pins, libs: Vec::new() }
+    vyges_loom::sdc::SdcDesign { ports, insts: nl.insts.iter().map(|i| (**i).clone()).collect(), pins, libs: Vec::new(), ..Default::default() }
 }
 
 /// `[get_ports P …]` against the netlist: each pattern's ports (`object_matches`, the reference's
