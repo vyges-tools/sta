@@ -635,15 +635,8 @@ fn clock_uncertainties(us: &[vyges_loom::sdc::ClockUncertainty], clocks: &mut [c
     Ok(())
 }
 
-/// Every `set_false_path` (`FalsePath`) and `set_multicycle_path` (`MultiCyclePath`) as the
-/// reference makes it, in file order: `-from` and `-to` on ports or pins (patterns matched against
-/// the netlist, as `get_ports` / `get_pins` do) or on the one clock. A false path of `-setup` alone
-/// is the max paths', `-hold` alone the min paths', else one for each; a multicycle path is one
-/// exception of `-setup`, `-hold` or neither (`set_multicycle_path` in `Sdc.tcl`: `-end` unless
-/// `-hold` alone or `-start`). `-through`, the edge forms (`-rise_from`, `-rise`, …),
-/// `-reset_path`, instances and several clocks are refused.
-fn timing_exceptions(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc, nl: &Netlist) -> Result<Vec<crate::sdc::PathDelay>, String> {
-    use crate::liberty::{MAX, MIN};
+/// Every connected instance pin, `inst/port`, in net order: what `get_pins` patterns match.
+fn connected_pins(nl: &Netlist) -> Vec<String> {
     let mut pins: Vec<String> = Vec::new();
     for net in &nl.nets {
         for c in &net.pins {
@@ -652,6 +645,20 @@ fn timing_exceptions(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc
             }
         }
     }
+    pins
+}
+
+/// Every `set_false_path` (`FalsePath`) and `set_multicycle_path` (`MultiCyclePath`) as the
+/// reference makes it, in file order: `-from` and `-to` on ports or pins (patterns matched against
+/// the netlist, as `get_ports` / `get_pins` do) or on the one clock. A false path of `-setup` alone
+/// is the max paths', `-hold` alone the min paths', else one for each; a multicycle path is one
+/// exception of `-setup`, `-hold` or neither (`set_multicycle_path` in `Sdc.tcl`: `-end` unless
+/// `-hold` alone or `-start`). Each `-through` is a point, in order ([`thru_point`]). The edge
+/// forms (`-rise_from`, `-rise_through`, `-rise`, …), `-reset_path`, instances on `-from` / `-to`
+/// and several clocks are refused.
+fn timing_exceptions(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc, nl: &Netlist) -> Result<Vec<crate::sdc::PathDelay>, String> {
+    use crate::liberty::{MAX, MIN};
+    let pins = connected_pins(nl);
     let mut out = Vec::new();
     for e in es {
         let multiplier = match e.kind {
@@ -663,9 +670,10 @@ fn timing_exceptions(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc
         if let Some(f) = e.flags.iter().find(|f| !allowed(f)) {
             return Err(format!("{cmd} {f}: not modelled"));
         }
-        if let Some((f, _)) = e.args.iter().find(|(f, _)| f != "-from" && f != "-to") {
+        if let Some((f, _)) = e.args.iter().find(|(f, _)| f != "-from" && f != "-to" && f != "-through") {
             return Err(format!("{cmd} {f}: not modelled"));
         }
+        let thrus = e.args.iter().filter(|(f, _)| f == "-through").map(|(_, o)| thru_point(cmd, o, nl, &pins)).collect::<Result<Vec<_>, _>>()?;
         let side = |flag: &str| -> Result<(Vec<String>, bool), String> {
             let (mut names, mut clock) = (Vec::new(), false);
             for (_, o) in e.args.iter().filter(|(f, _)| f == flag) {
@@ -695,8 +703,8 @@ fn timing_exceptions(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc
         if (given("-from") && from_pins.is_empty() && !from_clock) || (given("-to") && to_pins.is_empty() && !to_clock) {
             continue;
         }
-        if !given("-from") && !given("-to") {
-            return Err(format!("{cmd} with no -from / -to: not modelled"));
+        if !given("-from") && !given("-to") && thrus.is_empty() {
+            return Err(format!("{cmd} with no -from / -through / -to: not modelled"));
         }
         let has = |f: &str| e.flags.iter().any(|x| x == f);
         if let Some(n) = multiplier {
@@ -716,6 +724,7 @@ fn timing_exceptions(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc
                 delay: 0.0,
                 false_path: false,
                 multicycle: Some(crate::sdc::Multicycle { multiplier: n, use_end_clk, all: setup == hold }),
+                thrus,
             });
             continue;
         }
@@ -736,10 +745,32 @@ fn timing_exceptions(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc
                 delay: 0.0,
                 false_path: true,
                 multicycle: None,
+                thrus: thrus.clone(),
             });
         }
     }
     Ok(out)
+}
+
+/// One `-through` point (`ExceptionThru`): `get_pins` and `get_ports` are its pins, `get_nets` its
+/// nets, `get_cells` its instances, patterns matched against the netlist. Bare names (no finder),
+/// and a point that matches nothing, are refused.
+fn thru_point(cmd: &str, o: &vyges_loom::sdc::Objects, nl: &Netlist, pins: &[String]) -> Result<crate::sdc::Thru, String> {
+    let mut t = crate::sdc::Thru::default();
+    let hit = |n: &str, x: &str| vyges_loom::sdc::object_matches(n, x);
+    for n in &o.names {
+        match o.accessor.as_str() {
+            "get_pins" => t.pins.extend(pins.iter().filter(|p| hit(n, p)).cloned()),
+            "get_ports" => t.pins.extend(nl.ports.iter().map(|(p, _)| p).filter(|p| hit(n, p)).cloned()),
+            "get_nets" => t.nets.extend(nl.nets.iter().map(|x| &x.name).filter(|x| hit(n, x)).cloned()),
+            "get_cells" => t.insts.extend(nl.insts.iter().map(|x| &x.0).filter(|x| hit(n, x)).cloned()),
+            other => return Err(format!("{cmd} -through [{other} {}]: not modelled (pins, ports, nets or cells are)", o.names.join(" "))),
+        }
+    }
+    if t.pins.is_empty() && t.nets.is_empty() && t.insts.is_empty() {
+        return Err(format!("{cmd} -through [{} {}]: matches nothing: not modelled", o.accessor, o.names.join(" ")));
+    }
+    Ok(t)
 }
 
 /// A `-from` / `-to` side as `get_clocks_warn` reads it: names are clocks.
@@ -1059,7 +1090,7 @@ pub fn search_sdc_on(
     hold_repair: bool,
 ) -> Result<crate::sdc::Sdc, String> {
     let [i, o] = expanded_io_delays(s, nl);
-    search_sdc_with(s, [&i, &o], time_scale, propagated, hold_repair)
+    search_sdc_with(s, Some(nl), [&i, &o], time_scale, propagated, hold_repair)
 }
 
 /// The constraints the setup search reads (one clock and its port delays), from the SDC as the
@@ -1074,12 +1105,13 @@ pub fn search_sdc_on(
 /// are kept as written. [`search_sdc`] reads only named ports; a caller with the netlist expands
 /// first.
 pub fn search_sdc(s: &vyges_loom::sdc::Sdc, time_scale: f32, propagated: bool, hold_repair: bool) -> Result<crate::sdc::Sdc, String> {
-    search_sdc_with(s, [&s.input_delays, &s.output_delays], time_scale, propagated, hold_repair)
+    search_sdc_with(s, None, [&s.input_delays, &s.output_delays], time_scale, propagated, hold_repair)
 }
 
 /// [`search_sdc`] with the input and output delays given (`io`: inputs, outputs).
 fn search_sdc_with(
     s: &vyges_loom::sdc::Sdc,
+    nl: Option<&Netlist>,
     io: [&[vyges_loom::sdc::IoDelay]; 2],
     time_scale: f32,
     propagated: bool,
@@ -1306,16 +1338,16 @@ fn search_sdc_with(
         clocks,
         input_delays: inputs(&delays[0])?,
         output_delays: outputs(&delays[1])?,
-        path_delays: path_delays(s, time_scale)?,
+        path_delays: path_delays(s, nl, time_scale)?,
     })
 }
 
 /// Every `set_max_delay` / `set_min_delay` as the reference's `write_sdc` writes it:
-/// `[-ignore_clock_latency] [-probe] [-from <objs>] [-to <objs>] <delay>`, objects
-/// `[get_pins {..}]` or `[get_clocks {..}]`. Any other flag is refused; so is more than one (an
+/// `[-ignore_clock_latency] [-probe] [-from <objs>] [-through <objs>]... [-to <objs>] <delay>`,
+/// objects `[get_pins {..}]` or `[get_clocks {..}]`, `-through` points as [`thru_point`] reads them. Any other flag is refused; so is more than one (an
 /// exception's id is the order it was MADE in, which the file may not keep). Which forms the
 /// timer models is the search's to say (`Search::path_delays_modelled`).
-pub fn path_delays(s: &vyges_loom::sdc::Sdc, time_scale: f32) -> Result<Vec<crate::sdc::PathDelay>, String> {
+pub fn path_delays(s: &vyges_loom::sdc::Sdc, nl: Option<&Netlist>, time_scale: f32) -> Result<Vec<crate::sdc::PathDelay>, String> {
     use crate::liberty::{MAX, MIN};
     let mut out = Vec::new();
     for d in &s.path_delays {
@@ -1323,8 +1355,14 @@ pub fn path_delays(s: &vyges_loom::sdc::Sdc, time_scale: f32) -> Result<Vec<crat
         if let Some(f) = d.flags.iter().find(|f| !matches!(f.as_str(), "-ignore_clock_latency" | "-probe")) {
             return Err(format!("{cmd} {f}: not modelled"));
         }
-        if let Some((f, _)) = d.objects.iter().find(|(f, _)| f != "-from" && f != "-to") {
+        if let Some((f, _)) = d.objects.iter().find(|(f, _)| f != "-from" && f != "-to" && f != "-through") {
             return Err(format!("{cmd} {f}: not modelled"));
+        }
+        let mut thrus = Vec::new();
+        for (_, o) in d.objects.iter().filter(|(f, _)| f == "-through") {
+            // A point's objects are matched against the netlist ([`search_sdc_on`] has it).
+            let Some(nl) = nl else { return Err(format!("{cmd} -through read without the netlist: not modelled")) };
+            thrus.push(thru_point(cmd, o, nl, &connected_pins(nl))?);
         }
         if d.value.is_nan() {
             return Err(format!("{cmd}: the delay value is not modelled"));
@@ -1354,6 +1392,7 @@ pub fn path_delays(s: &vyges_loom::sdc::Sdc, time_scale: f32) -> Result<Vec<crat
             delay: crate::sdc::user_to_sta(d.value, time_scale),
             false_path: false,
             multicycle: None,
+            thrus,
         });
     }
     if out.len() > 1 {
@@ -1465,7 +1504,13 @@ mod tests {
         let f = read("set_false_path -to [get_ports y]\n").unwrap();
         assert_eq!(f.iter().map(|p| p.min_max).collect::<Vec<_>>(), vec![MIN, MAX]);
         assert!(read("set_false_path -from [get_ports -quiet nope]\nset_false_path -from [get_ports a] -to [get_ports -quiet nope2]\n").unwrap().is_empty(), "an empty side: no exception");
-        assert!(read("set_false_path -from [get_ports a] -through [get_pins lz/A]\n").unwrap_err().contains("not modelled"));
+        // Each `-through` a point, in order: pins and ports, nets, cells.
+        let f = read("set_false_path -from [get_ports a] -through [get_pins lz/A] -through [get_nets n1] -through [get_cells drv] -through [get_ports y]\n").unwrap();
+        let t = |pins: &[&str], nets: &[&str], insts: &[&str]| crate::sdc::Thru { pins: pins.iter().map(|x| x.to_string()).collect(), nets: nets.iter().map(|x| x.to_string()).collect(), insts: insts.iter().map(|x| x.to_string()).collect() };
+        assert_eq!(f[0].thrus, vec![t(&["lz/A"], &[], &[]), t(&[], &["n1"], &[]), t(&[], &[], &["drv"]), t(&["y"], &[], &[])]);
+        assert!(read("set_false_path -through n1\n").unwrap_err().contains("not modelled"), "a bare name: refused");
+        assert!(read("set_false_path -through [get_nets -quiet nope]\n").unwrap_err().contains("matches nothing"));
+        assert!(read("set_false_path -rise_through [get_nets n1]\n").unwrap_err().contains("not modelled"));
     }
 
     /// Rules (`Sdc::makeClkGroupExclusions`, `get_clocks_warn`; witnessed by the `clock_groups`

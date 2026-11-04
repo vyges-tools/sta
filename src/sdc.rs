@@ -109,9 +109,48 @@ impl PortDelay {
     }
 }
 
+/// One `-through` point (`ExceptionThru`): pins (and ports), nets and leaf instances, every
+/// transition (`-rise_through` / `-fall_through` are not modelled).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Thru {
+    pub pins: Vec<String>,
+    pub nets: Vec<String>,
+    pub insts: Vec<String>,
+}
+
+/// What a `-through` point is matched against: the pin a search edge arrives at, its net and its
+/// instance (`ExceptionThru::matches(from_pin, to_pin, to_rf)`), and whether the edge is a wire
+/// edge on that net (`edges_`: a net's driver-to-load pairs) and the pin an output or a latch
+/// data pin (where an instance starts a `-through`, `exceptionThruStates`).
+#[derive(Debug, Clone, Copy)]
+pub struct ThruPin<'a> {
+    pub pin: &'a str,
+    pub net: Option<&'a str>,
+    pub inst: Option<&'a str>,
+    pub wire: bool,
+    pub output_or_latch_data: bool,
+}
+
+impl Thru {
+    /// `ExceptionThru::matches`: the pin is one of the pins, on one of the nets (a net's driver
+    /// to load pairs are on the net too), or of one of the instances.
+    pub fn matches(&self, to: &ThruPin) -> bool {
+        self.pins.iter().any(|p| p == to.pin) || to.net.is_some_and(|n| self.nets.iter().any(|x| x == n)) || to.inst.is_some_and(|i| self.insts.iter().any(|x| x == i))
+    }
+
+    /// The `first_thru_*_exceptions_` lookups `exceptionThruStates` makes for the first point:
+    /// a pin of it, a wire edge on a net of it, or — at an output or latch data pin — a pin of an
+    /// instance of it.
+    fn starts_at(&self, to: &ThruPin) -> bool {
+        self.pins.iter().any(|p| p == to.pin)
+            || (to.wire && to.net.is_some_and(|n| self.nets.iter().any(|x| x == n)))
+            || (to.output_or_latch_data && to.inst.is_some_and(|i| self.insts.iter().any(|x| x == i)))
+    }
+}
+
 /// `set_max_delay` / `set_min_delay` (`PathDelay`), `-from` pins and `-to` pins or the clock, every
-/// transition, no `-through`. Its id (the order it was made in, `ExceptionPath::id`) is its index in
-/// [`Sdc::path_delays`].
+/// transition, `-through` points. Its id (the order it was made in, `ExceptionPath::id`) is its
+/// index in [`Sdc::path_delays`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathDelay {
     /// The pins of `-from`; empty with no `-from` pin.
@@ -136,6 +175,8 @@ pub struct PathDelay {
     /// paths are. `min_max` is `MAX` for `-setup`, `MIN` for `-hold`; [`Multicycle::all`] for
     /// neither.
     pub multicycle: Option<Multicycle>,
+    /// The `-through` points, in order.
+    pub thrus: Vec<Thru>,
 }
 
 /// A multicycle path's own fields (`MultiCyclePath`).
@@ -151,6 +192,48 @@ pub struct Multicycle {
 impl PathDelay {
     fn has_from(&self) -> bool {
         !self.from_pins.is_empty() || self.from_clock
+    }
+
+    fn has_to(&self) -> bool {
+        !self.to_pins.is_empty() || self.to_clock
+    }
+
+    /// The index of `firstState` (`makeStates`): 0, but 1 when the first point is a `-through`
+    /// (no `-from`) — its state is the one AFTER that point, which starts the exception.
+    pub fn first_index(&self) -> usize {
+        usize::from(!self.thrus.is_empty() && !self.has_from())
+    }
+
+    /// The index of the last state, past every `-through` (`next_thru_` null).
+    pub fn last_index(&self) -> usize {
+        self.thrus.len()
+    }
+
+    /// How many states the exception has.
+    fn state_count(&self) -> usize {
+        self.last_index() + 1 - self.first_index()
+    }
+
+    /// `ExceptionState::matchesNextThru` for the state of index `index`: a `-through` still to
+    /// come, the exception of this min/max (not exactly), and that point matches.
+    pub fn matches_next_thru(&self, index: usize, mm: usize, to: &ThruPin) -> bool {
+        self.thrus.get(index).is_some_and(|t| self.matches(mm, false) && t.matches(to))
+    }
+
+    /// `ExceptionState::isComplete` for the state of index `index`: past every `-through`, and no
+    /// `-to`.
+    pub fn is_complete(&self, index: usize) -> bool {
+        index == self.last_index() && !self.has_to()
+    }
+
+    /// The first point is the `-to` (`ExceptionPath::firstPt`): no `-from` and no `-through`.
+    fn first_is_to(&self) -> bool {
+        !self.has_from() && self.thrus.is_empty()
+    }
+
+    /// `ExceptionPath::isPathDelay`.
+    pub fn is_path_delay(&self) -> bool {
+        !self.false_path && self.multicycle.is_none()
     }
 
     /// `ExceptionTo::matches(pin, clk_edge, end_rf)`: a `-to` pin, or `-to` the clock at a clocked
@@ -205,6 +288,9 @@ impl PathDelay {
         if self.from_clock {
             p |= 1 << 3;
         }
+        if !self.thrus.is_empty() {
+            p |= 1 << 4;
+        }
         if self.to_clock {
             p |= 1 << 2;
         }
@@ -216,12 +302,6 @@ impl PathDelay {
             3000
         };
         base + p
-    }
-
-    /// `ExceptionState::isComplete` at the start: a false path with no `-to` (and no `-through`,
-    /// none here) is complete out of the gate — the path it starts is never made.
-    fn complete_false(&self) -> bool {
-        self.false_path && self.to_pins.is_empty() && !self.to_clock
     }
 
     /// `PathDelay::tighterThan`: a min delay is tighter when larger, a max delay when smaller.
@@ -243,8 +323,11 @@ impl PathDelay {
     }
 }
 
-/// The exception states a tag carries (`ExceptionStateSet`): one bit per path delay id. With no
-/// `-through`, an exception has one state, and it is complete from the start.
+/// The exception states a tag carries (`ExceptionStateSet`): one bit per state SLOT. An exception's
+/// states (`makeStates`: one per `-through` still to come, and the last, past them all) take
+/// consecutive slots, the exceptions in id order ([`Sdc::slot`], [`Sdc::state_of`]) — so bit order
+/// is `exceptionStateCmp`'s (exception id, then state index). With no `-through` anywhere, an
+/// exception has one state, complete from the start, and its slot is its id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct States(pub u64);
 
@@ -303,46 +386,208 @@ impl Sdc {
         !self.clocks[src].excluded.contains(&tgt)
     }
 
-    /// `Sdc::exceptionFromStates` returning false: a false path of this min/max complete at the
-    /// start (no `-to`) whose `-from` names `pin` — or, for a path the clock launches (`clk`),
-    /// the clock. No path starts there (`inputDelayTag` / `fromRegClkTag` make no tag). The
-    /// clock's own network paths are seeded regardless (`exceptionFromClkStates`).
-    pub fn false_from(&self, pin: &str, clk: bool, mm: usize) -> bool {
-        self.path_delays.iter().any(|pd| {
-            pd.min_max == mm && pd.complete_false() && (pd.from_pins.iter().any(|p| p == pin) || (clk && pd.from_clock && pd.from_pins.is_empty()))
-        })
+    /// The slot of state `index` of exception `id` ([`States`]): the exceptions before it take
+    /// theirs first.
+    pub fn slot(&self, id: usize, index: usize) -> usize {
+        let base: usize = self.path_delays[..id].iter().map(PathDelay::state_count).sum();
+        base + index - self.path_delays[id].first_index()
+    }
+
+    /// The exception and state index a slot stands for.
+    pub fn state_of(&self, slot: usize) -> (usize, usize) {
+        let mut base = 0;
+        for (id, pd) in self.path_delays.iter().enumerate() {
+            let n = pd.state_count();
+            if slot < base + n {
+                return (id, pd.first_index() + slot - base);
+            }
+            base += n;
+        }
+        panic!("state slot {slot} is past the {base} slots of the exceptions: a set holds only slots made by Sdc::slot");
+    }
+
+    /// How many state slots the exceptions take (at most 64 are modelled).
+    pub fn state_slots(&self) -> usize {
+        self.path_delays.iter().map(PathDelay::state_count).sum()
+    }
+
+    /// Whether any exception has a `-through`.
+    pub fn has_thrus(&self) -> bool {
+        self.path_delays.iter().any(|pd| !pd.thrus.is_empty())
+    }
+
+    fn with(&self, states: States, id: usize, index: usize) -> States {
+        States(states.0 | 1 << self.slot(id, index))
+    }
+
+    /// `Sdc::exceptionFromStates` returning false: no path starts at `pin` ([`Sdc::from_states`]).
+    pub fn false_from(&self, pin: &ThruPin, clk: bool, mm: usize) -> bool {
+        self.from_states(pin, clk, mm).is_none()
+    }
+
+    /// The states [`Sdc::from_states`] gives a path starting at `pin`, none when it stops there.
+    pub fn exception_from_states(&self, pin: &ThruPin, clk: bool, mm: usize) -> States {
+        self.from_states(pin, clk, mm).unwrap_or(States::NONE)
+    }
+
+    /// `Sdc::exceptionFromStates(pin, rf, clk, clk_rf, min_max)`: the states of a path starting at
+    /// `pin` (and, launched by the clock, `clk`). Asked of, in order and while none stops the
+    /// path: the exceptions whose `-from` names the pin, those whose first point is a `-through`
+    /// naming the pin, those whose first `-through` names its instance, and those whose `-from`
+    /// names the clock ([`Sdc::exception_list_states`]). None (the reference's false): one of them is a
+    /// complete false path, and no path starts.
+    pub fn from_states(&self, pin: &ThruPin, clk: bool, mm: usize) -> Option<States> {
+        let mut s = States::NONE;
+        let lists: [&dyn Fn(&PathDelay) -> bool; 4] = [
+            &|pd| self.first_from_pin(pd, pin.pin),
+            &|pd| self.first_thru_pin(pd, pin.pin),
+            &|pd| self.first_thru_inst(pd, pin.inst),
+            &|pd| clk && self.first_from_clk(pd),
+        ];
+        for list in lists {
+            if !self.exception_list_states(&mut s, list, Some(pin), mm) {
+                return None;
+            }
+        }
+        Some(s)
+    }
+
+    /// `Sdc::exceptionFromClkStates`: the states a clock's seed at its source `pin` carries — the
+    /// exceptions whose `-from` names the pin (not advanced: the reference passes no pin), the
+    /// first states of those whose first `-through` names the pin, then those whose `-from` names
+    /// the clock. A complete false path does not stop the clock: it is kept, alone, as a marker
+    /// (and what later lists add with it), so the paths the clock starts as data stop.
+    pub fn clock_from_states(&self, pin: &ThruPin, mm: usize) -> States {
+        let mut s = States::NONE;
+        self.exception_list_states(&mut s, &|pd| self.first_from_pin(pd, pin.pin), None, mm);
+        for (id, pd) in self.path_delays.iter().enumerate() {
+            if self.first_thru_pin(pd, pin.pin) && pd.matches(mm, false) {
+                s = self.with(s, id, pd.first_index());
+            }
+        }
+        self.exception_list_states(&mut s, &|pd| self.first_from_clk(pd), Some(pin), mm);
+        s
+    }
+
+    fn first_from_pin(&self, pd: &PathDelay, pin: &str) -> bool {
+        pd.from_pins.iter().any(|p| p == pin)
+    }
+
+    fn first_thru_pin(&self, pd: &PathDelay, pin: &str) -> bool {
+        !pd.has_from() && pd.thrus.first().is_some_and(|t| t.pins.iter().any(|p| p == pin))
+    }
+
+    fn first_thru_inst(&self, pd: &PathDelay, inst: Option<&str>) -> bool {
+        !pd.has_from() && pd.thrus.first().is_some_and(|t| inst.is_some_and(|i| t.insts.iter().any(|x| x == i)))
+    }
+
+    fn first_from_clk(&self, pd: &PathDelay) -> bool {
+        pd.from_clock && pd.from_pins.is_empty()
+    }
+
+    /// `Sdc::exceptionFromStates(exceptions, pin, rf, min_max)` over the exceptions (in id order)
+    /// `list` admits, of this min/max (not exactly): each takes its first state, advanced once
+    /// when its next `-through` matches `pin`. A complete false path empties the set but for its
+    /// own state and ends the list: false.
+    fn exception_list_states(&self, s: &mut States, list: &dyn Fn(&PathDelay) -> bool, pin: Option<&ThruPin>, mm: usize) -> bool {
+        for (id, pd) in self.path_delays.iter().enumerate() {
+            if !list(pd) || !pd.matches(mm, false) {
+                continue;
+            }
+            let mut index = pd.first_index();
+            // `matchesNextThru(nullptr, pin)`: `-from clk -through reg/CLK`.
+            if pin.is_some_and(|p| pd.matches_next_thru(index, mm, p)) {
+                index += 1;
+            }
+            if pd.is_complete(index) && pd.false_path {
+                *s = self.with(States::NONE, id, index);
+                return false;
+            }
+            *s = self.with(*s, id, index);
+        }
+        true
+    }
+
+    /// `Sdc::exceptionThruStates(from_pin, to_pin, to_rf, min_max)`: the first states of the
+    /// exceptions whose first point is a `-through` met on the edge into `to` — a pin of it, a
+    /// wire edge on a net of it, an output (or latch data) pin of an instance of it — of this
+    /// min/max (`matchesFirstPt`, not exactly). Not advanced here: [`Sdc::mutate`]'s second pass
+    /// does that.
+    pub fn exception_thru_states(&self, to: &ThruPin, mm: usize) -> States {
+        let mut s = States::NONE;
+        for (id, pd) in self.path_delays.iter().enumerate() {
+            if !pd.has_from() && pd.thrus.first().is_some_and(|t| t.starts_at(to)) && pd.matches(mm, false) {
+                s = self.with(s, id, pd.first_index());
+            }
+        }
+        s
+    }
+
+    /// `Search::mutateTag`'s states over an edge `from` -> `to` of a path of min/max `mm` whose
+    /// tag is a clock's (`from_is_clk`). None (the reference's null tag): a false path completes
+    /// on a data path, which stops there.
+    ///
+    /// Two passes. The first looks for a change: a state whose next `-through` matches `to`, or a
+    /// path delay complete at `to` (a non-clock path reaching a complete false path stops). The
+    /// second, when there is a change or `to` starts a `-through`-first exception, advances every
+    /// state through all the `-through`s `to` matches, and keeps it unless it is a path delay
+    /// complete at `from` — so a path delay's state is dropped on the edge LEAVING its `-to` pin
+    /// only when that edge's own `to` makes a change too (the two passes test different pins).
+    pub fn mutate(&self, states: States, from: &ThruPin, to: &ThruPin, from_is_clk: bool, mm: usize) -> Option<States> {
+        let mut change = false;
+        for slot in states.ids() {
+            let (id, index) = self.state_of(slot);
+            let pd = &self.path_delays[id];
+            if pd.matches_next_thru(index, mm, to) {
+                change = true;
+                break;
+            }
+            if pd.is_complete(index) && pd.false_path && !from_is_clk {
+                return None;
+            }
+            if pd.is_path_delay() && self.is_complete_to(id, index, to.pin, mm) {
+                change = true;
+                break;
+            }
+        }
+        let fresh = if self.has_thrus() { self.exception_thru_states(to, mm) } else { States::NONE };
+        if !change && fresh == States::NONE {
+            return Some(states);
+        }
+        let mut out = fresh;
+        for slot in states.ids() {
+            let (id, mut index) = self.state_of(slot);
+            let pd = &self.path_delays[id];
+            while pd.matches_next_thru(index, mm, to) {
+                index += 1;
+            }
+            if pd.is_complete(index) && pd.false_path && !from_is_clk {
+                return None;
+            }
+            if !(pd.is_path_delay() && self.is_complete_to(id, index, from.pin, mm)) {
+                out = self.with(out, id, index);
+            }
+        }
+        Some(out)
+    }
+
+    /// `Sdc::isCompleteTo(state, pin, rf, min_max)` (the mutation's test): the state is past every
+    /// `-through`, the exception has a `-to` naming `pin` (clocks do not count), and it is of this
+    /// min/max exactly.
+    pub fn is_complete_to(&self, id: usize, index: usize, pin: &str, mm: usize) -> bool {
+        let pd = &self.path_delays[id];
+        index == pd.last_index() && pd.matches(mm, true) && pd.to_pins.iter().any(|p| p == pin)
     }
 
     /// `VisitPathEnds::falsePathTo` → `Search::exceptionTo(false_path, path, pin, rf, clk_edge =
-    /// null, min_max)`: of the FALSE PATHS alone, one of the path's states complete at `pin`, or
-    /// one whose first point is a `-to` naming the pin. Read before any end is visited, so a match
-    /// makes no end at the pin at all — check, output delay, path delay or gated clock. No clock
-    /// edge is passed, so `-to` the clock never matches here.
+    /// null, min_max)`: of the FALSE PATHS alone, one of the path's states past every `-through`
+    /// and complete at `pin`, or one whose first point is a `-to` naming the pin. Read before any
+    /// end is visited, so a match makes no end at the pin at all — check, output delay, path delay
+    /// or gated clock. No clock edge is passed, so `-to` the clock never matches here.
     pub fn false_path_to(&self, states: States, pin: &str, mm: usize) -> bool {
         let to = |pd: &PathDelay| pd.false_path && pd.min_max == mm && pd.to_matches(pin, false);
-        states.ids().any(|id| to(&self.path_delays[id]))
-            || self.path_delays.iter().any(|pd| !pd.has_from() && !pd.to_pins.is_empty() && to(pd))
-    }
-
-    /// `Sdc::exceptionFromStates`: the states a path starting at `pin` (and, launched by the clock,
-    /// at `clk`) carries — every exception of this min/max whose `-from` names the pin, then every
-    /// one whose `-from` names the clock. A false path complete at the start is not a state: it
-    /// stops the path ([`Sdc::false_from`], which callers ask first).
-    pub fn exception_from_states(&self, pin: &str, clk: bool, mm: usize) -> States {
-        let mut s = 0u64;
-        for (id, pd) in self.path_delays.iter().enumerate() {
-            if pd.matches(mm, false) && !pd.complete_false() && (pd.from_pins.iter().any(|p| p == pin) || (clk && pd.from_clock && pd.from_pins.is_empty())) {
-                s |= 1 << id;
-            }
-        }
-        States(s)
-    }
-
-    /// `Sdc::isCompleteTo(state, pin, rf, min_max)` (the mutation's test): the exception has a
-    /// `-to` naming `pin` (clocks do not count) and is of this min/max.
-    pub fn is_complete_to_pin(&self, id: usize, pin: &str, mm: usize) -> bool {
-        let pd = &self.path_delays[id];
-        !pd.false_path && pd.multicycle.is_none() && pd.min_max == mm && pd.to_pins.iter().any(|p| p == pin)
+        states.ids().map(|s| self.state_of(s)).any(|(id, index)| index == self.path_delays[id].last_index() && to(&self.path_delays[id]))
+            || self.path_delays.iter().any(|pd| pd.first_is_to() && !pd.to_pins.is_empty() && to(pd))
     }
 
     /// `Search::exceptionTo(any, path, pin, rf, clk_edge, min_max)` over path delays: the highest
@@ -382,18 +627,22 @@ impl Sdc {
                 *best = Some(id);
             }
         };
-        for id in states.ids() {
-            consider(id, &mut best);
+        // `Sdc::isCompleteTo`: only a state past every `-through` can end here.
+        for slot in states.ids() {
+            let (id, index) = self.state_of(slot);
+            if index == self.path_delays[id].last_index() {
+                consider(id, &mut best);
+            }
         }
         // `Sdc::exceptionTo`: `first_to_pin_exceptions_`, then `first_to_clk_exceptions_` (clocked
         // ends only).
         for (id, pd) in self.path_delays.iter().enumerate() {
-            if !pd.has_from() && !pd.to_pins.is_empty() && pd.to_pins.iter().any(|p| p == pin) {
+            if pd.first_is_to() && !pd.to_pins.is_empty() && pd.to_pins.iter().any(|p| p == pin) {
                 consider(id, &mut best);
             }
         }
         for (id, pd) in self.path_delays.iter().enumerate() {
-            if clocked && !pd.has_from() && pd.to_pins.is_empty() && pd.to_clock {
+            if clocked && pd.first_is_to() && pd.to_pins.is_empty() && pd.to_clock {
                 consider(id, &mut best);
             }
         }
@@ -596,8 +845,13 @@ mod tests {
     use super::*;
     use crate::liberty::{FALL, MAX, MIN, RISE};
 
+    /// A pin on no net, of no instance, reached by a gate edge.
+    fn pin_at(pin: &str) -> ThruPin<'_> {
+        ThruPin { pin, net: None, inst: None, wire: false, output_or_latch_data: false }
+    }
+
     fn false_path(from: &[&str], to: &[&str], mm: usize) -> PathDelay {
-        PathDelay { from_pins: from.iter().map(|p| p.to_string()).collect(), from_clock: false, to_pins: to.iter().map(|p| p.to_string()).collect(), to_clock: false, min_max: mm, ignore_clk_latency: false, break_path: false, delay: 0.0, false_path: true, multicycle: None }
+        PathDelay { from_pins: from.iter().map(|p| p.to_string()).collect(), from_clock: false, to_pins: to.iter().map(|p| p.to_string()).collect(), to_clock: false, min_max: mm, ignore_clk_latency: false, break_path: false, delay: 0.0, false_path: true, multicycle: None, thrus: Vec::new() }
     }
 
     /// Rules (`Sdc::exceptionFromStates`, `VisitPathEnds::falsePathTo`): a false path with no
@@ -615,15 +869,72 @@ mod tests {
             output_delays: vec![],
             path_delays: vec![false_path(&["rst"], &[], MAX), false_path(&["a"], &["y"], MAX), false_path(&[], &["z"], MIN), max_delay],
         };
-        assert!(sdc.false_from("rst", false, MAX) && !sdc.false_from("rst", false, MIN), "complete at the start, max only");
-        assert!(!sdc.false_from("a", false, MAX), "a -to: not complete at the start");
-        assert_eq!(sdc.exception_from_states("rst", false, MAX), States::NONE, "a complete false path is no state");
-        let from_a = sdc.exception_from_states("a", false, MAX);
+        assert!(sdc.false_from(&pin_at("rst"), false, MAX) && !sdc.false_from(&pin_at("rst"), false, MIN), "complete at the start, max only");
+        assert!(!sdc.false_from(&pin_at("a"), false, MAX), "a -to: not complete at the start");
+        assert_eq!(sdc.exception_from_states(&pin_at("rst"), false, MAX), States::NONE, "a complete false path is no state");
+        let from_a = sdc.exception_from_states(&pin_at("a"), false, MAX);
         assert_eq!(from_a, States(0b1010), "the false path and the max delay from a");
         assert!(sdc.false_path_to(from_a, "y", MAX), "its state completes at y");
         assert!(!sdc.false_path_to(States::NONE, "y", MAX), "a path not from a carries no state");
         assert!(!sdc.false_path_to(from_a, "z", MAX) && sdc.false_path_to(States::NONE, "z", MIN), "first point -to z: any path, min only");
         assert_eq!(sdc.path_delay_to(from_a, "y", false, MAX), Some(3), "the max delay, though the false path ranks higher");
+    }
+
+    fn thru(pins: &[&str], nets: &[&str], insts: &[&str]) -> Thru {
+        let v = |x: &[&str]| x.iter().map(|p| p.to_string()).collect();
+        Thru { pins: v(pins), nets: v(nets), insts: v(insts) }
+    }
+
+    /// Rules (`makeStates`, `ExceptionState::isComplete` / `matchesNextThru`,
+    /// `ExceptionThru::matches`, `Search::mutateTag`, `Sdc::exceptionThruStates`,
+    /// `Sdc::exceptionFromStates`): an exception's states are one per `-through` still to come
+    /// plus the last; with no `-from` the first `-through` is the start, and its state the one
+    /// AFTER it. A state advances when its next point matches the pin an edge reaches (a pin of
+    /// it, on a net of it, of an instance of it) — through every point the pin matches, in the
+    /// second pass. A `-through`-first exception starts on an edge reaching a pin of its first
+    /// point, a wire edge on a net of it, or an output of an instance of it; only past every
+    /// point can it end, and a false path past every point with no `-to` stops a data path (a
+    /// clock's carries it on). The `-through` adds 1<<4 to the priority.
+    #[test]
+    fn a_through_point_advances_the_state_that_waits_for_it() {
+        let mut fp = false_path(&["a"], &["y"], MAX);
+        fp.thrus = vec![thru(&["u1/A"], &[], &[]), thru(&[], &["n2"], &[])];
+        let mut first = false_path(&[], &[], MAX);
+        first.thrus = vec![thru(&[], &[], &["u3"])];
+        let sdc = Sdc { clocks: vec![], input_delays: vec![], output_delays: vec![], path_delays: vec![fp, first] };
+        assert_eq!(sdc.state_slots(), 4, "3 states for -from + 2 thrus, 1 for the -through-first one");
+        assert_eq!((sdc.slot(0, 2), sdc.slot(1, 1), sdc.state_of(3)), (2, 3, (1, 1)));
+        let start = sdc.exception_from_states(&pin_at("a"), false, MAX);
+        assert_eq!(start, States(1 << sdc.slot(0, 0)), "from a, waiting for u1/A");
+        let pin = |pin, net, inst, wire, out| ThruPin { pin, net, inst, wire, output_or_latch_data: out };
+        let u1a = pin("u1/A", Some("n1"), Some("u1"), true, false);
+        let s1 = sdc.mutate(start, &pin_at("a"), &u1a, false, MAX).unwrap();
+        assert_eq!(s1, States(1 << sdc.slot(0, 1)), "past u1/A, waiting for n2");
+        assert!(!sdc.false_path_to(s1, "y", MAX), "not past every point: no end at y");
+        let u1x = pin("u1/X", Some("n2"), Some("u1"), false, true);
+        let s2 = sdc.mutate(s1, &u1a, &u1x, false, MAX).unwrap();
+        assert_eq!(s2, States(1 << sdc.slot(0, 2)), "u1/X is on n2: past every point");
+        assert!(sdc.false_path_to(s2, "y", MAX), "now it ends the path at y");
+        assert_eq!(sdc.mutate(States::NONE, &pin_at("x"), &pin("u3/A", None, Some("u3"), true, false), false, MAX), Some(States::NONE), "an instance starts at its output only");
+        let u3x = pin("u3/X", None, Some("u3"), false, true);
+        let marked = sdc.mutate(States::NONE, &pin_at("u3/A"), &u3x, false, MAX).unwrap();
+        assert_eq!(marked, States(1 << sdc.slot(1, 1)), "the first state, complete, rides into u3/X");
+        assert_eq!(sdc.mutate(marked, &u3x, &pin_at("z"), false, MAX), None, "the next data edge stops it");
+        assert_eq!(sdc.mutate(marked, &u3x, &pin_at("z"), true, MAX), Some(marked), "a clock's tag carries it on");
+        assert!(sdc.false_from(&pin("u3/X", None, Some("u3"), false, true), false, MAX), "a path starting on u3 stops at once");
+        assert_eq!(sdc.path_delays[0].priority() - false_path(&["a"], &["y"], MAX).priority(), 1 << 4);
+    }
+
+    /// Rule (`Sdc::exceptionFromClkStates`): a clock's seed keeps a false path complete at its
+    /// pin as a marker instead of stopping, and adds the `-through`-first exceptions starting at
+    /// the pin.
+    #[test]
+    fn a_clock_seed_carries_a_complete_false_path() {
+        let mut first = false_path(&[], &["q"], MAX);
+        first.thrus = vec![thru(&["ck"], &[], &[])];
+        let sdc = Sdc { clocks: vec![], input_delays: vec![], output_delays: vec![], path_delays: vec![false_path(&["ck"], &[], MAX), first] };
+        assert!(sdc.false_from(&pin_at("ck"), true, MAX));
+        assert_eq!(sdc.clock_from_states(&pin_at("ck"), MAX), States(0b11), "the marker, and the -through-first state");
     }
 
     fn multicycle(from: &[&str], to: &[&str], mm: usize, multiplier: i32, use_end_clk: bool, all: bool) -> PathDelay {
@@ -645,7 +956,7 @@ mod tests {
         let at = |path_delays: Vec<PathDelay>| Sdc { clocks: vec![fast.clone(), slow.clone()], input_delays: vec![], output_delays: vec![], path_delays };
         let (src, tgt) = (Some(0), 2);
         let adj = |sdc: &Sdc, mm: usize| {
-            let states = sdc.exception_from_states("a", false, mm);
+            let states = sdc.exception_from_states(&pin_at("a"), false, mm);
             let id = sdc.multicycle_to(states, "y", true, mm, false);
             sdc.multicycle_adjustment(id, states, "y", src, tgt, mm)
         };
@@ -718,7 +1029,7 @@ mod tests {
     /// only the delay's own min/max matches.
     #[test]
     fn path_delay_to_takes_the_highest_priority_then_the_tighter() {
-        let pd = |to_pins: &[&str], to_clock: bool, delay: f32| PathDelay { from_pins: vec!["r1/CLK".into()], from_clock: false, to_pins: to_pins.iter().map(|p| p.to_string()).collect(), to_clock, min_max: MAX, ignore_clk_latency: true, break_path: true, delay, false_path: false, multicycle: None };
+        let pd = |to_pins: &[&str], to_clock: bool, delay: f32| PathDelay { from_pins: vec!["r1/CLK".into()], from_clock: false, to_pins: to_pins.iter().map(|p| p.to_string()).collect(), to_clock, min_max: MAX, ignore_clk_latency: true, break_path: true, delay, false_path: false, multicycle: None, thrus: Vec::new() };
         let sdc = Sdc { clocks: vec![Clock::new("c", 2.0, "clk", true)], input_delays: Vec::new(), output_delays: Vec::new(), path_delays: vec![pd(&[], true, 1.0), pd(&["r3/D"], false, 3.0), pd(&["r3/D"], false, 2.0)] };
         let all = States(0b111);
         assert_eq!(sdc.path_delay_to(all, "r3/D", true, MAX), Some(2));
@@ -726,8 +1037,8 @@ mod tests {
         assert_eq!(sdc.path_delay_to(all, "r2/D", true, MAX), Some(0));
         assert_eq!(sdc.path_delay_to(all, "r2/D", false, MAX), None);
         assert_eq!(sdc.path_delay_to(all, "r3/D", true, crate::liberty::MIN), None);
-        assert_eq!(sdc.exception_from_states("r1/CLK", true, MAX), all);
-        assert_eq!(sdc.exception_from_states("r1/CLK", true, crate::liberty::MIN), States::NONE);
+        assert_eq!(sdc.exception_from_states(&pin_at("r1/CLK"), true, MAX), all);
+        assert_eq!(sdc.exception_from_states(&pin_at("r1/CLK"), true, crate::liberty::MIN), States::NONE);
     }
 
     #[test]

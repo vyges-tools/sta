@@ -62,9 +62,9 @@ Each command lands in exactly one of three groups.
 | `set_clock_groups` | `-asynchronous`, `-logically_exclusive`, `-physically_exclusive` |
 | `set_input_delay`, `set_output_delay` | min/max, rise/fall, `-add_delay` |
 | `set_input_transition`, `set_load`, `set_driving_cell` | |
-| `set_max_delay`, `set_min_delay` | |
-| `set_false_path` | `-from` / `-to` ports and pins, `-setup` / `-hold` |
-| `set_multicycle_path` | `-setup` / `-hold`, `-start` / `-end` |
+| `set_max_delay`, `set_min_delay` | `-from` / `-to` pins or the clock, `-through` |
+| `set_false_path` | `-from` / `-to` ports and pins, `-through` pins, ports, nets and cells, `-setup` / `-hold` |
+| `set_multicycle_path` | `-setup` / `-hold`, `-start` / `-end`, `-through` as for false paths |
 | `set_timing_derate` | design-wide: `-early` / `-late`, cell delay, net delay, cell check, clock and data |
 | `set_case_analysis` | `0`, `1`, `zero`, `one`, `rising`, `falling`, on pins and ports (read with `load::design`) |
 | `set_logic_zero`, `set_logic_one`, `set_logic_dc` | on pins and ports (read with `load::design`) |
@@ -78,13 +78,14 @@ Each command lands in exactly one of three groups.
 - `create_generated_clock`
 - `set_disable_timing`, `set_sense` / `set_clock_sense`, `set_disable_clock_gating_check`
 - `group_path`, `set_path_margin`
-- exceptions given `-through`, from or to a clock with several clocks defined, on an internal pin,
-  or on a design with latches; multicycle paths on a design with gated-clock checks
+- exceptions given `-rise_through` / `-fall_through`, from or to a clock with several clocks
+  defined, on an internal pin, or on a design with latches; multicycle paths on a design with
+  gated-clock checks
 - any other command that could move a slack (the rule is in `load::constraints`: a command loom
   carries in no record of its own is refused unless it is one of the directives above)
 
 These commands are the next to move from refused to applied: generated clocks, disabled timing
-(already modelled in [sta-si](https://github.com/vyges-tools/sta-si)), and `-through`.
+(already modelled in [sta-si](https://github.com/vyges-tools/sta-si)), and latches.
 
 A design with pins tied to a constant or supply nets is read with `load::design` and its
 constraints with `load::design_constraints`, which carry the constants to the search; `load::netlist`

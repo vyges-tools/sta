@@ -10,7 +10,7 @@ line for line.
 |---|---|
 | `rv_plic_lite.v` | Vyges `rv_plic_lite` (Apache-2.0, github.com/vyges/vyges-rv-plic-lite), synthesized by Yosys to `sky130_fd_sc_hd`: 1,699 cells |
 | `sky130_fd_sc_hd__tt_025C_1v80.lib` | the SkyWater `sky130_fd_sc_hd` typical-corner library (Apache-2.0, github.com/google/skywater-pdk), cut to the cells the netlist and the constraints name; nothing else changed |
-| `*.sdc` | constraint variants: `base` (relaxed, all met), `tight` (failing paths), `env` (input transitions, output loads), `drive` (min/max input delays, driving cells, a clock waveform, bus patterns), `max_delay` (a path delay) |
+| `*.sdc` | constraint variants: `base` (relaxed, all met), `tight` (failing paths), `env` (input transitions, output loads), `drive` (min/max input delays, driving cells, a clock waveform, bus patterns), `max_delay` (a path delay), `through` (false and multicycle paths with `-through` pins, ports, nets and cells, one competing with a `-to`-only multicycle), `through_delay` (a path delay with a `-through` pin), and one variant per other applied command |
 | `*.golden` | the reference's `report_worst_slack`, `report_tns` and `get_property slack_max` of every pin, six digits, sorted |
 | `*.hold.golden` | the same for min: `report_worst_slack -min`, `report_tns -min`, `slack_min` |
 
