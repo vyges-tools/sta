@@ -244,6 +244,12 @@ fn change_prob(b: &Bdd, from: Edge, to: Edge, probs: &HashMap<u32, [[f32; 2]; 2]
     prob
 }
 
+/// A pin the simulation holds constant does not switch: density 0, duty its value, origin
+/// constant (upstream OpenSTA cc9027d, before any activity set on it or its clock's).
+pub fn constant_activity(value: Option<bool>) -> Option<Activity> {
+    value.map(|one| Activity::new(0.0, if one { 1.0 } else { 0.0 }, Origin::Constant))
+}
+
 /// A clock gate's gated clock: the clock's density times the enable's duty — the enable is
 /// latched, so only clock edges make gated clock edges (upstream OpenSTA cc9027d; before, the
 /// enable's density weighted by the clock's duty was added) — at the product of the duties.
@@ -310,6 +316,8 @@ pub struct ActivityInputs<'x> {
     /// The period of the fastest clock among the vertex's arrivals (`findClk`), any pin; `None`
     /// without one.
     pub clk_period: &'x [Option<f32>],
+    /// Per vertex, the value the logic simulation holds it at (`Sim::simValue`), if constant.
+    pub constant: &'x [Option<bool>],
     /// The SDC's fastest clock period (0 without clocks) and the time unit.
     pub min_period: f32,
     pub time_unit: f32,
@@ -685,6 +693,9 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
     /// pin's activity if set, else unknown.
     fn find_activity(&self, v: usize) -> Activity {
         let v = self.pin_key[v];
+        if let Some(a) = constant_activity(self.inp.constant[v]) {
+            return a;
+        }
         if self.inp.is_clock[v] {
             if let Some(a) = self.act.pin[v].filter(Activity::is_set) {
                 return a;
@@ -1391,6 +1402,14 @@ mod tests {
         assert_eq!(input_group_duty(Some(&f("!Z & B")), &p), 0.875 * 0.25);
         assert_eq!(input_group_duty(Some(&f("A")), &p), 0.5);
         assert_eq!(input_group_duty(None, &p), 1.0);
+    }
+
+    // A constant pin's activity is its value, with no density.
+    #[test]
+    fn a_constant_pin_does_not_switch() {
+        assert_eq!(constant_activity(Some(true)), Some(Activity { density: 0.0, duty: 1.0, origin: Origin::Constant }));
+        assert_eq!(constant_activity(Some(false)), Some(Activity { density: 0.0, duty: 0.0, origin: Origin::Constant }));
+        assert_eq!(constant_activity(None), None);
     }
 
     // A gated clock changes only on clock edges: the enable's own changes add nothing.
