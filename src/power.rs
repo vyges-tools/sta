@@ -10,12 +10,13 @@
 //! - otherwise the function's diagram ([`crate::bdd`]) is walked for the duty: at a node over
 //!   variable `x` with duty `p`, `duty = duty(else) * (1 - p) + duty(then) * p`: the first product in
 //!   double (`1 - p` is double), the second in FLOAT (float times float), their sum in double,
-//!   narrowed; then `1 - duty` when the edge is complemented. A node over an
-//!   internal port is that port's duty, with no complement; a node whose port has no pin on the
+//!   narrowed; then `1 - duty` when the edge is complemented. A node over an internal port
+//!   takes `p` from the register output's activity; a node whose port has no pin on the
 //!   instance is 0, with no complement;
-//! - the density is the sum, over the function's ports IN NAME ORDER that have a pin, of the
-//!   pin's density times the duty of the function's Boolean difference on the port, each product
-//!   and the running sum in float.
+//! - the density is the change density ([`eval_bdd_change_density`]); with a clock pin or a
+//!   missing pin among the ports, the sum, over the function's ports IN NAME ORDER that have a
+//!   pin, of the pin's density times the duty of the function's Boolean difference on the port,
+//!   each product and the running sum in float.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -122,20 +123,22 @@ pub fn eval_bdd_duty(b: &Bdd, e: Edge, pins: &impl InstPins) -> f32 {
     let duty0 = eval_bdd_duty(b, b.else_child(e), pins);
     let duty1 = eval_bdd_duty(b, b.then_child(e), pins);
     let port = &b.vars()[b.var(e) as usize];
-    if pins.is_internal(port) {
-        return pins.seq_activity(port).duty;
-    }
-    match pins.pin_activity(port) {
-        Some(a) => {
-            let p = f64::from(a.duty);
-            let duty = (f64::from(duty0) * (1.0 - p) + f64::from(duty1 * a.duty)) as f32;
-            if bdd::is_complement(e) {
-                (1.0 - f64::from(duty)) as f32
-            } else {
-                duty
-            }
+    // an internal port's node is expanded like any other (upstream OpenSTA cc9027d: it was its
+    // duty alone, cofactors and complement ignored)
+    let var_duty = if pins.is_internal(port) {
+        pins.seq_activity(port).duty
+    } else {
+        match pins.pin_activity(port) {
+            Some(a) => a.duty,
+            None => return 0.0,
         }
-        None => 0.0,
+    };
+    let p = f64::from(var_duty);
+    let duty = (f64::from(duty0) * (1.0 - p) + f64::from(duty1 * var_duty)) as f32;
+    if bdd::is_complement(e) {
+        (1.0 - f64::from(duty)) as f32
+    } else {
+        duty
     }
 }
 
@@ -1363,8 +1366,11 @@ mod tests {
         let iq = Activity::new(3e6, 0.4, Origin::Propagated);
         p.internal.insert("IQ", iq);
         assert_eq!(eval_activity(&f("IQ"), &p), iq);
-        // In a diagram, its node is its duty with NO complement: !IQ still reads 0.4.
-        assert_eq!(eval_activity(&f("!IQ"), &p).duty, 0.4);
+        // In a diagram, its node is expanded like a pin's (upstream OpenSTA cc9027d): !IQ is
+        // 1 - 0.4, and IQ & A weighs A's duty by it.
+        assert_eq!(eval_activity(&f("!IQ"), &p).duty, (1.0 - f64::from(0.4f32)) as f32);
+        p.act.insert("A", Activity::new(1e7, 0.5, Origin::Input));
+        assert_eq!(eval_activity(&f("IQ & A"), &p).duty, 0.2);
     }
 
     // A density under 1e-10 is clipped to 0 when the activity is made.
