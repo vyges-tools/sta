@@ -244,6 +244,17 @@ fn change_prob(b: &Bdd, from: Edge, to: Edge, probs: &HashMap<u32, [[f32; 2]; 2]
     prob
 }
 
+/// `maxPropagatedDensity`: a propagated activity on a driver pin is at most one transition per
+/// launching clock period, two on a clock pin (float); unbounded without clocks (upstream OpenSTA
+/// cc9027d: the slew bound still allows hundreds per period). Loads copy their driver's.
+pub fn max_propagated_density(launch_period: f32, is_clock: bool) -> f32 {
+    if launch_period <= 0.0 {
+        return f32::INFINITY;
+    }
+    let transitions_per_period: f32 = if is_clock { 2.0 } else { 1.0 };
+    transitions_per_period / launch_period
+}
+
 /// A clock's activity (`findActivity` on a clock pin): two transitions per period, at the duty
 /// of its waveform's first edges, `(fall - rise) / period`, in float.
 pub fn clock_activity(period: f32, rise: f32, fall: f32) -> Activity {
@@ -615,12 +626,19 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
     /// `setActivityCheck`: clamp the density to one transition per (least) slew, set it, and
     /// say whether it moved by more than the tolerance or changed origin.
     fn set_activity_check(&mut self, v: usize, mut a: Activity) -> bool {
+        let is_driver = self.is_driver(v);
         // the pin's: `getMinRfSlew` reads its first vertex
         let v = self.pin_key[v];
         let slew = self.inp.min_rf_slew[v];
         let max_density = if slew > 0.0 { (1.0 / f64::from(slew)) as f32 } else { f32::INFINITY };
         if a.density > max_density {
             a.density = max_density;
+        }
+        if a.origin == Origin::Propagated && is_driver {
+            let max_prop_density = max_propagated_density(self.launch_clk_period(v), self.inp.is_clock[v]);
+            if a.density > max_prop_density {
+                a.density = max_prop_density;
+            }
         }
         let prev = self.act.pin[v].unwrap_or(Activity::UNKNOWN);
         let density_delta = percent_change(a.density, prev.density);
@@ -1368,6 +1386,16 @@ mod tests {
         assert_eq!(input_group_duty(Some(&f("!Z & B")), &p), 0.875 * 0.25);
         assert_eq!(input_group_duty(Some(&f("A")), &p), 0.5);
         assert_eq!(input_group_duty(None, &p), 1.0);
+    }
+
+    // A propagated driver's density is at most one transition per launching period, two on a
+    // clock pin; no clock, no bound.
+    #[test]
+    fn propagated_density_is_bounded_by_the_launching_period() {
+        assert_eq!(max_propagated_density(1e-8, false), 1e8);
+        assert_eq!(max_propagated_density(1e-8, true), 2e8);
+        assert_eq!(max_propagated_density(4.0, false), 0.25);
+        assert_eq!(max_propagated_density(0.0, false), f32::INFINITY);
     }
 
     // The sensitizing duty of A in A&B is B's duty.
