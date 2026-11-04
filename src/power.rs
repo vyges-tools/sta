@@ -97,15 +97,20 @@ pub fn eval_activity(expr: &FuncExpr, pins: &impl InstPins) -> Activity {
 }
 
 /// `evalDiffDuty`: the duty of the function's Boolean difference on `port` — the probability the
-/// function is sensitive to it.
-pub fn eval_diff_duty(expr: &FuncExpr, port: &str, pins: &impl InstPins) -> f32 {
+/// function is sensitive to it — and, with a `when`, while the `when` holds (upstream OpenSTA
+/// cc9027d: the difference AND the `when`, its new ports numbered after the function's).
+pub fn eval_diff_duty(expr: &FuncExpr, port: &str, when: Option<&FuncExpr>, pins: &impl InstPins) -> f32 {
     let (mut b, f) = Bdd::of(expr);
     let Some(v) = b.var_index(port) else {
         // The port is not in the function: the reference asks the diagram for a variable it
         // never made. Not reached by a function that names the port.
         return 0.0;
     };
-    let diff = b.boolean_diff(f, v);
+    let mut diff = b.boolean_diff(f, v);
+    if let Some(when) = when {
+        let w = b.add(when);
+        diff = b.and(diff, w);
+    }
     eval_bdd_duty(&b, diff, pins)
 }
 
@@ -931,7 +936,8 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
             return 0.0;
         }
         if let Some(f) = func.filter(|f| has_port(f, from)) {
-            return eval_diff_duty(f, from, &InstView { p: self, inst: i });
+            let when = pwr.when.as_deref().and_then(|w| FuncExpr::parse(w).ok());
+            return eval_diff_duty(f, from, when.as_ref(), &InstView { p: self, inst: i });
         }
         match pwr.when.as_deref().and_then(|w| FuncExpr::parse(w).ok()) {
             Some(when) => self.eval_activity_on(&when, i).duty,
@@ -1368,6 +1374,19 @@ mod tests {
     #[test]
     fn the_diff_duty_is_the_sensitizing_probability() {
         let p = pins(&[("A", 1e7, 0.5), ("B", 2e7, 0.25)]);
-        assert_eq!(eval_diff_duty(&f("A & B"), "A", &p), 0.25);
+        assert_eq!(eval_diff_duty(&f("A & B"), "A", None, &p), 0.25);
+    }
+
+    // With a `when`, the sensitizing duty while it holds (upstream OpenSTA cc9027d): an XOR is
+    // always sensitive to A, so A's groups `when : B` and `when : !B` split it by B's duty.
+    #[test]
+    fn the_diff_duty_is_weighed_by_the_when() {
+        let p = pins(&[("A", 1e7, 0.5), ("B", 2e7, 0.25)]);
+        assert_eq!(eval_diff_duty(&f("A ^ B"), "A", None, &p), 1.0);
+        assert_eq!(eval_diff_duty(&f("A ^ B"), "A", Some(&f("B")), &p), 0.25);
+        assert_eq!(eval_diff_duty(&f("A ^ B"), "A", Some(&f("!B")), &p), 0.75);
+        // a `when` over a port the function does not name
+        let p = pins(&[("A", 1e7, 0.5), ("B", 2e7, 0.25), ("C", 1e7, 0.5)]);
+        assert_eq!(eval_diff_duty(&f("A & B"), "A", Some(&f("C")), &p), 0.125);
     }
 }

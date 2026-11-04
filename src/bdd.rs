@@ -67,8 +67,14 @@ impl Bdd {
     /// The diagram of `expr`, its variables numbered as they first appear.
     pub fn of(expr: &FuncExpr) -> (Bdd, Edge) {
         let mut b = Bdd::default();
-        let f = b.func(expr).unwrap_or(ONE);
+        let f = b.add(expr);
         (b, f)
+    }
+
+    /// The diagram of `expr` in this manager: its ports that are variables already keep their
+    /// numbers, new ones are numbered after them as they first appear.
+    pub fn add(&mut self, expr: &FuncExpr) -> Edge {
+        self.func(expr).unwrap_or(ONE)
     }
 
     fn func(&mut self, expr: &FuncExpr) -> Option<Edge> {
