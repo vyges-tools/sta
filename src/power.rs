@@ -75,6 +75,12 @@ pub trait InstPins {
     /// The register output's activity as the register pass set it (`findSeqActivity`):
     /// [`Activity::UNKNOWN`] when none.
     fn seq_activity(&self, port: &str) -> Activity;
+    /// What the change density reads of the instance's pin on `port`: `None` when the instance
+    /// has no pin there; else whether it is a clock pin (`ClkNetwork::isClock`) and its
+    /// `launchClkPeriod`.
+    fn pin_launch(&self, port: &str) -> Option<(bool, f32)>;
+    /// `clockMinPeriod` (0 without clocks), then the time unit.
+    fn periods(&self) -> (f32, f32);
 }
 
 /// `evalActivity`: the activity a function gives at one instance.
@@ -128,8 +134,12 @@ pub fn eval_bdd_duty(b: &Bdd, e: Edge, pins: &impl InstPins) -> f32 {
     }
 }
 
-/// `evalBddActivity`: the function's transition density, summed over its ports in name order.
+/// `evalBddActivity`: the function's change density ([`eval_bdd_change_density`]); when that does
+/// not apply, its transition density summed over its ports in name order.
 pub fn eval_bdd_activity(b: &mut Bdd, f: Edge, pins: &impl InstPins) -> f32 {
+    if let Some(density) = eval_bdd_change_density(b, f, pins) {
+        return density;
+    }
     let mut ports: Vec<(String, u32)> = b.vars().iter().enumerate().map(|(i, p)| (p.clone(), i as u32)).collect();
     ports.sort();
     let mut density = 0.0f32;
@@ -140,6 +150,93 @@ pub fn eval_bdd_activity(b: &mut Bdd, f: Edge, pins: &impl InstPins) -> f32 {
         density += a.density * diff_duty;
     }
     density
+}
+
+/// `evalBddChangeDensity`: the probability that the function's value differs between two
+/// consecutive samples, per sample period, each input an independent two-state process. Summing
+/// each input's density weighted by its sensitizing probability counts simultaneous input
+/// changes as separate output changes; this does not.
+///
+/// - `None` (the sum applies) when a non-internal port has no pin on the instance or its pin is
+///   a clock pin;
+/// - the sample period is the least positive `launchClkPeriod` of the non-internal ports' pins,
+///   else the fastest clock's period, else the time unit;
+/// - each variable's transition probabilities, in float: duty `p` clamped to [0, 1], half the
+///   change `h = min(density * period, 2 * min(p, 1 - p)) / 2`, so `P(0->0) = 1 - p - h`,
+///   `P(0->1) = P(1->0) = h`, `P(1->1) = p - h`;
+/// - the change probability of a (previous, current) diagram pair: two constants are 0 when
+///   equal, else 1; otherwise on the topmost variable of the two, the sum over previous then
+///   current value (0 then 1) of the probability times the pair's cofactors' change probability,
+///   in float; a variable without probabilities is 0;
+/// - the density is the function against itself, over the period, in float.
+pub fn eval_bdd_change_density(b: &Bdd, f: Edge, pins: &impl InstPins) -> Option<f32> {
+    let mut period = f32::INFINITY;
+    let mut var_activities = Vec::new();
+    for (v, port) in b.vars().iter().enumerate() {
+        let activity = if pins.is_internal(port) {
+            pins.seq_activity(port)
+        } else {
+            let (is_clock, pin_period) = pins.pin_launch(port)?;
+            if is_clock {
+                return None;
+            }
+            if pin_period > 0.0 && pin_period < period {
+                period = pin_period;
+            }
+            pins.pin_activity(port)?
+        };
+        var_activities.push((v as u32, activity));
+    }
+    let (min_period, time_unit) = pins.periods();
+    if period == f32::INFINITY {
+        period = min_period;
+    }
+    if period == 0.0 {
+        period = time_unit;
+    }
+    let mut probs: HashMap<u32, [[f32; 2]; 2]> = HashMap::new();
+    for (v, a) in var_activities {
+        let duty = a.duty.clamp(0.0, 1.0);
+        let (x, y) = (a.density * period, 2.0 * duty.min(1.0 - duty));
+        let half = (if y < x { y } else { x }) / 2.0;
+        probs.insert(v, [[1.0 - duty - half, half], [half, duty - half]]);
+    }
+    let mut cache = HashMap::new();
+    Some(change_prob(b, f, f, &probs, &mut cache) / period)
+}
+
+/// The cofactor of `e` on `v` when `v` is its top variable (the edge's complement carried to the
+/// child), else `e`.
+fn top_cofactor(b: &Bdd, e: Edge, v: u32, value: bool) -> Edge {
+    if b.is_constant(e) || b.var(e) != v {
+        return e;
+    }
+    let child = if value { b.then_child(e) } else { b.else_child(e) };
+    if bdd::is_complement(e) {
+        bdd::not(child)
+    } else {
+        child
+    }
+}
+
+fn change_prob(b: &Bdd, from: Edge, to: Edge, probs: &HashMap<u32, [[f32; 2]; 2]>, cache: &mut HashMap<(Edge, Edge), f32>) -> f32 {
+    if b.is_constant(from) && b.is_constant(to) {
+        return if from == to { 0.0 } else { 1.0 };
+    }
+    if let Some(&p) = cache.get(&(from, to)) {
+        return p;
+    }
+    // the variable is its level; the constant's is the largest
+    let v = if b.var(from) <= b.var(to) { b.var(from) } else { b.var(to) };
+    let Some(pr) = probs.get(&v) else { return 0.0 };
+    let mut prob = 0.0f32;
+    for prev in [false, true] {
+        for curr in [false, true] {
+            prob += pr[usize::from(prev)][usize::from(curr)] * change_prob(b, top_cofactor(b, from, v, prev), top_cofactor(b, to, v, curr), probs, cache);
+        }
+    }
+    cache.insert((from, to), prob);
+    prob
 }
 
 /// A clock's activity (`findActivity` on a clock pin): two transitions per period, at the duty
@@ -187,6 +284,9 @@ pub struct ActivityInputs<'x> {
     pub clock: &'x [Option<Activity>],
     /// `getMinRfSlew`: over the analysis points, the least of (rise + fall) / 2.
     pub min_rf_slew: &'x [f32],
+    /// The period of the fastest clock among the vertex's arrivals (`findClk`), any pin; `None`
+    /// without one.
+    pub clk_period: &'x [Option<f32>],
     /// The SDC's fastest clock period (0 without clocks) and the time unit.
     pub min_period: f32,
     pub time_unit: f32,
@@ -540,6 +640,17 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
         ));
         self.act.pin[v] = Some(a);
         changed
+    }
+
+    /// `launchClkPeriod`: the period of the fastest clock launching paths through the pin (its
+    /// driver vertex's arrivals), else the fastest clock's; 0 without clocks.
+    fn launch_clk_period(&self, v: usize) -> f32 {
+        let period = self.inp.clk_period[self.pin_drvr[v]].unwrap_or(0.0);
+        if period <= 0.0 {
+            self.inp.min_period
+        } else {
+            period
+        }
     }
 
     /// `findActivity`: a clock pin's own activity if one was set, else its clock's; any other
@@ -1043,6 +1154,12 @@ impl InstPins for InstView<'_, '_, '_, '_> {
     fn seq_activity(&self, port: &str) -> Activity {
         self.p.act.seq.get(&(self.inst, port.to_string())).copied().unwrap_or(Activity::UNKNOWN)
     }
+    fn pin_launch(&self, port: &str) -> Option<(bool, f32)> {
+        self.pin(port).map(|v| (self.p.inp.is_clock[self.p.pin_key[v]], self.p.launch_clk_period(v)))
+    }
+    fn periods(&self) -> (f32, f32) {
+        (self.p.inp.min_period, self.p.inp.time_unit)
+    }
 }
 
 #[cfg(test)]
@@ -1062,6 +1179,11 @@ mod tests {
     struct Pins {
         act: HashMap<&'static str, Activity>,
         internal: HashMap<&'static str, Activity>,
+        /// Every pin a clock pin (the change density does not apply: the sum), or not.
+        clock: bool,
+        /// Per port, its pin's `launchClkPeriod` (default 1).
+        launch: HashMap<&'static str, f32>,
+        periods: (f32, f32),
     }
 
     impl InstPins for Pins {
@@ -1074,10 +1196,79 @@ mod tests {
         fn seq_activity(&self, port: &str) -> Activity {
             self.internal.get(port).copied().unwrap_or(Activity::UNKNOWN)
         }
+        fn pin_launch(&self, port: &str) -> Option<(bool, f32)> {
+            self.act.get(port).map(|_| (self.clock, self.launch.get(port).copied().unwrap_or(1.0)))
+        }
+        fn periods(&self) -> (f32, f32) {
+            self.periods
+        }
     }
 
+    /// Pins that are clock pins: a function's density is the sum over its ports.
     fn pins(act: &[(&'static str, f32, f32)]) -> Pins {
-        Pins { act: act.iter().map(|&(p, d, u)| (p, Activity::new(d, u, Origin::Input))).collect(), internal: HashMap::new() }
+        Pins { clock: true, ..sampled(act) }
+    }
+
+    /// Pins that are not clock pins, each launched at period 1: the change density.
+    fn sampled(act: &[(&'static str, f32, f32)]) -> Pins {
+        Pins {
+            act: act.iter().map(|&(p, d, u)| (p, Activity::new(d, u, Origin::Input))).collect(),
+            internal: HashMap::new(),
+            clock: false,
+            launch: HashMap::new(),
+            periods: (1.0, 1e-9),
+        }
+    }
+
+    // The change density (upstream OpenSTA cc9027d, `evalBddChangeDensity`): the probability the
+    // value differs between consecutive samples. A & B with each input at duty 1/2 changing half
+    // the time (density 0.5 at period 1: P(0->1) = P(1->0) = 1/4): the output is high a quarter
+    // of the time in each sample, independently, so it differs with 2 * 1/4 * 3/4 = 0.375 —
+    // where the sum of densities times sensitizing duties gives 0.5.
+    #[test]
+    fn the_change_density_is_the_probability_consecutive_samples_differ() {
+        let p = sampled(&[("A", 0.5, 0.5), ("B", 0.5, 0.5)]);
+        assert_eq!(eval_activity(&f("A & B"), &p).density, 0.375);
+        assert_eq!(eval_activity(&f("A ^ B"), &p).density, 0.5);
+        assert_eq!(eval_activity(&f("A & B"), &pins(&[("A", 0.5, 0.5), ("B", 0.5, 0.5)])).density, 0.5);
+    }
+
+    // The sample period is the least positive launching period of the inputs' pins; else the
+    // fastest clock's; else the time unit. The density is per that period.
+    #[test]
+    fn the_change_density_samples_at_the_fastest_launching_period() {
+        let mut p = sampled(&[("A", 0.5, 0.5), ("B", 0.5, 0.5)]);
+        p.launch.insert("A", 2.0);
+        p.launch.insert("B", 1.0);
+        assert_eq!(eval_activity(&f("A & B"), &p).density, 0.375);
+        // no launching period: the fastest clock's (here 2: h = min(1, 1) / 2 = 1/2, so each
+        // input alternates; A & B then differs with P(11 then not) + P(not then 11) = 1/4 + 1/4)
+        p.launch.insert("A", 0.0);
+        p.launch.insert("B", 0.0);
+        p.periods = (2.0, 1e-9);
+        assert_eq!(eval_activity(&f("A & B"), &p).density, 0.5 / 2.0);
+        // no clock at all: the time unit
+        p.periods = (0.0, 0.5);
+        assert_eq!(eval_activity(&f("A"), &p).density, (0.5f32 * 0.5).min(1.0) / 0.5);
+    }
+
+    // A variable changes at most 2 * min(p, 1 - p) per sample: a fast input at duty 1/4 makes a
+    // buffer change half the samples.
+    #[test]
+    fn the_change_per_sample_is_bounded_by_the_duty() {
+        let p = sampled(&[("A", 1e9, 0.25)]);
+        assert_eq!(eval_activity(&f("A"), &p).density, 0.5);
+        assert_eq!(eval_activity(&f("!A"), &p).density, 0.5);
+    }
+
+    // A clock pin among the inputs, or a port with no pin, leaves the sum.
+    #[test]
+    fn a_clock_input_or_a_missing_pin_keeps_the_sum() {
+        let mut p = sampled(&[("A", 0.5, 0.5), ("B", 0.5, 0.5)]);
+        p.clock = true;
+        assert_eq!(eval_activity(&f("A & B"), &p).density, 0.5);
+        let p = sampled(&[("A", 0.5, 0.5)]);
+        assert_eq!(eval_activity(&f("A & C"), &p).density, 0.0);
     }
 
     fn f(s: &str) -> FuncExpr {
