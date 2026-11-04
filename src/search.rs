@@ -407,7 +407,7 @@ fn free_ports(e: &crate::func_expr::FuncExpr, fixed: &dyn Fn(&str) -> Option<boo
 
 /// `Sim::evalExpr`: the function's value under the constants — 0 or 1 when every assignment of the
 /// free ports agrees (the BDD is a constant), else unknown.
-fn eval_exact(e: &crate::func_expr::FuncExpr, fixed: &dyn Fn(&str) -> Option<bool>) -> Result<Option<bool>, String> {
+pub(crate) fn eval_exact(e: &crate::func_expr::FuncExpr, fixed: &dyn Fn(&str) -> Option<bool>) -> Result<Option<bool>, String> {
     let free = free_ports(e, fixed, None)?;
     let mut seen = [false; 2];
     for bits in 0..1u32 << free.len() {
@@ -704,8 +704,18 @@ impl<'g, 'a> Search<'g, 'a> {
         !self.is_check(e) && !self.sim.disabled_cond[e] && self.sim.sense[e] != SimSense::None && self.role(e) != Some(Role::RegSetClr)
     }
 
-    /// `searchThruTimingSense`: the arc's transitions against the edge's sense under constants.
+    /// `searchThru(from, from_rf, edge, to, to_rf)`: `searchThruTimingSense`, then
+    /// `searchThruSimEdge` at both ends — a pin a rising / falling case value holds is searched
+    /// from and to in that transition only.
     fn search_thru_sense(&self, e: usize, from_rf: usize, to_rf: usize) -> bool {
+        let held = &self.graph.sdc.sim_transitions;
+        let sim_edge = |v: usize, rf: usize| held.is_empty() || held.get(&self.graph.vertices[v].name).is_none_or(|&only| only == rf);
+        let ed = &self.graph.edges[e];
+        self.search_thru_timing_sense(e, from_rf, to_rf) && sim_edge(ed.from, from_rf) && sim_edge(ed.to, to_rf)
+    }
+
+    /// `searchThruTimingSense`: the arc's transitions against the edge's sense under constants.
+    fn search_thru_timing_sense(&self, e: usize, from_rf: usize, to_rf: usize) -> bool {
         match self.sim.sense[e] {
             SimSense::Positive => from_rf == to_rf,
             SimSense::Negative => from_rf != to_rf,

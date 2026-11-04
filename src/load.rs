@@ -26,10 +26,31 @@ use vyges_loom::netlist::CompactDesign;
 use crate::liberty::{Direction, Library};
 use crate::netlist::{inst, Conn, Net, Netlist, PortDir};
 
+/// A design as the timer reads it: the netlist, and the nets the reader holds constant
+/// ([`crate::sim::constant_nets`]: `supply0` / `supply1` nets, and the `zero_` / `one_` nets every
+/// `1'b0` / `1'b1` connection is bound to). The constants reach the search through
+/// [`design_constraints`].
+#[derive(Debug, Clone)]
+pub struct Design {
+    pub netlist: Netlist,
+    pub constant_nets: Vec<(String, bool)>,
+}
+
 /// The top module of `design` as the timer's netlist, its cells linked in `libs` (the first
 /// library that has a cell wins, as the reference links). Err names the first construct the
-/// timer cannot represent.
+/// timer cannot represent — and a constant net, which only [`design`] carries to the search.
 pub fn netlist(design: &CompactDesign, libs: &[Library]) -> Result<Netlist, String> {
+    let d = self::design(design, libs)?;
+    match d.constant_nets.first() {
+        Some((n, _)) => Err(format!("net {n} is held constant (a pin tied to a constant, or a supply net): read the design with load::design so the simulation takes it")),
+        None => Ok(d.netlist),
+    }
+}
+
+/// [`netlist`] with the constant nets kept: each pin tied to `1'b0` / `1'b1` is a pin of the net
+/// [`crate::sim::ZERO_NET`] / [`crate::sim::ONE_NET`], as the reader binds it
+/// (`VerilogConstantNetNameIterator`, `ensureNetBinding`).
+pub fn design(design: &CompactDesign, libs: &[Library]) -> Result<Design, String> {
     let m = design.top();
     let name = design.str(m.name);
     // What loom read and the timer has no place for.
@@ -50,9 +71,6 @@ pub fn netlist(design: &CompactDesign, libs: &[Library]) -> Result<Netlist, Stri
     }
     if let Some(p) = m.undirected.first() {
         return Err(format!("module {name}: port {} has no direction (reference warning 166); not modelled", design.str(*p)));
-    }
-    if let Some((n, _)) = m.constants.first() {
-        return Err(format!("module {name}: supply net {} (a constant net) is not modelled", design.str(*n)));
     }
     let find_cell = |cell: &str| libs.iter().find_map(|l| l.cells.get(cell));
     // ports, header order
@@ -81,9 +99,6 @@ pub fn netlist(design: &CompactDesign, libs: &[Library]) -> Result<Netlist, Stri
         if find_cell(cname).is_none() {
             return Err(format!("instance {iname}: cell {cname} is in no library read"));
         }
-        if let Some((p, _)) = m.ties(x).first() {
-            return Err(format!("instance {iname}: pin {} tied to a constant is not modelled", design.str(*p)));
-        }
         insts.push(inst(iname, cname));
     }
     // each net's pins in connection order, nets in first-connection order
@@ -100,6 +115,21 @@ pub fn netlist(design: &CompactDesign, libs: &[Library]) -> Result<Netlist, Stri
             if cell.port(pin).is_none() {
                 return Err(format!("instance {iname}: cell {cname} has no port {pin}"));
             }
+            let k = *net_at.entry(net).or_insert_with(|| {
+                nets.push((net.to_string(), Vec::new()));
+                nets.len() - 1
+            });
+            nets[k].1.push(Conn::Inst(index[w], pin.to_string()));
+        }
+        // a constant on a pin: the pin is on the reader's constant net of that value (loom keeps
+        // ties apart from connections, so they come after the instance's nets; the order of a net
+        // with no driver times nothing)
+        for (p, v) in m.ties(x) {
+            let pin = design.str(*p);
+            if cell.port(pin).is_none() {
+                return Err(format!("instance {iname}: cell {cname} has no port {pin}"));
+            }
+            let net = if *v { crate::sim::ONE_NET } else { crate::sim::ZERO_NET };
             let k = *net_at.entry(net).or_insert_with(|| {
                 nets.push((net.to_string(), Vec::new()));
                 nets.len() - 1
@@ -155,7 +185,10 @@ pub fn netlist(design: &CompactDesign, libs: &[Library]) -> Result<Netlist, Stri
     let mut order: Vec<usize> = (0..nets.len()).collect();
     order.sort_by_key(|&k| rank[k]); // stable: undriven nets keep their first-connection order
     let nets = order.into_iter().map(|k| std::sync::Arc::new(Net { name: nets[k].0.clone(), pins: std::mem::take(&mut nets[k].1) })).collect();
-    Ok(Netlist { insts, ports, nets })
+    let netlist = Netlist { insts, ports, nets };
+    let supply: Vec<(String, bool)> = m.constants.iter().map(|(n, v)| (design.str(*n).to_string(), *v)).collect();
+    let constant_nets = crate::sim::constant_nets(&netlist, &supply);
+    Ok(Design { netlist, constant_nets })
 }
 
 // ---- the constraints ---------------------------------------------------------------------------
@@ -256,6 +289,48 @@ fn expanded_ports(s: &vyges_loom::sdc::Sdc, nl: &Netlist, notes: &mut Vec<String
 /// the first command that would move a slack and that the timer does not model. Design-rule
 /// limits, and commands that move no slack, are returned as notes.
 pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> Result<(crate::sdc::Sdc, crate::graph::SdcEnv, Vec<String>), String> {
+    constraints_with(s, nl, libs, None)
+}
+
+/// [`constraints`] on a [`Design`]: the logic simulation's constants too — the design's constant
+/// nets, `set_logic_zero` / `set_logic_one` / `set_logic_dc` and `set_case_analysis` — in
+/// [`crate::graph::SdcEnv::constants`], where delay calculation and the search read them. The
+/// simulation's warnings (a propagated value against a constraint's) are notes.
+pub fn design_constraints(s: &vyges_loom::sdc::Sdc, d: &Design, libs: &[Library]) -> Result<(crate::sdc::Sdc, crate::graph::SdcEnv, Vec<String>), String> {
+    constraints_with(s, &d.netlist, libs, Some(&d.constant_nets))
+}
+
+/// Each pin or port a `set_case_analysis` (or `set_logic_*`) command names, with the value it holds
+/// (`None`: a transition or don't-care), a later command replacing an earlier on the same pin
+/// (`Sdc::setCaseAnalysis` / `setLogicValue` are maps). The values the reference takes: `0`,
+/// `zero`, `1`, `one`, `rise`, `rising`, `fall`, `falling`; `set_logic_dc` is `X`.
+fn logic_values(cmds: &[vyges_loom::sdc::LogicValueCmd], nl: &Netlist) -> Result<HashMap<String, Option<crate::sim::Logic>>, String> {
+    use crate::sim::Logic;
+    let mut out = HashMap::new();
+    for c in cmds {
+        let value = match c.value.as_str() {
+            "0" | "zero" => Some(Logic::Zero),
+            "1" | "one" => Some(Logic::One),
+            "rise" | "rising" => Some(Logic::Rise),
+            "fall" | "falling" => Some(Logic::Fall),
+            "X" => None,
+            v => return Err(format!("{}: value {v} is not one the reference takes", c.cmd)),
+        };
+        for o in &c.objects {
+            if is_pattern(o) {
+                return Err(format!("{} {o}: a pattern is not expanded by this timer", c.cmd));
+            }
+            let found = nl.ports.iter().any(|(p, _)| p == o) || o.rsplit_once('/').is_some_and(|(i, _)| nl.insts.iter().any(|x| x.0 == i));
+            if !found {
+                return Err(format!("{} {o}: no such pin or port", c.cmd));
+            }
+            out.insert(o.clone(), value);
+        }
+    }
+    Ok(out)
+}
+
+fn constraints_with(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library], constant_nets: Option<&[(String, bool)]>) -> Result<(crate::sdc::Sdc, crate::graph::SdcEnv, Vec<String>), String> {
     // everything loom read and carries in no record (`Sdc::not_applied`, the rejected commands
     // and unevaluated queries among them): refused if it can move a slack, else a note
     let mut notes = Vec::new();
@@ -271,9 +346,10 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
     if let Some(c) = s.clocks.iter().find(|c| c.generated.is_some()) {
         return Err(format!("create_generated_clock {}: not modelled by this timer", c.name));
     }
+    let simulated = constant_nets.is_some();
     let refused: [(&str, bool); 7] = [
-        ("set_case_analysis", !s.case_values.is_empty()),
-        ("set_logic_zero / set_logic_one / set_logic_dc", !s.logic_values.is_empty()),
+        ("set_case_analysis", !simulated && !s.case_values.is_empty()),
+        ("set_logic_zero / set_logic_one / set_logic_dc", !simulated && !s.logic_values.is_empty()),
         ("set_disable_timing", !s.disabled_timing.is_empty()),
         ("set_sense / set_clock_sense", !s.senses.is_empty()),
         ("set_disable_clock_gating_check", !s.disabled_gating_checks.is_empty()),
@@ -318,6 +394,13 @@ pub fn constraints(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library]) -> 
     sdc.path_delays.extend(falses);
     let mut env = sdc_env(&s, libs, nl)?;
     env.derates = derates;
+    if let Some(constant_nets) = constant_nets {
+        let (logic, case) = (logic_values(&s.logic_values, nl)?, logic_values(&s.case_values, nl)?);
+        let v = crate::sim::simulate(libs, nl, constant_nets, &logic, &case)?;
+        env.constants = v.constants;
+        env.sim_transitions = v.transitions;
+        notes.extend(v.warnings.into_iter().map(|w| format!("sim: {w}")));
+    }
     Ok((sdc, env, notes))
 }
 
@@ -708,12 +791,18 @@ pub fn time_design(libs: &[Library], nl: &Netlist, sdc: &crate::sdc::Sdc, env: c
 /// [`time_design`] for min (`MIN`: hold, `report_worst_slack -min`, `report_tns -min`,
 /// `slack_min`) or max (`MAX`).
 pub fn time_design_for(libs: &[Library], nl: &Netlist, sdc: &crate::sdc::Sdc, env: crate::graph::SdcEnv, mm: usize) -> Result<Timing, String> {
+    time_design_with(libs, nl, sdc, env, mm, &HashMap::new())
+}
+
+/// [`time_design_for`] with the nets' RC networks as `read_spef` reads them ([`crate::spef::read`]),
+/// keyed by net name; a net with none keeps its wire ideal.
+pub fn time_design_with(libs: &[Library], nl: &Netlist, sdc: &crate::sdc::Sdc, env: crate::graph::SdcEnv, mm: usize, parasitics: &HashMap<String, crate::graph::NetParasitics>) -> Result<Timing, String> {
     use crate::search::Search;
     let mut g = crate::graph::Graph::build(libs, nl)?;
     g.sdc = env;
     g.ideal_clock = crate::search::ideal_clock_pins(&g, sdc);
     g.ideal_clock_slew = crate::search::ideal_clock_slews(&g, sdc);
-    g.find_delays(&HashMap::new(), None)?;
+    g.find_delays(parasitics, None)?;
     let mut s = Search::in_graph_order(&g, sdc);
     s.constraints_modelled()?;
     s.find_arrivals()?;

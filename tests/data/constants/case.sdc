@@ -1,0 +1,8 @@
+create_clock -name clk_i -period 2.5 [get_ports {clk_i}]
+set_input_delay 0.4 -clock clk_i [all_inputs]
+set_output_delay 0.6 -clock clk_i [all_outputs]
+set_case_analysis 1 [get_ports {rst_ni}]
+set_case_analysis 0 [get_ports {intr_src_i[0]}]
+set_case_analysis rising [get_ports {intr_src_i[1]}]
+set_logic_one [get_pins {_2746_/S}]
+set_logic_zero [get_ports {intr_src_i[2]}]

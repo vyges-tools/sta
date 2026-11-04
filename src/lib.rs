@@ -14,6 +14,8 @@
 //! - [`dcalc`]: gate and wire delay (DMP effective capacitance, Elmore).
 //! - [`netlist`], [`graph`]: the timing graph and delay calculation over it.
 //! - [`parasitics`]: a net's RC network reduced to a pi model and per-load Elmore delays.
+//! - [`spef`]: a detailed SPEF read into those networks.
+//! - [`sim`]: the logic constants (tied pins, supply nets, case analysis) and their propagation.
 //! - [`sdc`], [`search`]: the clock and port delays; arrivals, requireds and slacks.
 //! - [`power`]: switching activity and instance power.
 //! - `load` (feature `loom`): a design loom read, laid out as the reference network lays it out.
@@ -34,4 +36,6 @@ pub mod path_enum;
 pub mod power;
 pub mod sdc;
 pub mod search;
+pub mod sim;
+pub mod spef;
 pub mod table;

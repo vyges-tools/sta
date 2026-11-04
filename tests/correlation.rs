@@ -35,6 +35,75 @@ fn ours(libs: &[Library], variant: &str, mm: usize) -> Vec<String> {
     lines
 }
 
+/// Our report on the constant-tied variant (`tests/data/constants`, `tie-variant.py` of the same
+/// netlist): pins tied to `1'b0` / `1'b1`, supply nets, tie cells, `set_case_analysis` and
+/// `set_logic_*`, all taken by the logic simulation.
+fn ours_constants(libs: &[Library], variant: &str, mm: usize) -> Vec<String> {
+    let c = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/constants/");
+    let design = vyges_loom::netlist::load_compact(&format!("{c}rv_plic_lite_tied.v")).expect("the netlist reads");
+    let d = vyges_sta::load::design(&design, libs).expect("every construct maps");
+    assert!(!d.constant_nets.is_empty(), "the variant has constant nets");
+    let text = std::fs::read_to_string(format!("{c}{variant}.sdc")).expect("the constraints are in the repository");
+    let sdc = vyges_loom::sdc::Sdc::parse_with(&text, &vyges_sta::load::sdc_design(&d.netlist, libs)).expect("the constraints read");
+    let (search_sdc, env, _notes) = vyges_sta::load::design_constraints(&sdc, &d, libs).expect("every constraint maps");
+    let t = vyges_sta::load::time_design_for(libs, &d.netlist, &search_sdc, env, mm).expect("the design times");
+    let mut lines = t.report_lines(libs[0].time_scale);
+    lines.sort();
+    lines
+}
+
+#[test]
+fn the_constant_tied_variant_matches_the_reference_line_for_line() {
+    let libs = libs();
+    let c = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/constants/");
+    let mut failed = Vec::new();
+    for variant in ["base", "tight", "case"] {
+        for (mm, file) in [(vyges_sta::liberty::MAX, format!("{variant}.golden")), (vyges_sta::liberty::MIN, format!("{variant}.hold.golden"))] {
+            let golden: Vec<String> = std::fs::read_to_string(format!("{c}{file}")).expect("the golden is in the repository").lines().map(String::from).collect();
+            let ours = ours_constants(&libs, variant, mm);
+            if ours != golden {
+                let only_ref: Vec<_> = golden.iter().filter(|g| !ours.contains(g)).take(4).collect();
+                let only_ours: Vec<_> = ours.iter().filter(|o| !golden.contains(o)).take(4).collect();
+                failed.push(format!("constants/{file}: {} golden lines, {} ours; only ref {only_ref:?}; only ours {only_ours:?}", golden.len(), ours.len()));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// The same netlist with every net's RC network read from a SPEF (`tests/data/spef`, `spef-gen.py`:
+/// RC trees, coupling caps, corner triplets, loop and self resistors, a name map), as the
+/// reference's `read_spef` reads it.
+#[test]
+fn the_spef_variant_matches_the_reference_line_for_line() {
+    let libs = libs();
+    let sp = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/spef/");
+    let design = vyges_loom::netlist::load_compact(&format!("{D}rv_plic_lite.v")).expect("the netlist reads");
+    let nl = vyges_sta::load::netlist(&design, &libs).expect("every construct maps");
+    let text = std::fs::read_to_string(format!("{sp}rv_plic_lite.spef")).expect("the SPEF is in the repository");
+    let (parasitics, report) = vyges_sta::spef::read(&text, &nl).expect("the SPEF reads");
+    assert_eq!((report.unknown_nets, report.unknown_nodes), (0, 0), "every name resolves, as the reference warns of none: {report:?}");
+    let mut failed = Vec::new();
+    for variant in ["base", "tight"] {
+        let text = std::fs::read_to_string(format!("{sp}{variant}.sdc")).expect("the constraints are in the repository");
+        let sdc = vyges_loom::sdc::Sdc::parse_with(&text, &vyges_sta::load::sdc_design(&nl, &libs)).expect("the constraints read");
+        for (mm, file) in [(vyges_sta::liberty::MAX, format!("{variant}.golden")), (vyges_sta::liberty::MIN, format!("{variant}.hold.golden"))] {
+            let (search_sdc, env, _notes) = vyges_sta::load::constraints(&sdc, &nl, &libs).expect("every constraint maps");
+            let t = vyges_sta::load::time_design_with(&libs, &nl, &search_sdc, env, mm, &parasitics).expect("the design times");
+            let mut ours = t.report_lines(libs[0].time_scale);
+            ours.sort();
+            let golden: Vec<String> = std::fs::read_to_string(format!("{sp}{file}")).expect("the golden is in the repository").lines().map(String::from).collect();
+            if ours != golden {
+                let only_ref: Vec<_> = golden.iter().filter(|g| !ours.contains(g)).take(4).collect();
+                let only_ours: Vec<_> = ours.iter().filter(|o| !golden.contains(o)).take(4).collect();
+                let n = golden.iter().filter(|g| !ours.contains(g)).count();
+                failed.push(format!("spef/{file}: {} golden lines, {} ours, {n} differ; only ref {only_ref:?}; only ours {only_ours:?}", golden.len(), ours.len()));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 #[test]
 fn every_variant_matches_the_reference_line_for_line() {
     let libs = libs();

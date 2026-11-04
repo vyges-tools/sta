@@ -196,6 +196,10 @@ pub struct SdcEnv {
     /// (`SearchPred0`), and on an instance with one it disables conditional arcs and arcs by their
     /// sense under the constants (`Sim::findDisabledEdges`).
     pub constants: HashMap<String, bool>,
+    /// The pins a `set_case_analysis rising` / `falling` holds, and what propagates from them, by
+    /// name: only that transition (`RISE` / `FALL`) is searched from or to them
+    /// (`searchThruSimEdge`).
+    pub sim_transitions: HashMap<String, usize>,
 }
 
 /// One `set_driving_cell`: the cell (the first library holding it), the port it drives from
