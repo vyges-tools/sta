@@ -244,6 +244,13 @@ fn change_prob(b: &Bdd, from: Edge, to: Edge, probs: &HashMap<u32, [[f32; 2]; 2]
     prob
 }
 
+/// A clock gate's gated clock: the clock's density times the enable's duty — the enable is
+/// latched, so only clock edges make gated clock edges (upstream OpenSTA cc9027d; before, the
+/// enable's density weighted by the clock's duty was added) — at the product of the duties.
+pub fn gated_clock_activity(clk: Activity, enable: Activity) -> Activity {
+    Activity::new(clk.density * enable.duty, clk.duty * enable.duty, Origin::Propagated)
+}
+
 /// `maxPropagatedDensity`: a propagated activity on a driver pin is at most one transition per
 /// launching clock period, two on a clock pin (float); unbounded without clocks (upstream OpenSTA
 /// cc9027d: the slew bound still allows hundreds per period). Loads copy their driver's.
@@ -580,10 +587,8 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
                     if cell.ports.iter().any(|p| p.name == port && p.is_clock_gate_out) {
                         let [enable, clk, gclk] = self.clock_gate_pins(i);
                         if let (Some(enable), Some(clk), Some(gclk)) = (enable, clk, gclk) {
-                            let a1 = self.find_activity(clk);
-                            let a2 = self.find_activity(enable);
-                            let (p1, p2) = (a1.duty, a2.duty);
-                            changed = self.set_activity_check(gclk, Activity::new(a1.density * p2 + a2.density * p1, p1 * p2, Origin::Propagated));
+                            let a = gated_clock_activity(self.find_activity(clk), self.find_activity(enable));
+                            changed = self.set_activity_check(gclk, a);
                         }
                     }
                 }
@@ -1386,6 +1391,13 @@ mod tests {
         assert_eq!(input_group_duty(Some(&f("!Z & B")), &p), 0.875 * 0.25);
         assert_eq!(input_group_duty(Some(&f("A")), &p), 0.5);
         assert_eq!(input_group_duty(None, &p), 1.0);
+    }
+
+    // A gated clock changes only on clock edges: the enable's own changes add nothing.
+    #[test]
+    fn a_gated_clock_changes_only_on_clock_edges() {
+        let a = gated_clock_activity(Activity::new(2e8, 0.5, Origin::Clock), Activity::new(1e7, 0.25, Origin::Propagated));
+        assert_eq!((a.density, a.duty, a.origin), (2e8 * 0.25, 0.125, Origin::Propagated));
     }
 
     // A propagated driver's density is at most one transition per launching period, two on a
