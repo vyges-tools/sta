@@ -753,7 +753,20 @@ impl<'a> Graph<'a> {
             if drivers.len() >= 10 && drivers.iter().all(|&d| !matches!(vertices[d].conn, Conn::Port(_)) && !fanin(d)) && loads.iter().all(|&l| !fanout_or_check(l)) {
                 continue;
             }
-            for &d in &drivers {
+            // `isPassiveBidirectDrvr` (OpenSTA fc6ed303): an instance pin's bidirect driver
+            // vertex with no fanin (a pad with no arc into it) drives nothing on a net that has
+            // an active driver.
+            let passive = |d: usize| {
+                let bidirect = d > 0 && vertices[d - 1].name == vertices[d].name && vertices[d - 1].conn == vertices[d].conn;
+                bidirect && !matches!(vertices[d].conn, Conn::Port(_)) && !fanin(d)
+            };
+            // (wire edges only reach loads, so a driver's fanin is the same before and after)
+            let passives: Vec<bool> = drivers.iter().map(|&d| passive(d)).collect();
+            let has_active_drvr = passives.iter().any(|&p| !p);
+            for (&d, &is_passive) in drivers.iter().zip(&passives) {
+                if has_active_drvr && is_passive {
+                    continue;
+                }
                 for &l in &loads {
                     if vertices[l].conn != vertices[d].conn {
                         edges.push(Edge { from: d, to: l, kind: EdgeKind::Wire });
@@ -1539,6 +1552,25 @@ mod tests {
         assert_eq!(names, ["x/A", "x/Y", "u1/Y", "u1/B", "u1/A", "a", "y"]);
         let plain = Graph::build_with_pins(&libs, &nl, Some(&pins)).unwrap();
         assert_eq!(plain.vertices.iter().position(|v| v.name == "u1/A"), Some(0));
+    }
+
+    // Rule (`Graph::isPassiveBidirectDrvr` / `hasActiveDrvr`, OpenSTA fc6ed303 #525): an
+    // instance pin's bidirect driver vertex with no fanin — a pad cell no library holds — makes no
+    // wire edge on a net with an active driver, here the inout port. So the port's load vertex
+    // has no levelized in-edge and is a root (zerosoc_pads' we_pad ports: seeded load AND driver).
+    #[test]
+    fn a_passive_bidirect_pad_drives_nothing_on_a_driven_net() {
+        let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
+        let nl = Netlist {
+            insts: vec![crate::netlist::inst("x", "gpio")],
+            ports: vec![("b".into(), PortDir::Inout)],
+            nets: vec![Net { name: "b".into(), pins: vec![Conn::Inst(0, "PAD".into()), Conn::Port(0)] }.into()],
+        };
+        let unlinked: HashMap<String, Vec<(String, Direction)>> = [("gpio".to_string(), vec![("PAD".to_string(), Direction::Bidirect)])].into();
+        let g = Graph::build_with_unlinked(&libs, &nl, None, &unlinked).unwrap();
+        let label = |v: usize| format!("{}{}", g.vertices[v].name, if g.vertices[v].is_driver { "+" } else { "" });
+        let edges: Vec<String> = g.edges.iter().map(|e| format!("{}>{}", label(e.from), label(e.to))).collect();
+        assert_eq!(edges, ["b+>x/PAD", "b>b+"]);
     }
 
     // Rules (`makePinVertices`, `makePortInstanceEdges`, `makeWireEdgesFromPin`,
