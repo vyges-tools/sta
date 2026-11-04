@@ -247,6 +247,13 @@ fn change_prob(b: &Bdd, from: Edge, to: Edge, probs: &HashMap<u32, [[f32; 2]; 2]
     prob
 }
 
+/// A register output pin is queued after its state is set when its function names the state
+/// (`IQ` or `IQN`) anywhere, as `!IQ` does (upstream OpenSTA cc9027d `hasPort`; before, only a
+/// function that is the state port alone).
+fn reads_state(func: &FuncExpr, seq: &crate::liberty::Seq) -> bool {
+    seq.output.as_deref().is_some_and(|o| has_port(func, o)) || seq.output_inv.as_deref().is_some_and(|o| has_port(func, o))
+}
+
 /// A pin the simulation holds constant does not switch: density 0, duty its value, origin
 /// constant (upstream OpenSTA cc9027d, before any activity set on it or its clock's).
 pub fn constant_activity(value: Option<bool>) -> Option<Activity> {
@@ -726,7 +733,7 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
         }
     }
 
-    /// Each register of `seq_cell`: its outputs' activities, then every pin whose function is
+    /// Each register of `seq_cell`: its outputs' activities, then every pin whose function names
     /// one of them is queued (ports read from the test cell when there is one).
     fn seed_reg_seqs(&mut self, i: usize, seq_cell: &'a Cell, test_cell: Option<&'a Cell>) {
         for seq in &seq_cell.seqs {
@@ -744,8 +751,8 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
                 if !cell.ports.iter().any(|p| p.name == port) {
                     continue;
                 }
-                if let Some(FuncExpr::Port(fp)) = self.func(cell, &port) {
-                    if Some(&fp) == seq.output.as_ref() || Some(&fp) == seq.output_inv.as_ref() {
+                if let Some(func) = self.func(cell, &port) {
+                    if reads_state(&func, seq) {
                         self.act.trace.push(format!("enqueue reg output {}", path_name(&self.g.vertices[v].name)));
                         self.bfs.enqueue(v, self.inp.level[v]);
                     }
@@ -1408,6 +1415,22 @@ mod tests {
         assert_eq!(input_group_duty(Some(&f("!Z & B")), &p), 0.875 * 0.25);
         assert_eq!(input_group_duty(Some(&f("A")), &p), 0.5);
         assert_eq!(input_group_duty(None, &p), 1.0);
+    }
+
+    // A register output whose function is any function of the state is queued with it.
+    #[test]
+    fn a_function_of_the_state_reads_the_state() {
+        let lib = crate::liberty::Library::read(
+            &crate::liberty_parse::parse(
+                "library (l) { cell (dff) { ff (IQ, IQN) { next_state : \"D\"; clocked_on : \"CK\"; }
+                 pin (D) { direction : input; } pin (CK) { direction : input; clock : true; } } }",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let seq = &lib.cells["dff"].seqs[0];
+        assert!(reads_state(&f("IQ"), seq) && reads_state(&f("!IQ"), seq) && reads_state(&f("IQN & D"), seq));
+        assert!(!reads_state(&f("D"), seq));
     }
 
     // A constant pin's activity is its value, with no density.
