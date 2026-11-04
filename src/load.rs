@@ -223,7 +223,9 @@ pub fn sdc_design(nl: &Netlist, libs: &[Library]) -> vyges_loom::sdc::SdcDesign 
             }
         }
     }
-    vyges_loom::sdc::SdcDesign { ports, insts: nl.insts.iter().map(|i| (**i).clone()).collect(), pins }
+    // `libs` (the group names an operating condition or wire load model is looked up in): this
+    // reader's libraries do not keep them, so those lookups are not checked here
+    vyges_loom::sdc::SdcDesign { ports, insts: nl.insts.iter().map(|i| (**i).clone()).collect(), pins, libs: Vec::new() }
 }
 
 /// `[get_ports P …]` against the netlist: each pattern's ports (`object_matches`, the reference's
@@ -1618,7 +1620,9 @@ mod tests {
         assert_eq!((f[DERATE_CELL_DELAY][DERATE_DATA][RISE][MAX], f[DERATE_CELL_DELAY][DERATE_CLK][RISE][MAX], f[DERATE_NET_DELAY][DERATE_DATA][FALL][MAX]), (Some(1.08), Some(1.05), Some(1.05)));
         assert_eq!((f[DERATE_CELL_CHECK][DERATE_DATA][RISE][MAX], f[DERATE_CELL_DELAY][DERATE_DATA][RISE][MIN]), (None, None), "no check, no early");
         assert!(read("set_timing_derate 1.05\n").unwrap_err().contains("111"));
-        assert!(read("set_timing_derate -early -late 1.05\n").unwrap_err().contains("110"));
+        // both -early and -late (Error 110): loom refuses it as it reads the SDC, before this
+        let both = vyges_loom::sdc::Sdc::parse("set_timing_derate -early -late 1.05\n").unwrap();
+        assert!(both.derates.is_empty() && both.rejected.iter().any(|r| r.contains("110")), "{:?}", both.rejected);
         assert!(read("").unwrap().is_none());
     }
 
@@ -1708,8 +1712,14 @@ mod tests {
         let rise = crate::sdc::user_to_sta(1.0, 1e-9);
         assert_eq!((g.name.as_str(), g.source.as_str(), g.period, g.waveform), ("div2", "a", p, [rise, rise + p / 2.0]));
         assert!(g.insertion.iter().flatten().flatten().all(Option::is_none), "no source latency");
-        let inv = read(&format!("{master}create_generated_clock -name i -source [get_ports clk] -master_clock clk -edges {{1 2 3}} -invert [get_ports a]\n")).unwrap();
-        assert_eq!(inv.clocks[1].waveform, [crate::sdc::user_to_sta(6.0, 1e-9), crate::sdc::user_to_sta(10.0, 1e-9) + rise]);
+        // `-edges` picks the master's edges (here at 1, 6, 11, 16, 21): {1 3 5} rises at 1, falls at
+        // 11, period 20
+        let ed = read(&format!("{master}create_generated_clock -name e -source [get_ports clk] -master_clock clk -edges {{1 3 5}} [get_ports a]\n")).unwrap();
+        assert_eq!((ed.clocks[1].period, ed.clocks[1].waveform), (p, [rise, crate::sdc::user_to_sta(11.0, 1e-9)]));
+        // `-invert` without -divide_by, -multiply_by or -combinational is the reference's Error 389:
+        // the clock is never made
+        let inv = vyges_loom::sdc::Sdc::parse(&format!("{master}create_generated_clock -name i -source [get_ports clk] -edges {{1 2 3}} -invert [get_ports a]\n")).unwrap();
+        assert!(inv.clocks.len() == 1 && inv.rejected.iter().any(|r| r.contains("389")), "{:?}", inv.rejected);
         let e = search_sdc(&vyges_loom::sdc::Sdc::parse(&format!("{master}create_generated_clock -name div2 -source [get_ports clk] -divide_by 2 [get_ports a]\n")).unwrap(), 1e-9, true, false).unwrap_err();
         assert!(e.contains("propagated"), "{e}");
         let e = read(&format!("{master}create_generated_clock -name div2 -source [get_ports b] -divide_by 2 [get_ports a]\n")).unwrap_err();
