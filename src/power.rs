@@ -247,6 +247,52 @@ fn change_prob(b: &Bdd, from: Edge, to: Edge, probs: &HashMap<u32, [[f32; 2]; 2]
     prob
 }
 
+/// A register output's density (upstream OpenSTA cc9027d): at most one change per active clock
+/// edge (half the clock's density), with probability at most `2 min(duty, 1 - duty)` — so
+/// `min(data density, min(duty, 1 - duty) × clock density)`, in float, continuous in the data's
+/// density (before: the data's density up to half the clock's, then `2 duty (1 - duty)` × the
+/// clock's).
+pub fn reg_output_density(in_density: f32, in_duty: f32, clk_density: f32) -> f32 {
+    let bound = in_duty.min(1.0 - in_duty) * clk_density;
+    if bound < in_density {
+        bound
+    } else {
+        in_density
+    }
+}
+
+/// `evalRegHoldActivity`: a register whose next state names its own state (`IQ`, `IQN`) — an
+/// enable flop, `(D&DE) | (IQ&!DE)` — as a two-state process (upstream OpenSTA cc9027d). Each
+/// active edge sets the state with `u = P(next | IQ=0, IQN=1)` and clears it with
+/// `v = 1 - P(next | IQ=1, IQN=0)` (each the duty of the next state's diagram with the state
+/// variables it names restricted, in float). The duty is `u / (u + v)` and the density is
+/// lowered, never raised, to `u v / (u + v) × clock density`; with `u + v = 0` the state never
+/// changes: duty 1/2, density 0. `None` when the next state does not name the state.
+pub fn eval_reg_hold_activity(data: &FuncExpr, iq: Option<&str>, iqn: Option<&str>, clk_density: f32, density: f32, pins: &impl InstPins) -> Option<(f32, f32)> {
+    if !(iq.is_some_and(|p| has_port(data, p)) || iqn.is_some_and(|p| has_port(data, p))) {
+        return None;
+    }
+    let (mut b, f) = Bdd::of(data);
+    let mut state_duty = [0.0f32; 2];
+    for value in [false, true] {
+        let mut node = f;
+        for (port, port_value) in [(iq, value), (iqn, !value)] {
+            if let Some(v) = port.and_then(|p| b.var_index(p)) {
+                node = b.restrict(node, v, port_value);
+            }
+        }
+        state_duty[usize::from(value)] = eval_bdd_duty(&b, node, pins);
+    }
+    let set = state_duty[0];
+    let clear = (1.0 - f64::from(state_duty[1])) as f32;
+    if set + clear > 0.0 {
+        let hold = set * clear / (set + clear) * clk_density;
+        Some((if hold < density { hold } else { density }, set / (set + clear)))
+    } else {
+        Some((0.0, 0.5))
+    }
+}
+
 /// A register output pin is queued after its state is set when its function names the state
 /// (`IQ` or `IQN`) anywhere, as `!IQ` does (upstream OpenSTA cc9027d `hasPort`; before, only a
 /// function that is the state port alone).
@@ -761,27 +807,31 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
         }
     }
 
-    /// One register output: the data's activity through the register — a register samples at
-    /// most once per clock edge pair, so when the data toggles faster than half the clock its
-    /// density is 2·duty·(1 − duty)·clock density (float); a latch passes the data while open.
+    /// One register output: the data's activity through the register — a register's output is
+    /// [`reg_output_density`], then [`eval_reg_hold_activity`] when the data names the state; a
+    /// latch passes the data while open when the data toggles faster than half the clock.
     /// A missing output (an `ff` naming one) is still evaluated and kept under no port.
     fn seed_reg_output(&mut self, i: usize, seq: &crate::liberty::Seq, output: Option<&str>, invert: bool) {
         let view = InstView { p: self, inst: i };
         let parse = |t: &Option<String>| t.as_deref().and_then(|t| FuncExpr::parse(t).ok());
-        let in_a = parse(&seq.data).map_or(Activity::UNKNOWN, |f| eval_activity(&f, &view));
+        let data = parse(&seq.data);
+        let in_a = data.as_ref().map_or(Activity::UNKNOWN, |f| eval_activity(f, &view));
         let clk_func = parse(&seq.clock);
         let clk = clk_func.as_ref().map_or(Activity::UNKNOWN, |f| eval_activity(f, &view));
         let (in_density, in_duty) = (in_a.density, in_a.duty);
         let mut out_density = in_density;
         let mut out_duty = in_duty;
         let clk_density = clk.density;
-        if in_density > clk_density / 2.0 {
-            if seq.is_register {
-                out_density = 2.0 * in_duty * (1.0 - in_duty) * clk_density;
-            } else {
-                let clk_invert = matches!(&clk_func, Some(FuncExpr::Not(x)) if matches!(**x, FuncExpr::Port(_)));
-                out_density = if clk_invert { in_density * (1.0 - clk.duty) } else { in_density * clk.duty };
+        if seq.is_register {
+            out_density = reg_output_density(in_density, in_duty, clk_density);
+            if let Some(data) = &data {
+                if let Some((density, duty)) = eval_reg_hold_activity(data, seq.output.as_deref(), seq.output_inv.as_deref(), clk_density, out_density, &view) {
+                    (out_density, out_duty) = (density, duty);
+                }
             }
+        } else if in_density > clk_density / 2.0 {
+            let clk_invert = matches!(&clk_func, Some(FuncExpr::Not(x)) if matches!(**x, FuncExpr::Port(_)));
+            out_density = if clk_invert { in_density * (1.0 - clk.duty) } else { in_density * clk.duty };
         }
         if invert {
             out_duty = (1.0 - f64::from(out_duty)) as f32;
@@ -1415,6 +1465,33 @@ mod tests {
         assert_eq!(input_group_duty(Some(&f("!Z & B")), &p), 0.875 * 0.25);
         assert_eq!(input_group_duty(Some(&f("A")), &p), 0.5);
         assert_eq!(input_group_duty(None, &p), 1.0);
+    }
+
+    // A register's output changes at most once per active edge, with probability at most
+    // 2 min(p, 1 - p): min(data density, min(p, 1 - p) × clock density).
+    #[test]
+    fn a_register_output_is_continuous_in_the_data_density() {
+        assert_eq!(reg_output_density(1e6, 0.5, 2e8), 1e6);
+        assert_eq!(reg_output_density(4e8, 0.5, 2e8), 1e8);
+        assert_eq!(reg_output_density(4e8, 0.25, 2e8), 5e7);
+        // slower than half the clock but bounded by the duty: 0.1 × 2e8 = 2e7 < 9e7
+        assert_eq!(reg_output_density(9e7, 0.9, 2e8), 0.100000024 * 2e8);
+    }
+
+    // An enable flop's next state (D & DE) | (IQ & !DE): set with u = P(D) P(DE), cleared with
+    // v = P(!D) P(DE); duty u / (u + v) = P(D), density at most u v / (u + v) × clock.
+    #[test]
+    fn an_enable_flop_holds_its_state() {
+        let p = pins(&[("D", 1e7, 0.5), ("DE", 1e7, 0.25)]);
+        let (density, duty) = eval_reg_hold_activity(&f("(D & DE) | (IQ & !DE)"), Some("IQ"), Some("IQN"), 2e8, 1e9, &p).unwrap();
+        assert_eq!(duty, 0.5);
+        assert_eq!(density, 0.125 * 0.125 / 0.25 * 2e8);
+        // never raised
+        assert_eq!(eval_reg_hold_activity(&f("(D & DE) | (IQ & !DE)"), Some("IQ"), Some("IQN"), 2e8, 1e6, &p).unwrap().0, 1e6);
+        // a state that never changes: IQ alone
+        assert_eq!(eval_reg_hold_activity(&f("IQ"), Some("IQ"), Some("IQN"), 2e8, 1e6, &p), Some((0.0, 0.5)));
+        // a plain flop: not a hold
+        assert_eq!(eval_reg_hold_activity(&f("D"), Some("IQ"), Some("IQN"), 2e8, 1e6, &p), None);
     }
 
     // A register output whose function is any function of the state is queued with it.
