@@ -357,6 +357,10 @@ pub const CHANGE_TOLERANCE: f32 = 0.01;
 /// The register passes after the first propagation.
 pub const MAX_ACTIVITY_PASSES: usize = 50;
 
+/// The warning when the register passes do not settle (upstream OpenSTA cc9027d), as the
+/// reference logs it.
+pub const NOT_CONVERGED: &str = "[WARNING STA-2402] power activity propagation through registers did not converge after 50 passes.";
+
 /// What the propagation reads besides the graph, per vertex.
 pub struct ActivityInputs<'x> {
     /// `Levelize` levels (any order-equivalent numbering).
@@ -388,6 +392,9 @@ pub struct Activities {
     pub seq: HashMap<(usize, String), Activity>,
     /// The register passes run after the first propagation.
     pub passes: usize,
+    /// Registers still changed after the last pass allowed ([`MAX_ACTIVITY_PASSES`]): the
+    /// reference warns once (`STA-2402`, [`NOT_CONVERGED`]).
+    pub not_converged: bool,
     pub trace: Vec<String>,
 }
 
@@ -482,6 +489,7 @@ pub fn ensure_activities(g: &Graph<'_>, inp: &ActivityInputs<'_>) -> Result<Acti
         pass += 1;
     }
     p.act.passes = pass - 1;
+    p.act.not_converged = !regs.is_empty();
     // a bidirect pin's driver vertex reads the pin's activity
     for v in 0..p.act.pin.len() {
         p.act.pin[v] = p.act.pin[p.pin_key[v]];
@@ -1599,6 +1607,16 @@ mod tests {
         let d = |v: &str| act.pin[at(v)].unwrap().density;
         assert_eq!((d("m/Q"), d("u/A")), (1e8, 1e8), "seeded, then a load: not bounded");
         assert_eq!(d("u/Y"), 1.0 / 2e-8);
+    }
+
+    // The propagation through registers settles: none is left after the passes.
+    #[test]
+    fn a_settled_propagation_does_not_warn() {
+        let libs = [crate::liberty::Library::read(&crate::liberty_parse::parse(MACRO_LIB).unwrap()).unwrap()];
+        let nl = macro_chain();
+        let g = Graph::build(&libs, &nl).unwrap();
+        assert!(!propagate(&g, 1e-8, None).not_converged);
+        assert!(NOT_CONVERGED.ends_with(&format!("after {MAX_ACTIVITY_PASSES} passes.")));
     }
 
     // A register output whose function is any function of the state is queued with it.
