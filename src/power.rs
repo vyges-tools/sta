@@ -466,6 +466,7 @@ pub fn ensure_activities(g: &Graph<'_>, inp: &ActivityInputs<'_>) -> Result<Acti
     let input = input_activity(inp.min_period, inp.time_unit);
     p.act.trace.push(format!("VYG-INPUT dens {}", bits(input.density)));
     p.seed_activities(input);
+    p.seed_func_less_output_activities(input);
     p.visit_all();
     let mut regs = std::mem::take(&mut p.visited_regs);
     let mut pass = 1;
@@ -598,6 +599,31 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
             self.act.pin[self.pin_key[v]] = Some(input);
             // the fanout of the pin's DRIVER vertex
             self.enqueue_adjacent(self.pin_drvr[v]);
+        }
+    }
+
+    /// `seedFuncLessOutputActivities` (upstream OpenSTA cc9027d): the propagation never sets an
+    /// output with no function on a cell with no register, test cell or clock gate (a memory, a
+    /// macro), so each such output that is not a clock pin is seeded like a root, in instance
+    /// then pin order, and its fanout is queued.
+    fn seed_func_less_output_activities(&mut self, input: Activity) {
+        for i in 0..self.g.netlist.insts.len() {
+            let Some(cell) = self.cell_of_inst(i) else { continue };
+            if !cell.seqs.is_empty() || cell.test_cell.is_some() || cell.is_clock_gate {
+                continue;
+            }
+            for v in self.inst_pins[i].clone() {
+                // a bidirect pin's driver vertex is the same pin
+                if self.pin_key[v] != v {
+                    continue;
+                }
+                let Some(port) = self.g.vertices[v].port.as_deref() else { continue };
+                let Some(p) = cell.ports.iter().find(|p| p.name == port) else { continue };
+                if is_any_output(p.direction) && p.function.is_none() && !self.inp.is_clock[v] {
+                    self.act.pin[v] = Some(input);
+                    self.enqueue_adjacent(self.pin_drvr[v]);
+                }
+            }
         }
     }
 
@@ -1492,6 +1518,87 @@ mod tests {
         assert_eq!(eval_reg_hold_activity(&f("IQ"), Some("IQ"), Some("IQN"), 2e8, 1e6, &p), Some((0.0, 0.5)));
         // a plain flop: not a hold
         assert_eq!(eval_reg_hold_activity(&f("D"), Some("IQ"), Some("IQN"), 2e8, 1e6, &p), None);
+    }
+
+    const MACRO_LIB: &str = r#"library (t) {
+      time_unit : "1ns"; capacitive_load_unit (1, pf);
+      cell (mem) {
+        pin (A) { direction : input; capacitance : 0.001; }
+        pin (Q) { direction : output;
+          timing () { related_pin : "A"; timing_sense : non_unate;
+            cell_rise (scalar) { values ("0.1"); } rise_transition (scalar) { values ("0.1"); }
+            cell_fall (scalar) { values ("0.1"); } fall_transition (scalar) { values ("0.1"); } }
+        }
+      }
+      cell (inv) {
+        pin (A) { direction : input; capacitance : 0.001; }
+        pin (Y) { direction : output; function : "!A";
+          timing () { related_pin : "A"; timing_sense : negative_unate;
+            cell_rise (scalar) { values ("0.1"); } rise_transition (scalar) { values ("0.1"); }
+            cell_fall (scalar) { values ("0.1"); } fall_transition (scalar) { values ("0.1"); } }
+        }
+      }
+    }"#;
+
+    /// Port a into a macro `m` (an arc A -> Q, no function), its Q into an inverter `u`.
+    fn macro_chain() -> crate::netlist::Netlist {
+        use crate::netlist::{Net, Netlist, PortDir};
+        let pin = |i: usize, p: &str| Conn::Inst(i, p.into());
+        Netlist {
+            insts: vec![crate::netlist::inst("m", "mem"), crate::netlist::inst("u", "inv")],
+            ports: vec![("a".into(), PortDir::Input), ("y".into(), PortDir::Output)],
+            nets: vec![
+                Net { name: "a".into(), pins: vec![pin(0, "A"), Conn::Port(0)] }.into(),
+                Net { name: "q".into(), pins: vec![pin(0, "Q"), pin(1, "A")] }.into(),
+                Net { name: "y".into(), pins: vec![pin(1, "Y"), Conn::Port(1)] }.into(),
+            ],
+        }
+    }
+
+    fn propagate(g: &Graph<'_>, min_period: f32, clk_period: Option<f32>) -> Activities {
+        let n = g.vertices.len();
+        let level = g.levels().unwrap();
+        let (f, none, zero) = (vec![false; n], vec![None; n], vec![0.0; n]);
+        let clk = vec![clk_period; n];
+        let inp = ActivityInputs { level: &level, clock_source: &f, is_clock: &f, clock: &none, min_rf_slew: &zero, clk_period: &clk, constant: &vec![None; n], min_period, time_unit: 1e-9 };
+        ensure_activities(g, &inp).unwrap()
+    }
+
+    // A macro's output with no function is seeded like a root (upstream OpenSTA cc9027d), so
+    // its fanout sees the input activity, not nothing.
+    #[test]
+    fn a_func_less_output_is_seeded_like_an_input() {
+        let libs = [crate::liberty::Library::read(&crate::liberty_parse::parse(MACRO_LIB).unwrap()).unwrap()];
+        let nl = macro_chain();
+        let g = Graph::build(&libs, &nl).unwrap();
+        let act = propagate(&g, 1e-8, None);
+        let at = |n: &str| act.pin[g.vertices.iter().position(|v| v.name == n).unwrap()];
+        let input = input_activity(1e-8, 1e-9);
+        assert_eq!(at("m/Q"), Some(input));
+        assert_eq!(at("u/Y").map(|a| (a.density, a.duty)), Some((input.density, 0.5)));
+    }
+
+    // The bound applies where the propagation sets a driver: one transition per launching
+    // period. A change density never exceeds it, so the inverter reads a clock pin here (the sum:
+    // its input's density, 1e8 / s) and is launched at 2e-8 s: bounded to 5e7; the seeded macro
+    // output is not bounded.
+    #[test]
+    fn a_propagated_driver_is_bounded_by_its_launching_period() {
+        let libs = [crate::liberty::Library::read(&crate::liberty_parse::parse(MACRO_LIB).unwrap()).unwrap()];
+        let nl = macro_chain();
+        let g = Graph::build(&libs, &nl).unwrap();
+        let n = g.vertices.len();
+        let at = |n: &str| g.vertices.iter().position(|v| v.name == n).unwrap();
+        let level = g.levels().unwrap();
+        let (f, none, zero) = (vec![false; n], vec![None; n], vec![0.0; n]);
+        let mut is_clock = f.clone();
+        is_clock[at("u/A")] = true;
+        let clk = vec![Some(2e-8); n];
+        let inp = ActivityInputs { level: &level, clock_source: &f, is_clock: &is_clock, clock: &none, min_rf_slew: &zero, clk_period: &clk, constant: &none.iter().map(|_| None).collect::<Vec<_>>(), min_period: 0.0, time_unit: 1e-9 };
+        let act = ensure_activities(&g, &inp).unwrap();
+        let d = |v: &str| act.pin[at(v)].unwrap().density;
+        assert_eq!((d("m/Q"), d("u/A")), (1e8, 1e8), "seeded, then a load: not bounded");
+        assert_eq!(d("u/Y"), 1.0 / 2e-8);
     }
 
     // A register output whose function is any function of the state is queued with it.
