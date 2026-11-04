@@ -340,12 +340,6 @@ fn constraints_with(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library], co
         }
         notes.push(format!("{}: {} (no slack moves with it)", n.command, n.why));
     }
-    // A generated clock's arrivals come from its master through the circuit (the reference's
-    // generated-clock insertion search); taken as an ordinary clock at its pin, it would be timed
-    // wrong, silently. Refused until that search is transcribed.
-    if let Some(c) = s.clocks.iter().find(|c| c.generated.is_some()) {
-        return Err(format!("create_generated_clock {}: not modelled by this timer", c.name));
-    }
     let simulated = constant_nets.is_some();
     let refused: [(&str, bool); 7] = [
         ("set_case_analysis", !simulated && !s.case_values.is_empty()),
@@ -1093,6 +1087,49 @@ pub fn search_sdc_on(
     search_sdc_with(s, Some(nl), [&i, &o], time_scale, propagated, hold_repair)
 }
 
+/// `create_generated_clock` (`Sta::makeGeneratedClock`, then `Clock::generate` from its master,
+/// [`crate::sdc::generate`]): the master is `-master_clock`, else the clock defined on the
+/// `-source` pin — among the clocks made before it. With an IDEAL master its source latency is 0
+/// (`Search::clockInsertion`: `isGeneratedWithPropagatedMaster` false), so it is a clock at its
+/// pins like any other, with the derived waveform. Refused: a master found only by searching up
+/// from `-source` (`Genclks::ensureMaster`), a propagated master or generated clock (the
+/// generated-clock insertion search and its CRPR), edges outside one period.
+fn generated_clock(clock: &vyges_loom::sdc::SdcClock, g: &vyges_loom::sdc::GeneratedClock, source: &str, prop: bool, made: &[crate::sdc::Clock], time_scale: f32) -> Result<crate::sdc::Clock, String> {
+    let cmd = format!("create_generated_clock {}", clock.name);
+    let master = match &g.master_clock {
+        Some(m) => made.iter().find(|c| &c.name == m),
+        None => g.source.names.first().and_then(|src| made.iter().find(|c| !c.source.is_empty() && &c.source == src)),
+    };
+    let Some(master) = master else {
+        return Err(format!("{cmd}: no clock defined on the -source pin before it (the master found by searching up from -source is not modelled)"));
+    };
+    if prop || master.propagated {
+        return Err(format!("{cmd}: a propagated generated clock or master (the generated-clock insertion search) is not modelled"));
+    }
+    if g.edges.iter().any(|&e| e < 1) {
+        return Err(format!("{cmd} -edges: an edge below 1 is not modelled"));
+    }
+    let int = |v: Option<i64>, f: &str| -> Result<i32, String> { v.map_or(Ok(0), |v| i32::try_from(v).map_err(|_| format!("{cmd} {f} {v}: out of range"))) };
+    let spec = crate::sdc::Generated {
+        // `-combinational` alone is a divide by 1
+        divide_by: if g.divide_by.is_none() && g.multiply_by.is_none() && g.edges.is_empty() && g.combinational { 1 } else { int(g.divide_by, "-divide_by")? },
+        multiply_by: int(g.multiply_by, "-multiply_by")?,
+        duty_cycle: if g.multiply_by.is_some() { g.duty_cycle.unwrap_or(0.0) as f32 } else { 0.0 },
+        edges: g.edges.iter().map(|&e| e as i32).collect(),
+        edge_shifts: g.edge_shift.iter().map(|&x| crate::sdc::user_to_sta(x, time_scale)).collect(),
+        invert: g.invert,
+    };
+    let Some((period, waveform)) = crate::sdc::generate(master, &spec) else {
+        return Err(format!("{cmd}: none of -divide_by, -multiply_by, -edges or -combinational"));
+    };
+    if !(waveform[0] >= 0.0 && waveform[0] < period && waveform[1] > waveform[0] && waveform[1] - waveform[0] < period) {
+        return Err(format!("{cmd}: edges {waveform:?} on period {period}: not modelled (a rise then a fall within one period is)"));
+    }
+    let mut c = crate::sdc::Clock::new(&clock.name, period, source, false);
+    c.waveform = waveform;
+    Ok(c)
+}
+
 /// The constraints the setup search reads (one clock and its port delays), from the SDC as the
 /// reference wrote it. Everything else that moves a setup slack is refused here, never dropped.
 ///
@@ -1140,6 +1177,10 @@ fn search_sdc_with(
             source
         };
         let prop = !clock.is_virtual() && if named_propagated.is_empty() { propagated } else { named_propagated.contains(&clock.name) };
+        if let Some(g) = &clock.generated {
+            clocks.push(generated_clock(clock, g, source, prop, &clocks, time_scale)?);
+            continue;
+        }
         let mut c = Clock::new(&clock.name, crate::sdc::user_to_sta(clock.period, time_scale), source, prop);
         // `-waveform {rise fall}`: each edge `time_ui_sta`, like the period. Two edges, the rise
         // first and within a period of the start, the fall after it and less than a period later.
@@ -1652,23 +1693,27 @@ mod tests {
         assert_eq!(ss.input_delays.iter().map(|d| d.port.as_str()).collect::<Vec<_>>(), ["a", "b"]);
     }
 
-    /// A generated clock is refused, not timed as an ordinary clock at its pin: the reference
-    /// derives its arrivals from the master clock through the circuit, which this timer does not.
+    /// Rules (`Sta::makeGeneratedClock`, `Clock::generate`, `Search::clockInsertion`): a
+    /// generated clock of an ideal master is a clock at its pin with the derived waveform (no
+    /// source latency); its master is the clock on `-source`, or `-master_clock`. A propagated
+    /// master (the generated-clock insertion search), or a `-source` no clock is defined on, is
+    /// refused.
     #[test]
-    fn a_generated_clock_is_refused() {
-        use crate::netlist::{Netlist, PortDir::*};
-        let nl = Netlist { insts: vec![], ports: vec![("clk".into(), Input), ("a".into(), Input)], nets: vec![] };
-        let sdc = vyges_loom::sdc::Sdc::parse(
-            "create_clock -name clk -period 10 [get_ports clk]\ncreate_generated_clock -name div2 -source [get_ports clk] -divide_by 2 [get_ports a]\n",
-        )
-        .unwrap();
-        let err = constraints(&sdc, &nl, &[]).unwrap_err();
-        assert!(err.contains("create_generated_clock div2"), "{err}");
-        let plain = vyges_loom::sdc::Sdc::parse("create_clock -name clk -period 10 [get_ports clk]\n").unwrap();
-        // without the generated clock the same call gets past this refusal (here to the next
-        // check, which wants a library): the refusal fires on generated clocks only
-        let e = constraints(&plain, &nl, &[]).unwrap_err();
-        assert!(!e.contains("create_generated_clock"), "{e}");
+    fn a_generated_clock_of_an_ideal_master_is_a_clock_at_its_pin() {
+        let read = |text: &str| search_sdc(&vyges_loom::sdc::Sdc::parse(text).unwrap(), 1e-9, false, false);
+        let master = "create_clock -name clk -period 10 -waveform {1 6} [get_ports clk]\n";
+        let sdc = read(&format!("{master}create_generated_clock -name div2 -source [get_ports clk] -divide_by 2 [get_ports a]\n")).unwrap();
+        let g = &sdc.clocks[1];
+        let p = crate::sdc::user_to_sta(10.0, 1e-9) * 2.0;
+        let rise = crate::sdc::user_to_sta(1.0, 1e-9);
+        assert_eq!((g.name.as_str(), g.source.as_str(), g.period, g.waveform), ("div2", "a", p, [rise, rise + p / 2.0]));
+        assert!(g.insertion.iter().flatten().flatten().all(Option::is_none), "no source latency");
+        let inv = read(&format!("{master}create_generated_clock -name i -source [get_ports clk] -master_clock clk -edges {{1 2 3}} -invert [get_ports a]\n")).unwrap();
+        assert_eq!(inv.clocks[1].waveform, [crate::sdc::user_to_sta(6.0, 1e-9), crate::sdc::user_to_sta(10.0, 1e-9) + rise]);
+        let e = search_sdc(&vyges_loom::sdc::Sdc::parse(&format!("{master}create_generated_clock -name div2 -source [get_ports clk] -divide_by 2 [get_ports a]\n")).unwrap(), 1e-9, true, false).unwrap_err();
+        assert!(e.contains("propagated"), "{e}");
+        let e = read(&format!("{master}create_generated_clock -name div2 -source [get_ports b] -divide_by 2 [get_ports a]\n")).unwrap_err();
+        assert!(e.contains("-source"), "{e}");
     }
 
     /// Rules (`Sdc::allOutputs` / `Sdc::allInputs`): any-output = output or bidirect; any-input =

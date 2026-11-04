@@ -55,6 +55,7 @@ Each command lands in exactly one of three groups.
 | command | notes |
 | --- | --- |
 | `create_clock` | on ports or pins, with `-waveform`; virtual clocks |
+| `create_generated_clock` | of an ideal master: `-divide_by`, `-multiply_by` (`-duty_cycle`), `-edges` (`-edge_shift`), `-invert`, `-combinational`, `-master_clock`, `-add`; the waveform derived from the master's |
 | `set_propagated_clock` | |
 | `set_clock_latency` | network latency on clocks and pins; `-source` insertion, `-early` / `-late` |
 | `set_clock_uncertainty` | on clocks, and between clocks (`-from` / `-to`), setup and hold |
@@ -75,7 +76,8 @@ Each command lands in exactly one of three groups.
 
 **Refused** — the load stops and names the command, rather than time the design without it:
 
-- `create_generated_clock`
+- `create_generated_clock` of a propagated master, or itself propagated (its source latency is
+  the master's arrival through the circuit), or whose master is not defined on its `-source` pin
 - `set_disable_timing`, `set_sense` / `set_clock_sense`, `set_disable_clock_gating_check`
 - `group_path`, `set_path_margin`
 - exceptions given `-rise_through` / `-fall_through`, from or to a clock with several clocks
@@ -84,7 +86,7 @@ Each command lands in exactly one of three groups.
 - any other command that could move a slack (the rule is in `load::constraints`: a command loom
   carries in no record of its own is refused unless it is one of the directives above)
 
-These commands are the next to move from refused to applied: generated clocks, disabled timing
+These commands are the next to move from refused to applied: generated clocks of propagated masters, disabled timing
 (already modelled in [sta-si](https://github.com/vyges-tools/sta-si)), and latches.
 
 A design with pins tied to a constant or supply nets is read with `load::design` and its

@@ -685,6 +685,73 @@ impl Sdc {
     }
 }
 
+/// What `create_generated_clock` asks of its master (`Clock::divide_by_` … `invert_`), as the
+/// command hands it to `Sta::makeGeneratedClock`: 0 for a divide or multiply not given (`-combinational`
+/// alone is a divide by 1), `-duty_cycle` with `-multiply_by` only, `-edge_shift` in seconds.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Generated {
+    pub divide_by: i32,
+    pub multiply_by: i32,
+    pub duty_cycle: f32,
+    pub edges: Vec<i32>,
+    pub edge_shifts: Vec<f32>,
+    pub invert: bool,
+}
+
+/// `Clock::generate(src_clk)`: a generated clock's period and two edges from its master's, in
+/// `float`. A divide by 1 copies the master; a power-of-two divide keeps the master's rise and
+/// gives a 50% duty cycle; any other divide, or a multiply, scales the master's edges
+/// (`generateScaledClk`; `-duty_cycle` sets the fall instead); `-edges` takes master edges
+/// (1-based, counted through the master's two edges cycle after cycle) plus `-edge_shift`
+/// (`generateEdgesClk`); `-invert` then moves each edge to the next one's time, the last a period
+/// past the first (less a period when the first was a period or more in). None: none of the
+/// forms (`create_generated_clock` stops before making such a clock).
+pub fn generate(master: &Clock, g: &Generated) -> Option<(f32, [f32; 2])> {
+    let src = master.waveform;
+    let scaled = |scale: f32| -> (f32, [f32; 2]) {
+        let period = master.period * scale;
+        if g.duty_cycle != 0.0 {
+            let rise = src[0] * scale;
+            (period, [rise, rise + period * g.duty_cycle / 100.0])
+        } else {
+            (period, [src[0] * scale, src[1] * scale])
+        }
+    };
+    let (period, mut wave) = if g.divide_by == 1 {
+        (master.period, src)
+    } else if g.divide_by > 1 {
+        if g.divide_by & (g.divide_by - 1) == 0 {
+            let period = master.period * g.divide_by as f32;
+            (period, [src[0], src[0] + period / 2.0])
+        } else {
+            scaled(g.divide_by as f32)
+        }
+    } else if g.multiply_by >= 1 {
+        scaled(1.0 / g.multiply_by as f32)
+    } else if g.edges.len() == 3 {
+        // `std::div(edge - 1, 2)`: the master edge and how many master periods on
+        let at = |k: usize| {
+            let e = g.edges[k] - 1;
+            let shift = g.edge_shifts.get(k).copied().unwrap_or(0.0);
+            (src[(e % 2) as usize] + (e / 2) as f32 * master.period, shift)
+        };
+        let (r, rs) = at(0);
+        let rise = r + rs;
+        let (f, fs) = at(1);
+        let (p, ps) = at(2);
+        (p - rise + ps, [rise, f + fs])
+    } else {
+        return None;
+    };
+    if g.invert {
+        let first = wave[0];
+        let offset = if first >= period { period } else { 0.0 };
+        wave[0] = wave[1] - offset;
+        wave[1] = first - offset + period;
+    }
+    Some((period, wave))
+}
+
 /// A user-unit value (as the command line holds it, a `double`) in seconds: `Unit::userToSta`
 /// multiplies the `double` by the unit's `float` scale (`scale_`, e.g. `f32(1e-9)` for ns) in
 /// `double`; the command's `float` argument narrows the product once.
@@ -991,6 +1058,28 @@ mod tests {
         assert_eq!(sdc.check_clk_uncertainty(None, edge(1, FALL), MAX), -0.3e-9, "unclocked: b's own");
         assert_eq!(sdc.check_clk_uncertainty(Some(edge(1, RISE)), edge(0, RISE), MIN), 0.03e-9, "hold: a's own, not negated");
         assert_eq!(sdc.check_clk_uncertainty(Some(edge(0, RISE)), edge(1, FALL), MIN), 0.0, "neither set for hold");
+    }
+
+    /// Rules (`Clock::generate`, `generateScaledClk`, `generateEdgesClk`): a power-of-two divide
+    /// keeps the rise, 50% duty; a divide by 3 scales both edges; a multiply scales by 1/m in
+    /// float, `-duty_cycle` setting the fall; `-edges {1 3 5}` is a divide by 2 on the master's
+    /// edges, a shift moving each; `-invert` swaps rise and fall a period on. Neither form: none.
+    #[test]
+    fn a_generated_clock_derives_its_waveform_from_the_master() {
+        let mut m = Clock::new("m", 2e-9, "clk", false);
+        m.waveform = [0.5e-9, 1.5e-9];
+        let gen = |g: Generated| generate(&m, &g).unwrap();
+        assert_eq!(gen(Generated { divide_by: 1, ..Default::default() }), (2e-9, [0.5e-9, 1.5e-9]));
+        assert_eq!(gen(Generated { divide_by: 4, ..Default::default() }), (8e-9, [0.5e-9, 0.5e-9 + 4e-9]));
+        assert_eq!(gen(Generated { divide_by: 3, ..Default::default() }), (2e-9 * 3.0, [0.5e-9 * 3.0, 1.5e-9 * 3.0]));
+        let s = 1.0f32 / 2.0;
+        assert_eq!(gen(Generated { multiply_by: 2, duty_cycle: 25.0, ..Default::default() }), (2e-9 * s, [0.5e-9 * s, 0.5e-9 * s + 2e-9 * s * 25.0 / 100.0]));
+        assert_eq!(gen(Generated { edges: vec![1, 3, 5], ..Default::default() }), (0.5e-9 + 2.0 * 2e-9 - 0.5e-9, [0.5e-9, 0.5e-9 + 2e-9]));
+        let shifted = gen(Generated { edges: vec![2, 3, 4], edge_shifts: vec![0.1e-9, 0.2e-9, 0.1e-9], ..Default::default() });
+        assert_eq!(shifted, (1.5e-9 + 2e-9 - (1.5e-9 + 0.1e-9) + 0.1e-9, [1.5e-9 + 0.1e-9, 0.5e-9 + 2e-9 + 0.2e-9]));
+        let (p, w) = gen(Generated { divide_by: 2, invert: true, ..Default::default() });
+        assert_eq!((p, w), (4e-9, [0.5e-9 + 2e-9, 0.5e-9 + 4e-9]));
+        assert_eq!(generate(&m, &Generated::default()), None);
     }
 
     /// Rise to rise: one period; rise to fall: half a period; fall to rise: a full period from the

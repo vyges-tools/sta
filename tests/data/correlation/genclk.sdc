@@ -1,0 +1,5 @@
+create_clock -name clk_i -period 2.5 -waveform {0.3 1.0} [get_ports {clk_i}]
+create_generated_clock -name div2 -source [get_ports {clk_i}] -master_clock clk_i -divide_by 2 -add [get_ports {clk_i}]
+set_input_delay 0.4 -clock clk_i [all_inputs]
+set_output_delay 0.6 -clock div2 [all_outputs]
+create_generated_clock -name dq -source [get_ports {clk_i}] -master_clock clk_i -divide_by 2 [get_pins {_2911_/Q}]
