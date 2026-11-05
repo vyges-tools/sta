@@ -71,8 +71,11 @@ Each command lands in exactly one of three groups.
 | `set_logic_zero`, `set_logic_one`, `set_logic_dc` | on pins and ports (read with `load::design`) |
 
 **Read, not checked** — kept and reported as notes; no slack moves with them: `set_max_fanout`,
-`set_max_transition`, `set_max_capacitance`, and directives a timer never consults (`set_dont_use`,
-`set_dont_touch`, `set_max_area`, power limits, voltage areas, clock-gating style, …).
+`set_max_transition`, `set_max_capacitance`, `set_min_capacitance`, and directives a timer never
+consults (`set_dont_use`, `set_dont_touch`, `set_max_area`, `set_max_dynamic_power`,
+`set_max_leakage_power`, voltage areas, clock-gating style, …). A command loom keeps as written
+follows the same rule: one of these is a note with its count (`set_max_leakage_power (2
+commands): kept and written back, not applied (no slack moves with it)`), any other is refused.
 
 **Refused** — the load stops and names the command, rather than time the design without it:
 

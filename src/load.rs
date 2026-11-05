@@ -332,6 +332,14 @@ fn logic_values(cmds: &[vyges_loom::sdc::LogicValueCmd], nl: &Netlist) -> Result
     Ok(out)
 }
 
+/// Whether leaving `cmd` unapplied can move a slack here: everything but the directives no timer
+/// consults (loom's `BENIGN_FOR_TIMING`: area and power limits, voltage areas, …) and the
+/// design-rule limits, which this timer reads and does not check.
+fn moves_a_slack(cmd: &str) -> bool {
+    const DESIGN_RULES: [&str; 4] = ["set_max_capacitance", "set_max_transition", "set_max_fanout", "set_min_capacitance"];
+    !vyges_loom::sdc::BENIGN_FOR_TIMING.contains(&cmd) && !DESIGN_RULES.contains(&cmd)
+}
+
 fn constraints_with(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library], constant_nets: Option<&[(String, bool)]>) -> Result<(crate::sdc::Sdc, crate::graph::SdcEnv, Vec<String>), String> {
     // everything loom read and carries in no record (`Sdc::not_applied`, the rejected commands
     // and unevaluated queries among them): refused if it can move a slack, else a note
@@ -343,17 +351,32 @@ fn constraints_with(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library], co
         notes.push(format!("{}: {} (no slack moves with it)", n.command, n.why));
     }
     let simulated = constant_nets.is_some();
-    let refused: [(&str, bool); 7] = [
+    let refused: [(&str, bool); 6] = [
         ("set_case_analysis", !simulated && !s.case_values.is_empty()),
         ("set_logic_zero / set_logic_one / set_logic_dc", !simulated && !s.logic_values.is_empty()),
         ("set_disable_timing", !s.disabled_timing.is_empty()),
         ("set_sense / set_clock_sense", !s.senses.is_empty()),
         ("set_disable_clock_gating_check", !s.disabled_gating_checks.is_empty()),
         ("group_path / set_path_margin", !s.other_exceptions.is_empty()),
-        ("a command kept as written", !s.kept.is_empty()),
     ];
     if let Some((what, _)) = refused.iter().find(|(_, set)| *set) {
         return Err(format!("{what}: not modelled by this timer"));
+    }
+    // a command kept as written (loom's `Sdc::kept`) by the same rule as the rest: refused if it
+    // can move a slack, else a note with its count
+    let mut kept: Vec<(&str, usize)> = Vec::new();
+    for k in &s.kept {
+        if moves_a_slack(&k.cmd) {
+            return Err(format!("{} (kept as written): not modelled by this timer", k.cmd));
+        }
+        match kept.iter_mut().find(|(c, _)| *c == k.cmd) {
+            Some((_, n)) => *n += 1,
+            None => kept.push((&k.cmd, 1)),
+        }
+    }
+    for (c, n) in kept {
+        let times = if n == 1 { String::new() } else { format!(" ({n} commands)") };
+        notes.push(format!("{c}{times}: kept and written back, not applied (no slack moves with it)"));
     }
     // design-rule limits are carried, and move no slack: read, not checked
     if s.max_fanout.is_some() || !s.max_fanout_objects.is_empty() {
@@ -1518,6 +1541,29 @@ mod tests {
         }
         let data = refusal("set_sense -type data -positive [get_pins b/X]");
         assert!(data.starts_with("set_sense (rejected: -type data is not modelled"), "{data}");
+    }
+
+    /// A command kept as written is judged as every other: one that can move a slack is refused,
+    /// naming it; an area or power limit, or a design-rule limit, is a note with its count.
+    #[test]
+    fn a_kept_command_is_refused_only_when_it_moves_a_slack() {
+        let d = vyges_loom::netlist::parse_compact("module t (a, y); input a; output y; BUF b (.A(a), .X(y)); endmodule\n").unwrap();
+        let nl = netlist(&d, &[lib()]).unwrap();
+        let read = |lines: &str| {
+            let s = vyges_loom::sdc::Sdc::parse(&format!("create_clock -name c -period 2 [get_ports a]\n{lines}\n")).unwrap();
+            constraints_with(&s, &nl, &[lib()], None).map(|(_, _, notes)| notes)
+        };
+        let notes = read("set_max_area 0\nset_max_dynamic_power 1\nset_max_leakage_power 1\nset_max_leakage_power 2\nset_min_capacitance 0.01 [get_ports a]")
+            .unwrap_or_else(|e| panic!("refused: {e}"));
+        for want in [
+            "set_max_area: kept and written back, not applied (no slack moves with it)",
+            "set_max_leakage_power (2 commands): kept and written back, not applied (no slack moves with it)",
+            "set_min_capacitance: kept and written back, not applied (no slack moves with it)",
+        ] {
+            assert!(notes.iter().any(|n| n == want), "{want}: {notes:?}");
+        }
+        assert_eq!(read("set_drive 1 [get_ports a]").unwrap_err(), "set_drive (kept as written): not modelled by this timer");
+        assert_eq!(read("set_max_area 0\nset_operating_conditions typ").unwrap_err(), "set_operating_conditions (kept as written): not modelled by this timer");
     }
 
     /// Rule (`set_clock_uncertainty` in the reference's `sdc/Sdc.tcl`): `-setup` alone sets the
