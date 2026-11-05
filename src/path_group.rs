@@ -98,6 +98,41 @@ impl Search<'_, '_> {
     }
 }
 
+/// `Sta::findRegisterClkPins` (`data` false) / `findRegisterDataPins` (`data` true) with no
+/// clocks, rise and fall, registers and latches — `all_registers -clock_pins` / `-data_pins`.
+/// Without clocks `FindRegVisitor::visitRegs` takes every register clock vertex
+/// (`Graph::regClkVertices`: a pin some `reg_clk_to_q` / `latch_en_to_q` arc leaves) and, the
+/// search being specific to neither kind nor edge, visits its instance whatever its sequentials
+/// (`visitReg`): each of the instance's pins that matches. A clock pin matches when such an arc
+/// leaves it (`FindRegClkPins::matchPin`); a data pin when a timing check ends at it
+/// (`Vertex::hasChecks`) and its port has neither `min_period` nor `min_pulse_width_high` /
+/// `_low` (`FindRegDataPins::matchPin`). Vertices, in the graph's order (a set: the order is not
+/// the reference's, nor read).
+pub fn register_pins(g: &crate::graph::Graph<'_>, data: bool) -> Vec<usize> {
+    use crate::graph::EdgeKind;
+    use crate::liberty::Role;
+    let reg_clk = |v: usize| {
+        g.out_edges[v].iter().any(|&e| match g.edges[e].kind {
+            EdgeKind::Gate { set } => matches!(g.arc_set(e, set).role, Role::RegClkToQ | Role::LatchEnToQ),
+            EdgeKind::Wire => false,
+        })
+    };
+    let inst_of = |v: usize| match &g.vertices[v].conn {
+        crate::netlist::Conn::Inst(i, _) => Some(*i),
+        crate::netlist::Conn::Port(_) => None,
+    };
+    let regs: std::collections::BTreeSet<usize> = (0..g.vertices.len()).filter(|&v| reg_clk(v)).filter_map(inst_of).collect();
+    let port_timed = |v: usize| {
+        let x = &g.vertices[v];
+        let port = x.lib.zip(x.cell.as_deref()).zip(x.port.as_deref()).and_then(|((l, c), p)| g.libs[l].cells.get(c).and_then(|c| c.port(p)));
+        port.is_some_and(|p| p.min_period.is_some() || p.min_pulse_width.iter().any(Option::is_some))
+    };
+    (0..g.vertices.len())
+        .filter(|&v| inst_of(v).is_some_and(|i| regs.contains(&i)))
+        .filter(|&v| if data { !g.vertices[v].is_driver && g.in_edges[v].iter().any(|&e| g.is_check(e)) && !port_timed(v) } else { reg_clk(v) })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +197,57 @@ mod tests {
         assert!(ends(-1.0, 0.45).is_empty(), "above slack_max");
         assert!(ends(0.55, 1.0).is_empty(), "under slack_min");
         assert_eq!(ends(0.5, 0.5).len(), 1, "the bounds are inclusive");
+    }
+
+    const SEQ: &str = r#"library (s) {
+      time_unit : "1ns"; capacitive_load_unit (1, pf);
+      cell (dff) {
+        ff (IQ, IQN) { clocked_on : "CK"; next_state : "D"; clear : "!RN"; }
+        pin (CK) { direction : input; clock : true; capacitance : 0.001; }
+        pin (D) { direction : input; capacitance : 0.001;
+          timing () { related_pin : "CK"; timing_type : setup_rising;
+            rise_constraint (scalar) { values ("0.05"); } fall_constraint (scalar) { values ("0.05"); } } }
+        pin (RN) { direction : input; capacitance : 0.001; min_pulse_width_low : 0.1;
+          timing () { related_pin : "CK"; timing_type : recovery_rising;
+            rise_constraint (scalar) { values ("0.05"); } } }
+        pin (SI) { direction : input; capacitance : 0.001;
+          timing () { related_pin : "CK"; timing_type : hold_rising;
+            rise_constraint (scalar) { values ("0.01"); } fall_constraint (scalar) { values ("0.01"); } } }
+        pin (Q) { direction : output; function : "IQ";
+          timing () { related_pin : "CK"; timing_type : rising_edge;
+            cell_rise (scalar) { values ("0.1"); } rise_transition (scalar) { values ("0.05"); }
+            cell_fall (scalar) { values ("0.1"); } fall_transition (scalar) { values ("0.05"); } } }
+      }
+      cell (buf) {
+        pin (A) { direction : input; capacitance : 0.001; }
+        pin (X) { direction : output; function : "A";
+          timing () { related_pin : "A"; timing_sense : positive_unate;
+            cell_rise (scalar) { values ("0.1"); } rise_transition (scalar) { values ("0.05"); }
+            cell_fall (scalar) { values ("0.1"); } fall_transition (scalar) { values ("0.05"); } } }
+      }
+    }"#;
+
+    /// Rules (`FindRegClkPins::matchPin`, `FindRegDataPins::matchPin`, `visitReg`): a register's
+    /// clock pin is the one a clock-to-Q arc leaves; its data pins are the pins a timing check ends
+    /// at — any check, so a hold-only SI too — less a pin whose port has a min pulse width (RN:
+    /// `min_pulse_width_low`); a buffer has neither.
+    #[test]
+    fn a_registers_clock_and_data_pins() {
+        let libs = vec![Library::read(&crate::liberty_parse::parse(SEQ).unwrap()).unwrap()];
+        let i = |k: usize, p: &str| Conn::Inst(k, p.into());
+        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins }.into();
+        let netlist = Netlist {
+            insts: vec![crate::netlist::inst("r", "dff"), crate::netlist::inst("b", "buf")],
+            ports: vec![("clk".into(), PortDir::Input), ("d".into(), PortDir::Input), ("q".into(), PortDir::Output)],
+            nets: vec![net("clk", vec![i(0, "CK"), Conn::Port(0)]), net("d", vec![i(0, "D"), i(0, "RN"), i(0, "SI"), Conn::Port(1)]), net("n", vec![i(0, "Q"), i(1, "A")]), net("q", vec![i(1, "X"), Conn::Port(2)])],
+        };
+        let g = Graph::build(&libs, &netlist).unwrap();
+        let names = |data: bool| {
+            let mut v: Vec<String> = register_pins(&g, data).into_iter().map(|v| g.vertices[v].name.clone()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(false), ["r/CK"]);
+        assert_eq!(names(true), ["r/D", "r/SI"]);
     }
 }

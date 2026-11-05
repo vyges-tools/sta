@@ -114,7 +114,8 @@ refuses such a design rather than time it without them.
 - `sdc`, `search` — clocks and constraints; arrivals, requireds, slacks.
 - `incr` — the timer's state across edits, each update doing the reference's incremental work.
 - `path_enum` — the k worst paths to one endpoint.
-- `path_group` — which `group_path` a path end is in, and a group's path ends, worst first.
+- `path_group` — which `group_path` a path end is in, a group's path ends, worst first, and
+  the registers' clock and data pins (`all_registers -clock_pins` / `-data_pins`).
 - `power` — switching activity and instance power.
 - `fuzzy` — the tolerant comparison every merge uses.
 - `load` (feature `loom`) — a design read by [loom](https://github.com/vyges-tools/loom)

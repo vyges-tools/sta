@@ -108,6 +108,12 @@ pub struct Port {
     pub fanout_load: Option<f32>,
     /// `max_fanout`, unscaled, when set.
     pub max_fanout: Option<f32>,
+    /// `min_period` (`× time unit`), when set (`LibertyPort::minPeriod`).
+    pub min_period: Option<f32>,
+    /// `min_pulse_width_high` / `min_pulse_width_low` (`× time unit`), `[rise/fall]`, when set
+    /// (`LibertyPort::minPulseWidth`: the pin attributes only, never a `min_pulse_width` timing
+    /// group).
+    pub min_pulse_width: [Option<f32>; 2],
     /// `related_power_pin`: the pg pin whose voltage its switching power is at.
     pub related_power_pin: Option<String>,
     /// `three_state` (the tristate enable function), as text.
@@ -792,6 +798,14 @@ impl Library {
         if own.max_fanout.is_some() {
             port.max_fanout = own.max_fanout;
         }
+        if own.min_period.is_some() {
+            port.min_period = own.min_period;
+        }
+        for rf in [RISE, FALL] {
+            if own.min_pulse_width[rf].is_some() {
+                port.min_pulse_width[rf] = own.min_pulse_width[rf];
+            }
+        }
     }
 
     /// Port attributes: `capacitance` sets all four values, then
@@ -826,6 +840,8 @@ impl Library {
         let max_capacitance = pg.attr_float("max_capacitance").map(|v| v * self.cap_scale);
         let fanout_load = pg.attr_float("fanout_load");
         let max_fanout = pg.attr_float("max_fanout");
+        let min_period = pg.attr_float("min_period").map(|v| v * self.time_scale);
+        let min_pulse_width = [pg.attr_float("min_pulse_width_high"), pg.attr_float("min_pulse_width_low")].map(|w| w.map(|v| v * self.time_scale));
         let related_power_pin = pg.attr_text("related_power_pin");
         let three_state = pg.attr_text("three_state");
         let is_clock_gate_clock = pg.attr_text("clock_gate_clock_pin").is_some_and(|c| c.eq_ignore_ascii_case("true"));
@@ -845,6 +861,8 @@ impl Library {
             max_capacitance,
             fanout_load,
             max_fanout,
+            min_period,
+            min_pulse_width,
             three_state,
             is_clock_gate_clock,
             is_clock_gate_enable,
