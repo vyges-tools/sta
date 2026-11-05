@@ -177,6 +177,11 @@ pub struct PathDelay {
     pub multicycle: Option<Multicycle>,
     /// The `-through` points, in order.
     pub thrus: Vec<Thru>,
+    /// `group_path -name` (a `GroupPath`), not a delay: its name. It moves no slack — it rides
+    /// on the tags as any exception does (`exceptionFromStates`), and a path end it reaches is in
+    /// its group ([`Sdc::group_paths_to`]). Of every min/max (`MinMaxAll::all()`), priority 0 plus
+    /// the points', never tighter. `min_max`, `delay` and the rest mean nothing for it.
+    pub group: Option<String>,
 }
 
 /// A multicycle path's own fields (`MultiCyclePath`).
@@ -233,7 +238,7 @@ impl PathDelay {
 
     /// `ExceptionPath::isPathDelay`.
     pub fn is_path_delay(&self) -> bool {
-        !self.false_path && self.multicycle.is_none()
+        !self.false_path && self.multicycle.is_none() && self.group.is_none()
     }
 
     /// `ExceptionTo::matches(pin, clk_edge, end_rf)`: a `-to` pin, or `-to` the clock at a clocked
@@ -250,6 +255,10 @@ impl PathDelay {
     /// every min path too when not asked exactly (`set_multicycle_path -setup` decides the hold
     /// check's accounting, so it rides on min tags).
     fn matches(&self, mm: usize, exactly: bool) -> bool {
+        // `GroupPath`: `MinMaxAll::all()`, which matches either, exactly or not.
+        if self.group.is_some() {
+            return true;
+        }
         match self.multicycle {
             Some(m) => m.all || self.min_max == mm || (!exactly && mm == crate::liberty::MIN),
             None => self.min_max == mm,
@@ -294,10 +303,13 @@ impl PathDelay {
         if self.to_clock {
             p |= 1 << 2;
         }
+        // `groupPathPriority()` is 0: below every other exception.
         let base = if self.false_path {
             4000
         } else if self.multicycle.is_some() {
             2000
+        } else if self.group.is_some() {
+            0
         } else {
             3000
         };
@@ -308,7 +320,8 @@ impl PathDelay {
     /// A false path is never tighter (`FalsePath::tighterThan`): of two at one priority, the
     /// first found stays.
     fn tighter_than(&self, other: &PathDelay) -> bool {
-        if self.false_path || other.false_path {
+        // `GroupPath::tighterThan`: never.
+        if self.false_path || other.false_path || self.group.is_some() || other.group.is_some() {
             return false;
         }
         // `MultiCyclePath::tighterThan`: the smaller multiplier (`pathMultiplier()`, the raw one).
@@ -598,13 +611,41 @@ impl Sdc {
     /// False paths are not candidates: a false path at the pin has already stopped the end
     /// ([`Sdc::false_path_to`]), and one that does not match here could not win.
     pub fn path_delay_to(&self, states: States, pin: &str, clocked: bool, mm: usize) -> Option<usize> {
-        self.exception_to(states, pin, clocked, mm, false, &|pd| !pd.false_path && pd.multicycle.is_none())
+        self.exception_to(states, pin, clocked, mm, false, &|pd| pd.is_path_delay())
     }
 
     /// `Search::exceptionTo(multi_cycle, …, match_min_max_exactly)`: the multicycle path ruling a
     /// check of min/max `mm` at `pin` — at a check, below any path delay (2000 against 3000).
     pub fn multicycle_to(&self, states: States, pin: &str, clocked: bool, mm: usize, exactly: bool) -> Option<usize> {
         self.exception_to(states, pin, clocked, mm, exactly, &|pd| pd.multicycle.is_some())
+    }
+
+    /// `Search::groupPathsTo(path_end)`: the group paths a path end at `pin` is in, as ids, in the
+    /// reference's order. First the path's states (id order, `exceptionStateCmp`) whose exception
+    /// is a group path matching the end — its `-to` naming the pin (or the target clock at a clocked
+    /// end), or no `-to` at all. 🔑 NO completeness test: a state still waiting for a `-through`
+    /// matches too (`exceptionMatchesTo`, not `isCompleteTo`). Then the group paths whose FIRST
+    /// point is a `-to` naming the pin, then those naming the clock (`Sdc::groupPathsTo`:
+    /// `require_to_pin`, so no `-to` never matches there).
+    pub fn group_paths_to(&self, states: States, pin: &str, clocked: bool) -> Vec<usize> {
+        let mut out = Vec::new();
+        for slot in states.ids() {
+            let (id, _) = self.state_of(slot);
+            if self.path_delays[id].group.is_some() && self.path_delays[id].to_matches(pin, clocked) {
+                out.push(id);
+            }
+        }
+        for (id, pd) in self.path_delays.iter().enumerate() {
+            if pd.group.is_some() && pd.first_is_to() && pd.to_pins.iter().any(|p| p == pin) {
+                out.push(id);
+            }
+        }
+        for (id, pd) in self.path_delays.iter().enumerate() {
+            if clocked && pd.group.is_some() && pd.first_is_to() && pd.to_pins.is_empty() && pd.to_clock {
+                out.push(id);
+            }
+        }
+        out
     }
 
     /// `Search::exceptionTo` over the exceptions `kind` admits.
@@ -918,7 +959,7 @@ mod tests {
     }
 
     fn false_path(from: &[&str], to: &[&str], mm: usize) -> PathDelay {
-        PathDelay { from_pins: from.iter().map(|p| p.to_string()).collect(), from_clock: false, to_pins: to.iter().map(|p| p.to_string()).collect(), to_clock: false, min_max: mm, ignore_clk_latency: false, break_path: false, delay: 0.0, false_path: true, multicycle: None, thrus: Vec::new() }
+        PathDelay { from_pins: from.iter().map(|p| p.to_string()).collect(), from_clock: false, to_pins: to.iter().map(|p| p.to_string()).collect(), to_clock: false, min_max: mm, ignore_clk_latency: false, break_path: false, delay: 0.0, false_path: true, multicycle: None, thrus: Vec::new(), group: None }
     }
 
     /// Rules (`Sdc::exceptionFromStates`, `VisitPathEnds::falsePathTo`): a false path with no
@@ -1002,6 +1043,39 @@ mod tests {
         let sdc = Sdc { clocks: vec![], input_delays: vec![], output_delays: vec![], path_delays: vec![false_path(&["ck"], &[], MAX), first] };
         assert!(sdc.false_from(&pin_at("ck"), true, MAX));
         assert_eq!(sdc.clock_from_states(&pin_at("ck"), MAX), States(0b11), "the marker, and the -through-first state");
+    }
+
+    fn group(name: &str, from: &[&str], to: &[&str]) -> PathDelay {
+        PathDelay { false_path: false, group: Some(name.into()), ..false_path(from, to, MAX) }
+    }
+
+    /// Rules (`GroupPath`, `Search::groupPathsTo`, `Sdc::groupPathsTo`): a group path is of every
+    /// min/max (`MinMaxAll::all()`), priority 0 plus its points, never tighter, and never a path
+    /// delay (no internal pins, no `pathDelayTo` candidate). It starts on the tag like any
+    /// exception. A path end is in it when the path carries one of its states and its `-to` names
+    /// the end — with NO completeness test, so a state still waiting for a `-through` counts — or
+    /// no `-to` at all; or when its first point is a `-to` naming the end (that list requires a
+    /// `-to`). States first, in id order, then the first-`-to` group paths.
+    #[test]
+    fn a_path_end_is_in_the_groups_its_states_and_its_pin_name() {
+        let mut waits = group("w", &["a"], &["y"]);
+        waits.thrus = vec![thru(&["u9/A"], &[], &[])];
+        let sdc = Sdc {
+            clocks: vec![],
+            input_delays: vec![],
+            output_delays: vec![],
+            path_delays: vec![group("g", &["a"], &["y"]), group("t", &[], &["y"]), waits, group("all", &["a"], &[])],
+        };
+        let g = &sdc.path_delays[0];
+        assert!(g.matches(MIN, true) && g.matches(MAX, true), "of every min/max, exactly");
+        assert_eq!(g.priority(), 1 << 6 | 1 << 5, "priority 0 plus -from and -to pins");
+        assert!(!g.is_path_delay() && !g.tighter_than(&sdc.path_delays[3]));
+        let from_a = sdc.exception_from_states(&pin_at("a"), false, MIN);
+        assert_eq!(from_a, States(1 << sdc.slot(0, 0) | 1 << sdc.slot(2, 0) | 1 << sdc.slot(3, 0)), "g, w (waiting for u9/A) and all start at a, for min too");
+        assert_eq!(sdc.group_paths_to(from_a, "y", false), vec![0, 2, 3, 1], "states in id order (w not through u9/A, yet in), then the first -to");
+        assert_eq!(sdc.group_paths_to(from_a, "z", false), vec![3], "no -to: any end");
+        assert_eq!(sdc.group_paths_to(States::NONE, "y", false), vec![1], "a path from elsewhere: the first -to only");
+        assert_eq!(sdc.path_delay_to(from_a, "y", false, MAX), None, "never a path delay");
     }
 
     fn multicycle(from: &[&str], to: &[&str], mm: usize, multiplier: i32, use_end_clk: bool, all: bool) -> PathDelay {
@@ -1118,7 +1192,7 @@ mod tests {
     /// only the delay's own min/max matches.
     #[test]
     fn path_delay_to_takes_the_highest_priority_then_the_tighter() {
-        let pd = |to_pins: &[&str], to_clock: bool, delay: f32| PathDelay { from_pins: vec!["r1/CLK".into()], from_clock: false, to_pins: to_pins.iter().map(|p| p.to_string()).collect(), to_clock, min_max: MAX, ignore_clk_latency: true, break_path: true, delay, false_path: false, multicycle: None, thrus: Vec::new() };
+        let pd = |to_pins: &[&str], to_clock: bool, delay: f32| PathDelay { from_pins: vec!["r1/CLK".into()], from_clock: false, to_pins: to_pins.iter().map(|p| p.to_string()).collect(), to_clock, min_max: MAX, ignore_clk_latency: true, break_path: true, delay, false_path: false, multicycle: None, thrus: Vec::new(), group: None };
         let sdc = Sdc { clocks: vec![Clock::new("c", 2.0, "clk", true)], input_delays: Vec::new(), output_delays: Vec::new(), path_delays: vec![pd(&[], true, 1.0), pd(&["r3/D"], false, 3.0), pd(&["r3/D"], false, 2.0)] };
         let all = States(0b111);
         assert_eq!(sdc.path_delay_to(all, "r3/D", true, MAX), Some(2));

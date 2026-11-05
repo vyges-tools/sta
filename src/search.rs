@@ -553,7 +553,7 @@ impl<'g, 'a> Search<'g, 'a> {
             let index = graph.index();
             let has_check = |v: usize| graph.in_edges[v].iter().any(|&e| matches!(graph.edges[e].kind, EdgeKind::Gate { set } if is_check_role(graph.arc_set(e, set).role)));
             // `recordPathDelayInternalFrom` / `To` are made for path delays only (`makePathDelay`).
-            for pd in sdc.path_delays.iter().filter(|pd| !pd.false_path && pd.multicycle.is_none()) {
+            for pd in sdc.path_delays.iter().filter(|pd| pd.is_path_delay()) {
                 // `recordPathDelayInternalFrom`: not `isExceptionStartpoint`.
                 for &v in pd.from_pins.iter().filter_map(|p| index.get(p.as_str())) {
                     let top_input = graph.is_port(v) && graph.vertices[v].is_driver;
@@ -1120,7 +1120,7 @@ impl<'g, 'a> Search<'g, 'a> {
                     return Err(format!("-through {p}: no such pin"));
                 }
             }
-            if pd.false_path || pd.multicycle.is_some() {
+            if !pd.is_path_delay() {
                 self.exception_modelled(pd)?;
                 continue;
             }
@@ -1164,7 +1164,13 @@ impl<'g, 'a> Search<'g, 'a> {
     /// `exceptionTo`, and a latch check its own default cycles); for a multicycle path no gated
     /// clock check (`PathEndGatedClock` has its own accounting).
     fn exception_modelled(&self, pd: &crate::sdc::PathDelay) -> Result<(), String> {
-        let cmd = if pd.false_path { "set_false_path" } else { "set_multicycle_path" };
+        let cmd = if pd.false_path {
+            "set_false_path"
+        } else if pd.group.is_some() {
+            "group_path"
+        } else {
+            "set_multicycle_path"
+        };
         if (pd.from_clock || pd.to_clock) && (pd.false_path || self.sdc.clocks.len() > 1) {
             return Err(format!("{cmd} -from / -to a clock: not modelled{}", if pd.false_path { "" } else { " with several clocks" }));
         }
@@ -1187,6 +1193,11 @@ impl<'g, 'a> Search<'g, 'a> {
         }
         for pin in &pd.to_pins {
             let Some(v) = find(pin) else { return Err(format!("{cmd} -to {pin}: no such pin")) };
+            // A group path's `-to` is read only where an end is visited (`groupPathsTo`), never by
+            // the search: on an internal pin it names no end, and is no different.
+            if pd.group.is_some() {
+                continue;
+            }
             if !(self.graph.is_port(v) || self.graph.in_edges[v].iter().any(|&e| self.is_check(e))) {
                 return Err(format!("{cmd} -to the internal pin {pin}: not modelled"));
             }
@@ -2743,7 +2754,7 @@ mod tests {
 
     /// `set_max_delay -ignore_clock_latency -from f1/CLK -to f2/D <d>`.
     fn max_delay_f1_f2(d: f32) -> crate::sdc::PathDelay {
-        crate::sdc::PathDelay { from_pins: vec!["f1/CLK".into()], from_clock: false, to_pins: vec!["f2/D".into()], to_clock: false, min_max: MAX, ignore_clk_latency: true, break_path: true, delay: d, false_path: false, multicycle: None, thrus: Vec::new() }
+        crate::sdc::PathDelay { from_pins: vec!["f1/CLK".into()], from_clock: false, to_pins: vec!["f2/D".into()], to_clock: false, min_max: MAX, ignore_clk_latency: true, break_path: true, delay: d, false_path: false, multicycle: None, thrus: Vec::new(), group: None }
     }
 
     /// Rules (`fromRegClkTag` → `exceptionFromStates`; `PathEndPathDelay::requiredTime`): a path
@@ -2784,7 +2795,7 @@ mod tests {
     #[test]
     fn a_min_delay_between_clocks_overrides_the_hold_check() {
         let d = 0.8e-9f32;
-        let pd = crate::sdc::PathDelay { from_pins: Vec::new(), from_clock: true, to_pins: Vec::new(), to_clock: true, min_max: MIN, ignore_clk_latency: false, break_path: true, delay: d, false_path: false, multicycle: None, thrus: Vec::new() };
+        let pd = crate::sdc::PathDelay { from_pins: Vec::new(), from_clock: true, to_pins: Vec::new(), to_clock: true, min_max: MIN, ignore_clk_latency: false, break_path: true, delay: d, false_path: false, multicycle: None, thrus: Vec::new(), group: None };
         let (libs, netlist, mut sdc) = design();
         sdc.output_delays.clear();
         sdc.path_delays.push(pd);
@@ -2838,7 +2849,7 @@ mod tests {
             ports: vec![("in".into(), PortDir::Input), ("out".into(), PortDir::Output)],
             nets: vec![net("in", vec![i(0, "A"), Conn::Port(0)]), net("m", vec![i(0, "X"), i(1, "A")]), net("out", vec![i(1, "X"), Conn::Port(1)])],
         };
-        let pd = crate::sdc::PathDelay { from_pins: vec!["b1/X".into()], from_clock: false, to_pins: vec!["b2/A".into()], to_clock: false, min_max: MAX, ignore_clk_latency: false, break_path: true, delay: 2e-9, false_path: false, multicycle: None, thrus: Vec::new() };
+        let pd = crate::sdc::PathDelay { from_pins: vec!["b1/X".into()], from_clock: false, to_pins: vec!["b2/A".into()], to_clock: false, min_max: MAX, ignore_clk_latency: false, break_path: true, delay: 2e-9, false_path: false, multicycle: None, thrus: Vec::new(), group: None };
         let sdc = Sdc { clocks: Vec::new(), input_delays: Vec::new(), output_delays: Vec::new(), path_delays: vec![pd] };
         let mut g = Graph::build(&libs, &netlist).unwrap();
         g.find_delays(&HashMap::new(), None).unwrap();

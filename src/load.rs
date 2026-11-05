@@ -357,7 +357,7 @@ fn constraints_with(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library], co
         ("set_disable_timing", !s.disabled_timing.is_empty()),
         ("set_sense / set_clock_sense", !s.senses.is_empty()),
         ("set_disable_clock_gating_check", !s.disabled_gating_checks.is_empty()),
-        ("group_path / set_path_margin", !s.other_exceptions.is_empty()),
+        ("set_path_margin", s.other_exceptions.iter().any(|x| x.cmd == "set_path_margin")),
     ];
     if let Some((what, _)) = refused.iter().find(|(_, set)| *set) {
         return Err(format!("{what}: not modelled by this timer"));
@@ -411,6 +411,11 @@ fn constraints_with(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library], co
         return Err("set_false_path / set_multicycle_path with set_max_delay / set_min_delay: not modelled (the ids across them are the order they were made in)".into());
     }
     sdc.path_delays.extend(falses);
+    let groups = group_paths(&s.other_exceptions, &s, nl)?;
+    if !groups.is_empty() && !sdc.path_delays.is_empty() {
+        return Err("group_path with set_false_path / set_multicycle_path / set_max_delay / set_min_delay: not modelled (the ids across them are the order they were made in)".into());
+    }
+    sdc.path_delays.extend(groups);
     let mut env = sdc_env(&s, libs, nl)?;
     env.derates = derates;
     if let Some(constant_nets) = constant_nets {
@@ -744,6 +749,7 @@ fn timing_exceptions(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc
                 false_path: false,
                 multicycle: Some(crate::sdc::Multicycle { multiplier: n, use_end_clk, all: setup == hold }),
                 thrus,
+                group: None,
             });
             continue;
         }
@@ -765,8 +771,90 @@ fn timing_exceptions(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc
                 false_path: true,
                 multicycle: None,
                 thrus: thrus.clone(),
+                group: None,
             });
         }
+    }
+    Ok(out)
+}
+
+/// Every `group_path -name` as the reference makes it (`Sdc::makeGroupPath`: one `GroupPath`, of
+/// every min/max), in file order: `-from` / `-to` on ports, pins or the one clock — each object
+/// list `[get_ports …]`, `[get_pins …]`, `[all_inputs …]` / `[all_outputs]` or a `[list …]` of
+/// them, patterns matched against the netlist — and `-through` points as [`thru_point`] reads them. `-weight` and `-critical_range` are
+/// read and ignored, as the reference ignores them. Refused: `-default` (its paths go to the path
+/// delay group), the edge forms and `-rise` / `-fall`, two of one name (`addException` would merge
+/// them), a side that matches nothing, and no point at all.
+fn group_paths(xs: &[vyges_loom::sdc::ExceptionCmd], s: &vyges_loom::sdc::Sdc, nl: &Netlist) -> Result<Vec<crate::sdc::PathDelay>, String> {
+    use crate::liberty::MAX;
+    let pins = connected_pins(nl);
+    let mut out: Vec<crate::sdc::PathDelay> = Vec::new();
+    for x in xs.iter().filter(|x| x.cmd == "group_path") {
+        if x.default {
+            return Err("group_path -default: not modelled".into());
+        }
+        let Some(name) = &x.name else { return Err("group_path without -name: not modelled".into()) };
+        if let Some(f) = x.flags.first() {
+            return Err(format!("group_path {f}: not modelled"));
+        }
+        if let Some((f, _)) = x.args.iter().find(|(f, _)| f != "-from" && f != "-to" && f != "-through") {
+            return Err(format!("group_path {f}: not modelled"));
+        }
+        if out.iter().any(|g| g.group.as_deref() == Some(name.as_str())) {
+            return Err(format!("group_path -name {name} twice: not modelled (the reference merges them)"));
+        }
+        let thrus = x.args.iter().filter(|(f, _)| f == "-through").map(|(_, o)| thru_point("group_path", o, nl, &pins)).collect::<Result<Vec<_>, _>>()?;
+        let side = |flag: &str| -> Result<(Vec<String>, bool), String> {
+            let (mut names, mut clock) = (Vec::new(), false);
+            for (_, o) in x.args.iter().filter(|(f, _)| f == flag) {
+                let items = if o.accessor == "list" { o.items.iter().collect::<Vec<_>>() } else { vec![o] };
+                for o in items {
+                    match o.accessor.as_str() {
+                        "get_ports" => {
+                            for n in &o.names {
+                                names.extend(nl.ports.iter().map(|(p, _)| p).filter(|p| vyges_loom::sdc::object_matches(n, p)).cloned());
+                            }
+                        }
+                        "get_pins" => {
+                            for n in &o.names {
+                                names.extend(pins.iter().filter(|p| vyges_loom::sdc::object_matches(n, p)).cloned());
+                            }
+                        }
+                        "all_inputs" | "all_outputs" => {
+                            let sources: std::collections::HashSet<&str> = s.clocks.iter().flat_map(|c| c.sources.iter().map(String::as_str)).collect();
+                            names.extend(port_collection(&o.accessor, &o.flags, &nl.ports, &sources).map_err(|f| format!("group_path {flag} [{} {f}]: not modelled", o.accessor))?);
+                        }
+                        "get_clocks" if s.clocks.len() == 1 && o.names.iter().all(|n| vyges_loom::sdc::object_matches(n, &s.clocks[0].name)) => clock = true,
+                        other => return Err(format!("group_path {flag} [{other} {}]: not modelled (ports, pins or the one clock are)", o.names.join(" "))),
+                    }
+                }
+            }
+            names.dedup();
+            let given = x.args.iter().any(|(f, _)| f == flag);
+            if given && names.is_empty() && !clock {
+                return Err(format!("group_path -name {name} {flag}: matches nothing: not modelled"));
+            }
+            Ok((names, clock))
+        };
+        let (from_pins, from_clock) = side("-from")?;
+        let (to_pins, to_clock) = side("-to")?;
+        if from_pins.is_empty() && !from_clock && to_pins.is_empty() && !to_clock && thrus.is_empty() {
+            return Err(format!("group_path -name {name} with no -from / -through / -to: not modelled"));
+        }
+        out.push(crate::sdc::PathDelay {
+            from_pins,
+            from_clock,
+            to_pins,
+            to_clock,
+            min_max: MAX,
+            ignore_clk_latency: false,
+            break_path: false,
+            delay: 0.0,
+            false_path: false,
+            multicycle: None,
+            thrus,
+            group: Some(name.clone()),
+        });
     }
     Ok(out)
 }
@@ -1459,6 +1547,7 @@ pub fn path_delays(s: &vyges_loom::sdc::Sdc, nl: Option<&Netlist>, time_scale: f
             false_path: false,
             multicycle: None,
             thrus,
+            group: None,
         });
     }
     if out.len() > 1 {
@@ -1564,6 +1653,36 @@ mod tests {
         }
         assert_eq!(read("set_drive 1 [get_ports a]").unwrap_err(), "set_drive (kept as written): not modelled by this timer");
         assert_eq!(read("set_max_area 0\nset_operating_conditions typ").unwrap_err(), "set_operating_conditions (kept as written): not modelled by this timer");
+    }
+
+    /// Rules (`Sdc::makeGroupPath`, `group_path` in the reference's `sdc/Sdc.tcl`): a named group
+    /// path is one exception of every min/max, its sides ports, pins or `[list …]` of them; the
+    /// ids across it and the other exceptions are the order they were made in, which the file may
+    /// not keep, so it is refused beside them. `-weight` is read and ignored; `-default`, a second
+    /// group of one name (merged by `addException`), a side matching nothing and
+    /// `set_path_margin` are refused.
+    #[test]
+    fn a_group_path_is_one_exception_of_every_min_max() {
+        let d = vyges_loom::netlist::parse_compact("module t (a, y); input a; output y; BUF b (.A(a), .X(y)); endmodule\n").unwrap();
+        let nl = netlist(&d, &[lib()]).unwrap();
+        let read = |lines: &str| {
+            let s = vyges_loom::sdc::Sdc::parse(&format!("create_clock -name c -period 2\n{lines}\n")).unwrap();
+            constraints_with(&s, &nl, &[lib()], None).map(|(sdc, _, _)| sdc.path_delays)
+        };
+        let g = read("group_path -name g -weight 2 -from [all_inputs -no_clocks] -to [list [get_pins b/A] [get_ports y]]").unwrap();
+        assert_eq!(g.len(), 1);
+        assert_eq!((g[0].group.as_deref(), &g[0].from_pins, &g[0].to_pins), (Some("g"), &vec!["a".to_string()], &vec!["b/A".to_string(), "y".to_string()]));
+        assert!(!g[0].is_path_delay() && !g[0].false_path && g[0].multicycle.is_none());
+        for (lines, why) in [
+            ("group_path -default -to [get_ports y]", "group_path -default: not modelled"),
+            ("group_path -name g -to [get_ports y]\ngroup_path -name g -from [get_ports a]", "twice"),
+            ("group_path -name g -to [get_ports nope]", "matches nothing"),
+            ("set_path_margin 0.1 -to [get_ports y]", "set_path_margin"),
+            ("set_false_path -from [get_ports a]\ngroup_path -name g -to [get_ports y]", "the ids across them"),
+        ] {
+            let e = read(lines).unwrap_err();
+            assert!(e.contains(why), "{lines}: {e}");
+        }
     }
 
     /// Rule (`set_clock_uncertainty` in the reference's `sdc/Sdc.tcl`): `-setup` alone sets the

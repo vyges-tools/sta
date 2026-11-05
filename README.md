@@ -82,7 +82,8 @@ commands): kept and written back, not applied (no slack moves with it)`), any ot
 - `create_generated_clock` of a propagated master, or itself propagated (its source latency is
   the master's arrival through the circuit), or whose master is not defined on its `-source` pin
 - `set_disable_timing`, `set_sense` / `set_clock_sense`, `set_disable_clock_gating_check`
-- `group_path`, `set_path_margin`
+- `set_path_margin`; `group_path -default`, two `group_path`s of one name, and `group_path` in a
+  file that also has false, multicycle or delay paths (their ids are the order they were made in)
 - exceptions given `-rise_through` / `-fall_through`, from or to a clock with several clocks
   defined, on an internal pin, or on a design with latches; multicycle paths on a design with
   gated-clock checks
