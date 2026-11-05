@@ -107,6 +107,17 @@ fn set_false_path_removes_the_path() {
     assert_eq!(slack(&with, "r2/D"), None, "{with:?}");
 }
 
+/// `group_path`: no slack moves; the group's path ends are reported, its endpoints only.
+#[test]
+fn group_path_groups_the_ends_it_names() {
+    let (without, with) = moves("group_path -name rr -from [get_pins r1/CLK] -to [get_pins {r2/D r3/D}]");
+    let slacks = |l: &[String]| l.iter().filter(|x| !x.starts_with("group ")).cloned().collect::<Vec<_>>();
+    assert_eq!(slacks(&with), slacks(&without), "no slack moves with a group");
+    let groups: Vec<&String> = with.iter().filter(|x| x.starts_with("group ")).collect();
+    assert_eq!(groups.len(), 1, "r1 reaches r2/D only (r3 has no clock): {groups:?}");
+    assert!(groups[0].starts_with("group rr 000000 r2/D "), "{groups:?}");
+}
+
 /// `set_input_delay`: a path from the port starts at the delay after the clock edge.
 #[test]
 fn set_input_delay_times_the_port() {

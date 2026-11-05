@@ -1533,6 +1533,13 @@ impl<'g, 'a> Search<'g, 'a> {
         }
     }
 
+    /// Whether the vertex's clocked path ends have a target clock: an output delay at the port or a
+    /// timing check at the pin (`visitOutputDelayEnd` / `visitCheckEnd`), not a path delay alone.
+    pub(crate) fn has_target_clock(&self, v: usize) -> bool {
+        let name = &self.graph.vertices[v].name;
+        (self.graph.is_port(v) && self.output_delay.get(name).is_some_and(|d| !d.is_empty())) || self.graph.in_edges[v].iter().any(|&e| self.is_check(e))
+    }
+
     /// The endpoint's path ends: an output delay end if the port has one, else a check end —
     /// setup for a max path, hold for a min path.
     fn visit_path_ends(&self, v: usize, req: &mut [f32]) {

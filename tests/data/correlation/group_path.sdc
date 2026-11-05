@@ -1,0 +1,8 @@
+create_clock -name clk_i -period 2.5 [get_ports {clk_i}]
+set_input_delay 0.4 -clock clk_i [all_inputs]
+set_output_delay 0.6 -clock clk_i [all_outputs]
+group_path -name reg2reg -from [get_pins {*/CLK}] -to [list [get_pins {_29*_/D}] [get_pins {_30*_/D}]]
+group_path -name in2reg -from [get_ports {tl_i[*] intr_src_i[*]}] -to [get_pins {*/D}]
+group_path -name to_tl -to [get_ports {tl_o[*]}]
+group_path -name reg2out -weight 2 -from [get_pins {*/CLK}] -to [get_ports {tl_o[*] irq_o}]
+group_path -name thru_net -through [get_nets {_0930_}]

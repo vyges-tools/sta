@@ -67,6 +67,7 @@ Each command lands in exactly one of three groups.
 | `set_false_path` | `-from` / `-to` ports and pins, `-through` pins, ports, nets and cells, `-setup` / `-hold` |
 | `set_multicycle_path` | `-setup` / `-hold`, `-start` / `-end`, `-through` as for false paths |
 | `set_timing_derate` | design-wide: `-early` / `-late`, cell delay, net delay, cell check, clock and data |
+| `group_path` | `-name` with `-from` / `-to` ports, pins or the clock, `-through` as for false paths; no slack moves with it — each group's path ends are reported (`path_group::group_path_ends`) |
 | `set_case_analysis` | `0`, `1`, `zero`, `one`, `rising`, `falling`, on pins and ports (read with `load::design`) |
 | `set_logic_zero`, `set_logic_one`, `set_logic_dc` | on pins and ports (read with `load::design`) |
 
@@ -113,6 +114,7 @@ refuses such a design rather than time it without them.
 - `sdc`, `search` — clocks and constraints; arrivals, requireds, slacks.
 - `incr` — the timer's state across edits, each update doing the reference's incremental work.
 - `path_enum` — the k worst paths to one endpoint.
+- `path_group` — which `group_path` a path end is in, and a group's path ends, worst first.
 - `power` — switching activity and instance power.
 - `fuzzy` — the tolerant comparison every merge uses.
 - `load` (feature `loom`) — a design read by [loom](https://github.com/vyges-tools/loom)

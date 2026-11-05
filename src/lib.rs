@@ -33,6 +33,7 @@ pub mod load;
 pub mod netlist;
 pub mod parasitics;
 pub mod path_enum;
+pub mod path_group;
 pub mod power;
 pub mod sdc;
 pub mod search;

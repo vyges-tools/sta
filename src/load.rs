@@ -897,6 +897,9 @@ pub struct Timing {
     pub tns: f32,
     /// `(pin, slack)` in vertex order; a pin no constrained path reaches has none
     pub pin_slacks: Vec<(String, f32)>,
+    /// Per `group_path -name`, in id order: the group's path ends, worst first, as `(pin, slack)`
+    /// ([`crate::search::Search::group_path_ends`], every end, no slack limit).
+    pub group_ends: Vec<(String, Vec<(String, f32)>)>,
 }
 
 impl Timing {
@@ -914,6 +917,10 @@ impl Timing {
         };
         let mut out = vec![format!("worst {:.6}", user(self.wns)), format!("tns {:.6}", user(self.tns))];
         out.extend(self.pin_slacks.iter().map(|(pin, slack)| format!("slack {pin} {:.6}", user(*slack))));
+        // `find_timing_paths -path_group g -sort_by_slack`: `group <g> <k> <endpoint> <slack>`
+        for (g, ends) in &self.group_ends {
+            out.extend(ends.iter().enumerate().map(|(k, (pin, slack))| format!("group {g} {k:06} {pin} {:.6}", user(*slack))));
+        }
         out
     }
 }
@@ -964,7 +971,17 @@ pub fn time_design_with(libs: &[Library], nl: &Netlist, sdc: &crate::sdc::Sdc, e
             (slack < crate::search::INF).then(|| (g.vertices[v].name.clone(), slack))
         })
         .collect();
-    Ok(Timing { wns, tns, pin_slacks })
+    let group_ends = sdc
+        .path_delays
+        .iter()
+        .filter_map(|pd| pd.group.clone())
+        .map(|name| {
+            let ends = s.group_path_ends(&name, mm, usize::MAX, -crate::search::INF, crate::search::INF);
+            let ends = ends.into_iter().map(|e| (g.vertices[e.vertex].name.clone(), e.slack)).collect();
+            (name, ends)
+        })
+        .collect();
+    Ok(Timing { wns, tns, pin_slacks, group_ends })
 }
 
 /// `network_->findLibertyCell(name)`: the first library that has the name.
