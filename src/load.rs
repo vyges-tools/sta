@@ -402,6 +402,8 @@ fn constraints_with(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library], co
     // derates too: onto the graph below (`late_derate` / `early_derate` are their projection)
     let derates = timing_derates(&std::mem::take(&mut s.derates))?;
     (s.late_derate, s.early_derate) = (None, None);
+    // group paths after the false paths below (the search's reader would read them first)
+    let group_cmds = std::mem::take(&mut s.other_exceptions);
     let mut sdc = search_sdc_on(&s, nl, lib0.time_scale, false, false)?;
     clock_uncertainties(&uncertainties, &mut sdc.clocks, lib0.time_scale)?;
     clock_groups(&groups, &mut sdc.clocks)?;
@@ -411,7 +413,7 @@ fn constraints_with(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library], co
         return Err("set_false_path / set_multicycle_path with set_max_delay / set_min_delay: not modelled (the ids across them are the order they were made in)".into());
     }
     sdc.path_delays.extend(falses);
-    let groups = group_paths(&s.other_exceptions, &s, nl)?;
+    let groups = group_paths(&group_cmds, &s, nl)?;
     if !groups.is_empty() && !sdc.path_delays.is_empty() {
         return Err("group_path with set_false_path / set_multicycle_path / set_max_delay / set_min_delay: not modelled (the ids across them are the order they were made in)".into());
     }
@@ -1505,11 +1507,22 @@ fn search_sdc_with(
             })
             .collect()
     };
+    // `group_path -name` (read as [`constraints`] reads it): its pins are the netlist's, so a
+    // search without one refuses it; beside a path delay the ids across them are the order they
+    // were made in, which the file may not keep.
+    let mut pds = path_delays(s, nl, time_scale)?;
+    if s.other_exceptions.iter().any(|x| x.cmd == "group_path") {
+        let nl = nl.ok_or("group_path without the netlist: not modelled")?;
+        if !pds.is_empty() {
+            return Err("group_path with set_max_delay / set_min_delay: not modelled (the ids across them are the order they were made in)".into());
+        }
+        pds.extend(group_paths(&s.other_exceptions, s, nl)?);
+    }
     Ok(crate::sdc::Sdc {
         clocks,
         input_delays: inputs(&delays[0])?,
         output_delays: outputs(&delays[1])?,
-        path_delays: path_delays(s, nl, time_scale)?,
+        path_delays: pds,
     })
 }
 
@@ -1774,6 +1787,21 @@ mod tests {
         assert_eq!(cut("set_clock_groups -asynchronous -group {a} -group {nope}\n"), vec![vec![1, 2], vec![0], vec![0]]);
         assert_eq!(cut("set_clock_groups -asynchronous -allow_paths -group {a} -group {b}\n"), vec![Vec::<usize>::new(); 3]);
         assert_eq!(cut("set_clock_groups -name g -asynchronous -group {a} -group {b}\nset_clock_groups -name g -asynchronous -allow_paths -group {a} -group {b}\n"), vec![Vec::<usize>::new(); 3]);
+    }
+
+    /// Rule (`Sdc::makeGroupPath` on the repair's timer, as [`constraints`] reads it): the
+    /// search's constraints carry each named group too — read against the netlist, so the
+    /// netlist-less reader refuses it — and refuse it beside a path delay (creation-order ids).
+    #[test]
+    fn the_search_constraints_carry_a_group_path() {
+        let nl = netlist(&vyges_loom::netlist::parse_compact("module t (a, y); input a; output y; BUF b (.A(a), .X(y)); endmodule\n").unwrap(), &[lib()]).unwrap();
+        let sdc = |t: &str| vyges_loom::sdc::Sdc::parse(&format!("create_clock -name c -period 2\n{t}\n")).unwrap();
+        let g = search_sdc_on(&sdc("group_path -name reg2out -from [get_ports a] -to [get_ports y]"), &nl, 1e-9, false, false).unwrap();
+        assert_eq!(g.path_delays.len(), 1);
+        assert_eq!((g.path_delays[0].group.as_deref(), &g.path_delays[0].to_pins), (Some("reg2out"), &vec!["y".to_string()]));
+        assert!(search_sdc(&sdc("group_path -name g -to [get_ports y]"), 1e-9, false, false).unwrap_err().contains("without the netlist"));
+        let e = search_sdc_on(&sdc("set_max_delay 1 -from [get_pins b/A] -to [get_pins b/X]\ngroup_path -name g -to [get_ports y]"), &nl, 1e-9, false, false).unwrap_err();
+        assert!(e.contains("the ids across them"), "{e}");
     }
 
     /// Rules (`Sdc::setClockLatency(clk, nullptr, …)`): a latency on clocks is the clock's own,
