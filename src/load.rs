@@ -662,16 +662,31 @@ fn clock_uncertainties(us: &[vyges_loom::sdc::ClockUncertainty], clocks: &mut [c
 }
 
 /// Every connected instance pin, `inst/port`, in net order: what `get_pins` patterns match.
-fn connected_pins(nl: &Netlist) -> Vec<String> {
-    let mut pins: Vec<String> = Vec::new();
+fn connected_pins(nl: &Netlist) -> ConnectedPins<'_> {
+    let mut pins = ConnectedPins { insts: nl.insts.iter().map(|i| i.0.as_str()).collect(), at: Vec::new(), names: Vec::new() };
     for net in &nl.nets {
         for c in &net.pins {
             if let Conn::Inst(i, port) = c {
-                pins.push(format!("{}/{port}", nl.insts[*i].0));
+                pins.at.push((*i, port.as_str()));
+                pins.names.push(format!("{}/{port}", nl.insts[*i].0));
             }
         }
     }
     pins
+}
+
+/// The instance pins on nets, in net order: `(instance, port)` and the pin's name.
+struct ConnectedPins<'n> {
+    insts: Vec<&'n str>,
+    at: Vec<(usize, &'n str)>,
+    names: Vec<String>,
+}
+
+impl ConnectedPins<'_> {
+    /// `get_pins <pattern>` ([`vyges_loom::sdc::pins_matching`]): the pins' names, in net order.
+    fn matching(&self, pattern: &str) -> Vec<String> {
+        vyges_loom::sdc::pins_matching(pattern, &self.insts, &self.at).into_iter().map(|j| self.names[j].clone()).collect()
+    }
 }
 
 /// Every `set_false_path` (`FalsePath`) and `set_multicycle_path` (`MultiCyclePath`) as the
@@ -711,7 +726,7 @@ fn timing_exceptions(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc
                     }
                     "get_pins" => {
                         for n in &o.names {
-                            names.extend(pins.iter().filter(|p| vyges_loom::sdc::object_matches(n, p)).cloned());
+                            names.extend(pins.matching(n));
                         }
                     }
                     "get_clocks" if s.clocks.len() == 1 && o.names.iter().all(|n| vyges_loom::sdc::object_matches(n, &s.clocks[0].name)) => clock = true,
@@ -819,7 +834,7 @@ fn group_paths(xs: &[vyges_loom::sdc::ExceptionCmd], s: &vyges_loom::sdc::Sdc, n
                         }
                         "get_pins" => {
                             for n in &o.names {
-                                names.extend(pins.iter().filter(|p| vyges_loom::sdc::object_matches(n, p)).cloned());
+                                names.extend(pins.matching(n));
                             }
                         }
                         "all_inputs" | "all_outputs" => {
@@ -864,12 +879,12 @@ fn group_paths(xs: &[vyges_loom::sdc::ExceptionCmd], s: &vyges_loom::sdc::Sdc, n
 /// One `-through` point (`ExceptionThru`): `get_pins` and `get_ports` are its pins, `get_nets` its
 /// nets, `get_cells` its instances, patterns matched against the netlist. Bare names (no finder),
 /// and a point that matches nothing, are refused.
-fn thru_point(cmd: &str, o: &vyges_loom::sdc::Objects, nl: &Netlist, pins: &[String]) -> Result<crate::sdc::Thru, String> {
+fn thru_point(cmd: &str, o: &vyges_loom::sdc::Objects, nl: &Netlist, pins: &ConnectedPins<'_>) -> Result<crate::sdc::Thru, String> {
     let mut t = crate::sdc::Thru::default();
     let hit = |n: &str, x: &str| vyges_loom::sdc::object_matches(n, x);
     for n in &o.names {
         match o.accessor.as_str() {
-            "get_pins" => t.pins.extend(pins.iter().filter(|p| hit(n, p)).cloned()),
+            "get_pins" => t.pins.extend(pins.matching(n)),
             "get_ports" => t.pins.extend(nl.ports.iter().map(|(p, _)| p).filter(|p| hit(n, p)).cloned()),
             "get_nets" => t.nets.extend(nl.nets.iter().map(|x| &x.name).filter(|x| hit(n, x)).cloned()),
             "get_cells" => t.insts.extend(nl.insts.iter().map(|x| &x.0).filter(|x| hit(n, x)).cloned()),
