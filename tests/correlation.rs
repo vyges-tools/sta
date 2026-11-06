@@ -73,6 +73,40 @@ fn the_constant_tied_variant_matches_the_reference_line_for_line() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
+/// A small case of its own (`tests/data/<dir>`: `<netlist>`, `base.sdc`, the library given) against
+/// its `base.golden` / `base.hold.golden`; the mismatches.
+fn small_case(dir: &str, lib: &str, netlist: &str) -> Vec<String> {
+    let c = format!("{}/tests/data/{dir}/", env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(lib).expect("the library is in the repository");
+    let libs = vec![Library::read(&vyges_sta::liberty_parse::parse(&text).expect("parses")).expect("reads")];
+    let design = vyges_loom::netlist::load_compact(&format!("{c}{netlist}")).expect("the netlist reads");
+    let d = vyges_sta::load::design(&design, &libs).expect("every construct maps");
+    let sdc_text = std::fs::read_to_string(format!("{c}base.sdc")).expect("the constraints are in the repository");
+    let sdc = vyges_loom::sdc::Sdc::parse_with(&sdc_text, &vyges_sta::load::sdc_design(&d.netlist, &libs)).expect("the constraints read");
+    let mut failed = Vec::new();
+    for (mm, file) in [(vyges_sta::liberty::MAX, "base.golden"), (vyges_sta::liberty::MIN, "base.hold.golden")] {
+        let (search_sdc, env, _notes) = vyges_sta::load::design_constraints(&sdc, &d, &libs).expect("every constraint maps");
+        let t = vyges_sta::load::time_design_for(&libs, &d.netlist, &search_sdc, env, mm).expect("the design times");
+        let mut ours = t.report_lines(libs[0].time_scale);
+        ours.sort();
+        let golden: Vec<String> = std::fs::read_to_string(format!("{c}{file}")).expect("the golden is in the repository").lines().map(String::from).collect();
+        if ours != golden {
+            failed.push(format!("{dir}/{file}: golden {golden:?}\nours {ours:?}"));
+        }
+    }
+    failed
+}
+
+/// The partial-cond-arc rule (`tests/data/icg`: `Sim::isDisabledCond` → `arcEdgesMatch`, OpenSTA
+/// fdb00f48 / c2f099ca): ICG's true `when` sets have the fall arc alone, so the default CLK->GCLK
+/// set stays enabled and the registers behind both gates are clocked — before the rule, r1/D and
+/// r2/D had no slack.
+#[test]
+fn a_partial_cond_arc_set_leaves_the_default_arc_timed_as_the_reference_does() {
+    let failed = small_case("icg", concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/icg/icg.lib"), "icg.v");
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// The same netlist with every net's RC network read from a SPEF (`tests/data/spef`, `spef-gen.py`:
 /// RC trees, coupling caps, corner triplets, loop and self resistors, a name map), as the
 /// reference's `read_spef` reads it.

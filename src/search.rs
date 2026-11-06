@@ -498,7 +498,15 @@ fn sim_edges(graph: &Graph<'_>) -> SimEdges {
         let cond_is = |c: &str, want: bool| -> Result<bool, String> { Ok(parse(c).map(|f| eval_exact(&f, &fixed)).transpose()?.flatten() == Some(want)) };
         let disabled = match arc_set.cond.as_deref() {
             Some(c) => cond_is(c, false),
-            None => cell.arc_sets.iter().filter(|o| o.from == arc_set.from && o.to == arc_set.to).filter_map(|o| o.cond.as_deref()).try_fold(false, |d, c| Ok::<bool, String>(d || cond_is(c, true)?)),
+            // A true conditional set disables the default set only when it has an arc to every
+            // output edge the default set has (`arcEdgesMatch`: asap7's ICG conditional
+            // CLK->GCLK set has the fall arc alone, and the rise arc stays timed).
+            None => cell
+                .arc_sets
+                .iter()
+                .filter(|o| o.from == arc_set.from && o.to == arc_set.to && arc_edges_match(arc_to_edges(arc_set), arc_to_edges(o)))
+                .filter_map(|o| o.cond.as_deref())
+                .try_fold(false, |d, c| Ok::<bool, String>(d || cond_is(c, true)?)),
         };
         match disabled {
             Ok(d) => sim.disabled_cond[e] = d,
@@ -508,6 +516,17 @@ fn sim_edges(graph: &Graph<'_>) -> SimEdges {
         }
     }
     sim
+}
+
+/// The output edges (rise, fall) an arc set has an arc to (`TimingArcSet::arcTo(rf)`).
+fn arc_to_edges(set: &crate::liberty::ArcSet) -> [bool; 2] {
+    [0, 1].map(|rf| set.arcs.iter().any(|a| a.to_rf == rf))
+}
+
+/// `arcEdgesMatch` (OpenSTA fdb00f48, c2f099ca): the conditional set has an arc to every output
+/// edge the default set has one to.
+fn arc_edges_match(default_to: [bool; 2], cond_to: [bool; 2]) -> bool {
+    (0..2).all(|rf| !default_to[rf] || cond_to[rf])
 }
 
 fn is_check_role(r: Role) -> bool {
@@ -2084,6 +2103,30 @@ fn port_delays(list: &[PortDelay]) -> HashMap<String, Vec<usize>> {
 
 #[cfg(test)]
 mod tests {
+    /// Upstream rule (`Sim::isDisabledCond` → `arcEdgesMatch`, OpenSTA fdb00f48 / c2f099ca at
+    /// cc9027d6): a true `when` set disables the default set only when it has an arc to each output
+    /// edge the default set has; asap7's ICG conditional CLK->GCLK set (fall only) leaves the
+    /// default rise arc timed.
+    #[test]
+    fn a_true_cond_set_disables_the_default_only_when_it_covers_its_edges() {
+        use super::{arc_edges_match, arc_to_edges};
+        assert!(arc_edges_match([true, true], [true, true]));
+        assert!(!arc_edges_match([true, true], [false, true]), "the ICG case: fall only");
+        assert!(arc_edges_match([false, true], [false, true]));
+        assert!(arc_edges_match([false, true], [true, true]), "a superset covers");
+        assert!(!arc_edges_match([true, false], [false, true]));
+        let set = |rfs: &[usize]| crate::liberty::ArcSet {
+            from: "CLK".into(),
+            to: "GCLK".into(),
+            role: crate::liberty::Role::Combinational,
+            timing_type: "combinational".into(),
+            cond: None,
+            arcs: rfs.iter().map(|&rf| crate::liberty::Arc { from_rf: rf, to_rf: rf, model: crate::liberty::Model::Check(crate::table::Table { axes: vec![], values: vec![0.0] }) }).collect(),
+        };
+        assert_eq!(arc_to_edges(&set(&[1])), [false, true]);
+        assert_eq!(arc_to_edges(&set(&[0, 1])), [true, true]);
+    }
+
     use super::*;
     use crate::liberty::{Library, FALL, RISE};
     use crate::netlist::{Conn, Net, Netlist, PortDir};

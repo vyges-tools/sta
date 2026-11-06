@@ -952,7 +952,10 @@ impl Timing {
                 u
             }
         };
-        let mut out = vec![format!("worst {:.6}", user(self.wns)), format!("tns {:.6}", user(self.tns))];
+        // The worst slack with no constrained path is the reference's `INF` (`INF` = 1e30:
+        // `report_worst_slack` prints that delay by name), not the scaled value.
+        let worst = if self.wns >= crate::search::INF_SLACK { "INF".to_string() } else if self.wns <= -crate::search::INF_SLACK { "-INF".to_string() } else { format!("{:.6}", user(self.wns)) };
+        let mut out = vec![format!("worst {worst}"), format!("tns {:.6}", user(self.tns))];
         out.extend(self.pin_slacks.iter().map(|(pin, slack)| format!("slack {pin} {:.6}", user(*slack))));
         // `find_timing_paths -path_group g -sort_by_slack`: `group <g> <k> <endpoint> <slack>`
         for (g, ends) in &self.group_ends {
