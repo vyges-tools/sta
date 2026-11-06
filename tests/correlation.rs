@@ -107,6 +107,15 @@ fn a_partial_cond_arc_set_leaves_the_default_arc_timed_as_the_reference_does() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
+/// CRPR's common pin (`tests/data/crpr`: `CheckCrpr::findCrpr`, OpenSTA 9ef4b4f0, no levels): the
+/// capture clock path backed up to the first pin the launch path has, credited whatever the two
+/// transitions there (`same_pin`, the default) — an inverted capture is credited too.
+#[test]
+fn the_crpr_credit_is_taken_at_the_first_common_pin_as_the_reference_does() {
+    let failed = small_case("crpr", &format!("{D}sky130_fd_sc_hd__tt_025C_1v80.lib"), "crpr.v");
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// The same netlist with every net's RC network read from a SPEF (`tests/data/spef`, `spef-gen.py`:
 /// RC trees, coupling caps, corner triplets, loop and self resistors, a name map), as the
 /// reference's `read_spef` reads it.

@@ -1,0 +1,23 @@
+slack b0/A 0.458861
+slack b0/X 0.458861
+slack clk 0.458861
+slack d 1.991391
+slack i0/A 0.458861
+slack i0/Y 0.458861
+slack q2 0.458861
+slack q3 1.496756
+slack r1/CLK 0.495898
+slack r1/D 1.991391
+slack r1/Q 0.495898
+slack r1/RESET_B 2.320318
+slack r2/CLK 0.458861
+slack r2/D 0.495898
+slack r2/Q 0.458861
+slack r2/RESET_B 1.352158
+slack r3/CLK 1.496756
+slack r3/D 1.461564
+slack r3/Q 1.496756
+slack r3/RESET_B 2.320318
+slack rst_n 1.352158
+tns 0.000000
+worst 0.458861

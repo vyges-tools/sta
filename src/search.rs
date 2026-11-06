@@ -16,8 +16,8 @@
 //!   a path's slack is `required − arrival` (max);
 //! - a clock tag entering a register clock pin over an arc whose min and max delays are fuzzily
 //!   equal records the DRIVING path as its CRPR clock path, and a clock-to-Q launch keeps it — so launched data tags are distinguished by the clock net's driver, not by each flop;
-//! - a setup check's required gains the CRPR credit: the launch and capture clock paths backed up
-//!   (deeper first, by level) to their common pin, the smaller of the two `|max − min|` there.
+//! - a setup check's required gains the CRPR credit: the capture clock path backed up to the first
+//!   pin the launch clock path has (either transition), the smaller of the two `|max − min|` there.
 
 use std::collections::HashMap;
 
@@ -165,8 +165,6 @@ pub struct Search<'g, 'a> {
     output_delay: HashMap<String, Vec<usize>>,
     /// A vertex whose out-edges include a clock-to-Q arc.
     is_reg_clk: Vec<bool>,
-    /// `Levelize`: roots 0, else the longest fanin level + 1 over non-check edges.
-    level: Vec<usize>,
     /// `Sdc::isPathDelayInternalFrom` / `…FromBreak` / `…To` / `…ToBreak`: a path delay's
     /// `-from` pin that is not an exception startpoint (a top input or a register clock pin), its
     /// `-to` pin with no timing check that is not a top port; "break" unless `-probe`.
@@ -553,18 +551,6 @@ impl<'g, 'a> Search<'g, 'a> {
         }
         let input_delay = port_delays(&sdc.input_delays);
         let output_delay = port_delays(&sdc.output_delays);
-        let mut level = vec![0usize; n];
-        if let Ok(order) = graph.topo_order() {
-            for v in order {
-                for &e in &graph.out_edges[v] {
-                    let to = graph.edges[e].to;
-                    let check = matches!(graph.edges[e].kind, EdgeKind::Gate { set } if is_check_role(graph.arc_set(e, set).role));
-                    if !check {
-                        level[to] = level[to].max(level[v] + 1);
-                    }
-                }
-            }
-        }
         let (mut internal_from, mut internal_from_break, mut internal_to, mut internal_to_break) = (vec![false; n], vec![false; n], vec![false; n], vec![false; n]);
         if !sdc.path_delays.is_empty() {
             // the graph's own name index (built once; the last vertex of a repeated name, as a
@@ -594,7 +580,7 @@ impl<'g, 'a> Search<'g, 'a> {
         let (latch_en, latch_data) = latch_enables(graph);
         let clk_network = clock_network(graph, sdc);
         let clock_leaf = graph.vertices.iter().map(|v| sdc.clocks.iter().any(|c| !c.source.is_empty() && v.name == c.source)).collect();
-        let mut search = Search { graph, sdc, paths: vec![Vec::new(); n], vertex_id, input_delay, output_delay, is_reg_clk, level, internal_from, internal_from_break, internal_to, internal_to_break, sim, latch_en, latch_data, clk_network, clock_leaf, gated: HashMap::new() };
+        let mut search = Search { graph, sdc, paths: vec![Vec::new(); n], vertex_id, input_delay, output_delay, is_reg_clk, internal_from, internal_from_break, internal_to, internal_to_break, sim, latch_en, latch_data, clk_network, clock_leaf, gated: HashMap::new() };
         search.gated = search.gated_clk_enables();
         search
     }
@@ -1969,10 +1955,10 @@ impl<'g, 'a> Search<'g, 'a> {
     }
 
     /// The check CRPR for a data path ending at a check against the target clock path
-    /// `tgt` (at `tgt_v`): from the data tag's CRPR clock path and the target clock path, back up
-    /// the deeper one (by level) until they meet; the credit is the smaller of the two
-    /// paths' `|max − min|` there. No common pin, or no CRPR clock path (a path from
-    /// an input): 0.
+    /// `tgt` (at `tgt_v`): the target clock path backed up to the first pin the data tag's CRPR
+    /// clock path also has, whatever the two transitions there (`same_pin`, the default crpr
+    /// mode); the credit is the smaller of the two paths' `|max − min|` there. No common pin, or
+    /// no CRPR clock path (a path from an input): 0.
     fn check_crpr(&self, path: &Path, tgt_v: usize, tgt: &Path) -> f32 {
         let Some(c) = path.tag.crpr else { return 0.0 };
         let Some(src) = self.crpr_clk_path(&c) else { return 0.0 };
@@ -1982,21 +1968,23 @@ impl<'g, 'a> Search<'g, 'a> {
         if src.tag.mm == tgt.tag.mm || !self.propagated(se) || !self.propagated(te) || se / 2 != te / 2 {
             return 0.0;
         }
-        let (mut sv, mut sp) = (c.vertex, src);
-        let (mut tv, mut tp) = (tgt_v, tgt);
-        let (mut sl, mut tl) = (self.level[sv], self.level[tv]);
-        while sv != tv {
-            let diff = sl as i64 - tl as i64;
-            if diff >= 0 {
-                let Some((v, p)) = self.prev_path(sp) else { return 0.0 };
-                (sv, sp, sl) = (v, p, self.level[v]);
-            }
-            if diff <= 0 {
-                let Some((v, p)) = self.prev_path(tp) else { return 0.0 };
-                (tv, tp, tl) = (v, p, self.level[v]);
-            }
+        // `findCrpr` (OpenSTA 9ef4b4f0: no levels): every pin of the source clock path, then the
+        // target clock path backed up to the first pin the source path has.
+        let mut src_pins: HashMap<&str, (usize, &Path)> = HashMap::new();
+        let mut at = Some((c.vertex, src));
+        while let Some((v, p)) = at {
+            src_pins.insert(self.graph.vertices[v].name.as_str(), (v, p));
+            at = self.prev_path(p);
         }
-        self.crpr_arrival_diff(sv, sp).min(self.crpr_arrival_diff(tv, tp))
+        let mut at = Some((tgt_v, tgt));
+        while let Some((tv, tp)) = at {
+            if let Some(&(sv, sp)) = src_pins.get(self.graph.vertices[tv].name.as_str()) {
+                // `sta_crpr_mode same_pin` (the default): the transitions need not agree there.
+                return self.crpr_arrival_diff(sv, sp).min(self.crpr_arrival_diff(tv, tp));
+            }
+            at = self.prev_path(tp);
+        }
+        0.0
     }
 
     /// `Sta::slack(vertex, rf, min_max)`: over the paths of that min/max (and transition, when
