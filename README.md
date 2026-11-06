@@ -20,7 +20,8 @@ The reference whose arithmetic this crate reproduces is OpenSTA, as the OpenROAD
 - Several clocks, each on one port or pin, ideal or propagated, with waveforms and pin network
   latency; virtual clocks for I/O delays.
 - Setup and hold requireds, recovery/removal, gated-clock checks, latches with time borrowing,
-  common-path pessimism removal (CRPR).
+  common-path pessimism removal (CRPR), which can be switched off for a run (as
+  `sta::set_crpr_enabled 0` does).
 - Input and output delays (min/max, rise/fall, `-add_delay`), input transitions, port and net
   loads, driving cells, a path delay (`set_max_delay` / `set_min_delay`).
 - Clock constraints: `set_clock_uncertainty` on clocks and between clocks,

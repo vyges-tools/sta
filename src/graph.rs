@@ -181,6 +181,10 @@ pub struct SdcEnv {
     /// The design-wide `set_timing_derate` factors (`DeratingFactorsGlobal`), where any is set.
     /// None: every factor 1.
     pub derates: Option<Box<DerateFactors>>,
+    /// `sta::set_crpr_enabled 0` (`Variables::crprEnabled` false; `repair_timing -skip_crpr` sets
+    /// it for the repair): CRPR is not active ([`crate::search::Search::crpr_active`]). Default
+    /// false — CRPR enabled, as the reference starts.
+    pub crpr_disabled: bool,
     /// `set_load` on a net (`setNetWireCap`), keyed — as `drvr_pin_wire_cap_map_` is — by each of
     /// the net's DRIVER pins when it was set: per min/max, the wire cap and `-subtract_pin_load`.
     pub net_wire_cap: HashMap<String, [Option<(f32, bool)>; 2]>,

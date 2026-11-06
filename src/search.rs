@@ -903,6 +903,14 @@ impl<'g, 'a> Search<'g, 'a> {
     }
 
     /// Whether clock edge `e`'s clock is propagated (`ClkInfo::isPropagated`).
+    /// `StaState::crprActive`: the analysis type is on-chip variation (the reference's default,
+    /// the only one modelled) AND CRPR is enabled ([`crate::graph::SdcEnv::crpr_disabled`]).
+    /// Inactive, no tag carries a CRPR clock path (`clkInfoWithCrprClkPath`, `thruClkInfo`, the
+    /// latch enable's in `latchOutArrival`), so no check gets a credit and nothing is pruned.
+    pub fn crpr_active(&self) -> bool {
+        !self.graph.sdc.crpr_disabled
+    }
+
     pub fn propagated(&self, e: usize) -> bool {
         self.sdc.clocks.get(e / 2).is_some_and(|c| c.propagated)
     }
@@ -1011,7 +1019,8 @@ impl<'g, 'a> Search<'g, 'a> {
                 if !from.tag.is_clock || from.tag.clk_edge.is_none() {
                     return None;
                 }
-                let crpr = from.tag.crpr.or(Some(CrprPath { vertex: from_v, rf: from.tag.rf, mm, clk_edge: from.tag.clk_edge.unwrap() })).filter(|c| self.propagated(c.clk_edge));
+                // `clkInfoWithCrprClkPath`: only while CRPR is active
+                let crpr = from.tag.crpr.or(Some(CrprPath { vertex: from_v, rf: from.tag.rf, mm, clk_edge: from.tag.clk_edge.unwrap() })).filter(|c| self.crpr_active() && self.propagated(c.clk_edge));
                 // `fromRegClkTag`: the states of the path delays from the clock pin (or the
                 // clock), then `thruTag` over the clock-to-Q edge — no tag when a false path from
                 // the pin is complete there.
@@ -1039,7 +1048,7 @@ impl<'g, 'a> Search<'g, 'a> {
                 let from_is_reg_clk = self.is_reg_clk[from_v];
                 // `thruClkInfo`: the CRPR path set here is dropped again by `ClkInfo` for a clock
                 // that is not propagated.
-                let crpr = if (!to_is_clk && !from_is_reg_clk) || (self.is_reg_clk[to_v] && min_max_eq) {
+                let crpr = if self.crpr_active() && ((!to_is_clk && !from_is_reg_clk) || (self.is_reg_clk[to_v] && min_max_eq)) {
                     Some(CrprPath { vertex: from_v, rf: from.tag.rf, mm, clk_edge: from.tag.clk_edge.unwrap() })
                 } else {
                     from.tag.crpr
@@ -1791,7 +1800,7 @@ impl<'g, 'a> Search<'g, 'a> {
         }
         let delay = self.derated_delay(e, arc.index, false, MAX, MAX);
         let en_edge = en.tag.clk_edge.expect("a clock path");
-        let crpr = self.propagated(en_edge).then_some(CrprPath { vertex: en_v, rf: en.tag.rf, mm: en.tag.mm, clk_edge: en_edge });
+        let crpr = (self.crpr_active() && self.propagated(en_edge)).then_some(CrprPath { vertex: en_v, rf: en.tag.rf, mm: en.tag.mm, clk_edge: en_edge });
         let states = States(self.sdc.exception_from_states(&self.thru_pin(from_v, false), false, MAX).0 | self.sdc.exception_from_states(&self.thru_pin(en_v, false), true, MAX).0);
         let states = self.mutate_states(states, e, false, MAX)?;
         let tag = Tag { rf: arc.to_rf, mm: MAX, clk_edge: en.tag.clk_edge, is_clock: false, crpr, states, latency: en.tag.latency, segment_start: false };
@@ -2392,6 +2401,26 @@ mod tests {
             assert_eq!(q.tag.crpr.map(|c| c.vertex), Some(v("b1/X")));
             assert_eq!(q.tag.clk_edge, Some(RISE));
         });
+    }
+
+    /// Rule (`StaState::crprActive` = on-chip variation AND `crprEnabled`; `clkInfoWithCrprClkPath`
+    /// and `thruClkInfo` set a CRPR clock path only while it is active): with CRPR disabled
+    /// (`sta::set_crpr_enabled 0`, which `repair_timing -skip_crpr` does for the repair) neither
+    /// the clock tag nor the launched data tag carries one, on a propagated clock too.
+    #[test]
+    fn crpr_disabled_puts_no_crpr_path_on_any_tag() {
+        let (libs, netlist, sdc) = design();
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        g.find_delays(&HashMap::new(), None).unwrap();
+        g.sdc.crpr_disabled = true;
+        let mut s = Search::in_graph_order(&g, &sdc);
+        s.find_arrivals().unwrap();
+        s.find_requireds().unwrap();
+        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        assert!(sdc.clocks[0].propagated, "the fixture's clock is propagated");
+        assert_eq!(path(&s, v("f1/CLK"), RISE, true).tag.crpr, None);
+        assert_eq!(path(&s, v("f1/Q"), RISE, false).tag.crpr, None);
+        assert!(s.paths.iter().flatten().all(|p| p.tag.crpr.is_none()), "no tag anywhere");
     }
 
     /// Rule: `ClkInfo` keeps a CRPR clock path only for a PROPAGATED clock

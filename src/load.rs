@@ -477,7 +477,7 @@ fn clock_groups(cgs: &[vyges_loom::sdc::ClockGroups], clocks: &mut [crate::sdc::
 /// `-cell_delay`, `-cell_check`, `-net_delay`, and with none of them cell and net delays but NOT
 /// cell checks. A later command overwrites what it sets. The factor is the command's `float`.
 /// Objects (cells, instances, nets) are refused. None with no command.
-fn timing_derates(ds: &[vyges_loom::sdc::EnvCmd]) -> Result<Option<Box<crate::graph::DerateFactors>>, String> {
+pub fn timing_derates(ds: &[vyges_loom::sdc::EnvCmd]) -> Result<Option<Box<crate::graph::DerateFactors>>, String> {
     use crate::graph::{DERATE_CELL_CHECK, DERATE_CELL_DELAY, DERATE_CLK, DERATE_DATA, DERATE_NET_DELAY};
     use crate::liberty::{FALL, MAX, MIN, RISE};
     if ds.is_empty() {
