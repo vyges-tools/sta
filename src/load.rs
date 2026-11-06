@@ -258,8 +258,8 @@ fn is_pattern(name: &str) -> bool {
 }
 
 /// The constraints with every port pattern expanded to the ports it names ([`ports_matching`]):
-/// I/O delays, loads and input transitions, driving cells and clock sources. A PIN pattern is
-/// refused (pins are read by name only).
+/// I/O delays, loads and input transitions, driving cells and clock sources. Pin objects are
+/// found where they are read ([`pin_objects`]).
 fn expanded_ports(s: &vyges_loom::sdc::Sdc, nl: &Netlist, notes: &mut Vec<String>) -> Result<vyges_loom::sdc::Sdc, String> {
     let mut s = s.clone();
     for (list, cmd) in [(&mut s.input_delays, "set_input_delay"), (&mut s.output_delays, "set_output_delay")] {
@@ -277,10 +277,6 @@ fn expanded_ports(s: &vyges_loom::sdc::Sdc, nl: &Netlist, notes: &mut Vec<String
         if c.sources.iter().any(|x| is_pattern(x)) {
             c.sources = ports_matching(&c.sources, nl, "create_clock", notes);
         }
-    }
-    let pins = s.path_delays.iter().flat_map(|d| d.objects.iter().flat_map(|(_, o)| o.names.iter())).chain(s.clock_latencies.iter().flat_map(|l| l.objects.iter()));
-    if let Some(p) = pins.into_iter().find(|p| is_pattern(p)) {
-        return Err(format!("the pin pattern {p}: not modelled (pins are read by name)"));
     }
     Ok(s)
 }
@@ -689,6 +685,29 @@ impl ConnectedPins<'_> {
     }
 }
 
+/// The pins a `[get_pins …]` object names, as the netlist's pin names: each pattern found as the
+/// reference's SDC network finds it ([`ConnectedPins::matching`]: `out[1]$_DFF_P_/CLK` is the
+/// database's `out\[1\]$_DFF_P_/CLK`), in pattern order, each pin once. A pattern that matches
+/// nothing names nothing (`get_pins` warns, STA-0363). Without the netlist the names are read as
+/// written, a `*` / `?` pattern refused.
+fn pin_objects(what: &str, names: &[String], pins: Option<&ConnectedPins<'_>>) -> Result<Vec<String>, String> {
+    let Some(pins) = pins else {
+        if let Some(p) = names.iter().find(|p| is_pattern(p)) {
+            return Err(format!("{what} [get_pins {p}] without the netlist: not modelled"));
+        }
+        return Ok(names.to_vec());
+    };
+    let mut out: Vec<String> = Vec::new();
+    for n in names {
+        for p in pins.matching(n) {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Every `set_false_path` (`FalsePath`) and `set_multicycle_path` (`MultiCyclePath`) as the
 /// reference makes it, in file order: `-from` and `-to` on ports or pins (patterns matched against
 /// the netlist, as `get_ports` / `get_pins` do) or on the one clock. A false path of `-setup` alone
@@ -887,7 +906,8 @@ fn thru_point(cmd: &str, o: &vyges_loom::sdc::Objects, nl: &Netlist, pins: &Conn
             "get_pins" => t.pins.extend(pins.matching(n)),
             "get_ports" => t.pins.extend(nl.ports.iter().map(|(p, _)| p).filter(|p| hit(n, p)).cloned()),
             "get_nets" => t.nets.extend(nl.nets.iter().map(|x| &x.name).filter(|x| hit(n, x)).cloned()),
-            "get_cells" => t.insts.extend(nl.insts.iter().map(|x| &x.0).filter(|x| hit(n, x)).cloned()),
+            // `SdcNetwork::findInstancesMatching` ([`vyges_loom::sdc::insts_matching`])
+            "get_cells" => t.insts.extend(vyges_loom::sdc::insts_matching(n, &pins.insts).into_iter().map(|k| nl.insts[k].0.clone())),
             other => return Err(format!("{cmd} -through [{other} {}]: not modelled (pins, ports, nets or cells are)", o.names.join(" "))),
         }
     }
@@ -1352,6 +1372,7 @@ fn search_sdc_with(
     // `set_clock_latency` on pins (`Sdc::setClockLatency(clk | null, pin)`): an ideal clock's network
     // latency from that pin on. On clocks, `-source`, `-early` / `-late`, or on a propagated clock
     // (where the pin would turn it ideal) — refused.
+    let connected = nl.map(connected_pins);
     for l in &s.clock_latencies {
         let on_clocks = matches!(l.accessor.as_str(), "get_clocks" | "all_clocks");
         if l.accessor != "get_pins" && !on_clocks {
@@ -1409,12 +1430,13 @@ fn search_sdc_with(
             }
             continue;
         }
+        let latency_pins = pin_objects("set_clock_latency", &l.objects, connected.as_ref())?;
         for k in targets {
             let c: &mut Clock = &mut clocks[k];
             if c.propagated {
                 return Err("set_clock_latency on a pin of a propagated clock: not modelled".into());
             }
-            for pin in &l.objects {
+            for pin in &latency_pins {
                 let specific = l.clock.is_some();
                 let i = match c.pin_latencies.iter().position(|x| &x.pin == pin && x.specific == specific) {
                     Some(i) => i,
@@ -1557,11 +1579,12 @@ pub fn path_delays(s: &vyges_loom::sdc::Sdc, nl: Option<&Netlist>, time_scale: f
         if let Some((f, _)) = d.objects.iter().find(|(f, _)| f != "-from" && f != "-to" && f != "-through") {
             return Err(format!("{cmd} {f}: not modelled"));
         }
+        let connected = nl.map(connected_pins);
         let mut thrus = Vec::new();
         for (_, o) in d.objects.iter().filter(|(f, _)| f == "-through") {
             // A point's objects are matched against the netlist ([`search_sdc_on`] has it).
-            let Some(nl) = nl else { return Err(format!("{cmd} -through read without the netlist: not modelled")) };
-            thrus.push(thru_point(cmd, o, nl, &connected_pins(nl))?);
+            let (Some(nl), Some(pins)) = (nl, connected.as_ref()) else { return Err(format!("{cmd} -through read without the netlist: not modelled")) };
+            thrus.push(thru_point(cmd, o, nl, pins)?);
         }
         if d.value.is_nan() {
             return Err(format!("{cmd}: the delay value is not modelled"));
@@ -1570,7 +1593,7 @@ pub fn path_delays(s: &vyges_loom::sdc::Sdc, nl: Option<&Netlist>, time_scale: f
         let objs = |flag: &str| -> Result<(Vec<String>, bool), String> {
             let Some((_, o)) = d.objects.iter().find(|(f, _)| f == flag) else { return Ok((Vec::new(), false)) };
             if o.accessor == "get_pins" {
-                Ok((o.names.clone(), false))
+                Ok((pin_objects(&format!("{cmd} {flag}"), &o.names, connected.as_ref())?, false))
             } else if o.accessor == "get_clocks" && o.names.len() == 1 && s.clocks.iter().any(|c| c.name == o.names[0]) {
                 Ok((Vec::new(), true))
             } else {
@@ -1579,6 +1602,12 @@ pub fn path_delays(s: &vyges_loom::sdc::Sdc, nl: Option<&Netlist>, time_scale: f
         };
         let (from_pins, from_clock) = objs("-from")?;
         let (to_pins, to_clock) = objs("-to")?;
+        // Warnings 471 / 473 (`parse_from_arg` / `parse_to_arg`): a side given whose objects
+        // match nothing makes no path delay at all
+        let given = |flag: &str| d.objects.iter().any(|(f, _)| f == flag);
+        if (given("-from") && from_pins.is_empty() && !from_clock) || (given("-to") && to_pins.is_empty() && !to_clock) {
+            continue;
+        }
         let flag = |f: &str| d.flags.iter().any(|x| x == f);
         out.push(crate::sdc::PathDelay {
             from_pins,
@@ -1817,6 +1846,31 @@ mod tests {
         assert!(search_sdc(&sdc("group_path -name g -to [get_ports y]"), 1e-9, false, false).unwrap_err().contains("without the netlist"));
         let e = search_sdc_on(&sdc("set_max_delay 1 -from [get_pins b/A] -to [get_pins b/X]\ngroup_path -name g -to [get_ports y]"), &nl, 1e-9, false, false).unwrap_err();
         assert!(e.contains("the ids across them"), "{e}");
+    }
+
+    /// Rules (`SdcNetwork::findPinsMatching` / `findInstancesMatching`, `parse_from_arg`,
+    /// `set_clock_latency` in `Sdc.tcl`): the database keeps an instance's brackets escaped
+    /// (`b\[1\]`) and written SDC does not, so a pin of a path delay or a clock latency, and a
+    /// `-through` cell, written `b[1]` is the instance `b\[1\]` — not a pin that matches nothing.
+    /// A side whose pins match nothing makes no path delay (471 / 473); a latency on pins that
+    /// match nothing sets none. Without the netlist a pin pattern is refused.
+    #[test]
+    fn pin_and_cell_objects_are_found_as_the_reference_network_finds_them() {
+        let src = "module t (ck, a, y); input ck, a; output y; wire n1; BUF \\b\\[1\\] (.A(a), .X(n1)); BUF lz (.A(n1), .X(y)); endmodule\n";
+        let nl = netlist(&vyges_loom::netlist::parse_compact(src).unwrap(), &[lib()]).unwrap();
+        assert_eq!(nl.insts[0].0, "b\\[1\\]", "the escaped identifier keeps the database's escapes");
+        let sdc = |t: &str| vyges_loom::sdc::Sdc::parse(&format!("create_clock -name c -period 2 [get_ports ck]\n{t}\n")).unwrap();
+        let on = |t: &str| search_sdc_on(&sdc(t), &nl, 1e-9, false, false);
+        let g = on("set_max_delay 1 -from [get_pins b[1]/A] -to [get_pins {lz/X lz/*}]").unwrap();
+        assert_eq!((g.path_delays[0].from_pins.clone(), g.path_delays[0].to_pins.clone()), (vec!["b\\[1\\]/A".to_string()], vec!["lz/X".to_string(), "lz/A".to_string()]), "in pattern order, each pin once");
+        assert!(on("set_max_delay 1 -from [get_pins nope/A] -to [get_pins lz/X]").unwrap().path_delays.is_empty(), "an empty side: no path delay");
+        let t = on("set_max_delay 1 -through [get_cells b[1]] -through [get_cells l*]").unwrap();
+        assert_eq!((t.path_delays[0].thrus[0].insts.clone(), t.path_delays[0].thrus[1].insts.clone()), (vec!["b\\[1\\]".to_string()], vec!["lz".to_string()]));
+        let l = on("set_clock_latency 0.2 [get_pins b[1]/A]").unwrap();
+        assert_eq!(l.clocks[0].pin_latencies.iter().map(|x| x.pin.as_str()).collect::<Vec<_>>(), ["b\\[1\\]/A"]);
+        assert!(on("set_clock_latency 0.2 [get_pins nope/A]").unwrap().clocks[0].pin_latencies.is_empty());
+        assert!(search_sdc(&sdc("set_max_delay 1 -from [get_pins b*/A]"), 1e-9, false, false).unwrap_err().contains("without the netlist"));
+        assert_eq!(search_sdc(&sdc("set_max_delay 1 -from [get_pins lz/A]"), 1e-9, false, false).unwrap().path_delays[0].from_pins, ["lz/A"], "a name without the netlist: as written");
     }
 
     /// Rules (`Sdc::setClockLatency(clk, nullptr, …)`): a latency on clocks is the clock's own,
