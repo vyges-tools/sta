@@ -151,6 +151,32 @@ impl NoCrprBldr {
     }
 }
 
+/// One `PathEndCheck` of a vertex ([`Search::check_ends`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CheckEnd {
+    /// The data path: an index into the vertex's paths.
+    pub path: usize,
+    /// The check edge and its arc.
+    pub edge: usize,
+    pub arc: usize,
+    /// The target clock path: the check edge's from vertex and an index into its paths.
+    pub tgt_vertex: usize,
+    pub tgt_path: usize,
+    /// `PathEndCheck::requiredTime`.
+    pub required: f32,
+}
+
+impl CheckEnd {
+    /// `PathEnd::slack`: required − arrival for a max path, arrival − required for a min one.
+    pub fn slack(&self, data: &Path) -> f32 {
+        if data.tag.mm == MAX {
+            self.required - data.arrival
+        } else {
+            data.arrival - self.required
+        }
+    }
+}
+
 pub struct Search<'g, 'a> {
     pub graph: &'g Graph<'a>,
     pub sdc: &'g Sdc,
@@ -1554,6 +1580,90 @@ impl<'g, 'a> Search<'g, 'a> {
         (self.graph.is_port(v) && self.output_delay.get(name).is_some_and(|d| !d.is_empty())) || self.graph.in_edges[v].iter().any(|&e| self.is_check(e))
     }
 
+    /// `PathEndCheck::requiredTime` of a max path at check edge `e`, arc `k`, against target clock
+    /// path `tgt` at `tgt_v`: the target clock arrival (network latency — none for an ideal
+    /// clock's target, `targetClkDelay` — + the setup cycle's target time + uncertainty +
+    /// multicycle adjustment) less the check margin, plus the CRPR credit.
+    #[allow(clippy::too_many_arguments)]
+    fn setup_check_required(&self, path: &Path, pin: &str, src_edge: usize, e: usize, k: usize, tgt_v: usize, tgt: &Path) -> f32 {
+        let tgt_edge = tgt.tag.clk_edge.expect("a clock path has an edge");
+        let latency = self.tgt_clk_delay(tgt);
+        let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MAX);
+        let mcp = self.mcp_adjustment(path, pin, src_edge, tgt_edge, MAX);
+        let tgt_clk_arrival = (((0.0 + latency) + self.accting(src_edge, tgt_edge).required[ACCT_SETUP]) + unc) + mcp;
+        let margin = self.check_margin(e, k, MAX);
+        let crpr = self.check_crpr(path, tgt_v, tgt);
+        (tgt_clk_arrival - (margin + 0.0)) + crpr
+    }
+
+    /// `PathEndCheck::requiredTime` of a min path (a hold or removal check): the target clock
+    /// arrival under the hold cycle plus the margin, less the CRPR credit.
+    #[allow(clippy::too_many_arguments)]
+    fn hold_check_required(&self, path: &Path, pin: &str, src_edge: usize, e: usize, k: usize, tgt_v: usize, tgt: &Path) -> f32 {
+        let tgt_edge = tgt.tag.clk_edge.expect("a clock path has an edge");
+        let latency = self.tgt_clk_delay(tgt);
+        let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MIN);
+        let mcp = self.mcp_adjustment(path, pin, src_edge, tgt_edge, MIN);
+        let tgt_clk_arrival = (((0.0 + latency) + self.accting(src_edge, tgt_edge).required[ACCT_HOLD]) + unc) + mcp;
+        let margin = self.check_margin(e, k, MIN);
+        let crpr = self.check_crpr(path, tgt_v, tgt);
+        (tgt_clk_arrival + (margin - 0.0)) + (0.0 - crpr)
+    }
+
+    /// The `PathEndCheck` ends of vertex `v`, in the order `VisitPathEnds::visitClkedPathEnds`
+    /// visits them: per data path (in `paths[v]` order), per check in-edge (newest first, as the
+    /// graph iterates them), per arc to the path's transition, per target clock path of the
+    /// opposite min/max and the arc's clock transition. The same ends [`Self::visit_path_ends`]
+    /// takes requireds from: not at a port with an output delay, not for an unclocked path, a path
+    /// under a false path `-to` the pin, or a clock pair in different clock groups; a path delay
+    /// completing at the pin makes a `PathEndPathDelay` instead, and a latch's data pin a
+    /// `PathEndLatchCheck` — neither is listed.
+    pub fn check_ends(&self, v: usize) -> Vec<CheckEnd> {
+        let mut out = Vec::new();
+        let name = &self.graph.vertices[v].name;
+        if self.graph.is_port(v) && self.output_delay.get(name).is_some_and(|d| !d.is_empty()) {
+            return out;
+        }
+        for (i, path) in self.paths[v].iter().enumerate() {
+            if self.sdc.false_path_to(path.tag.states, name, path.tag.mm) {
+                continue;
+            }
+            let Some(src_edge) = path.tag.clk_edge else { continue };
+            let mm = path.tag.mm;
+            if self.sdc.path_delay_to(path.tag.states, name, true, mm).is_some() {
+                continue;
+            }
+            if mm == MAX && self.latch_data[v] {
+                continue;
+            }
+            for &e in self.graph.in_edges[v].iter().rev() {
+                let roles: &[Role] = if mm == MAX { &[Role::Setup, Role::Recovery] } else { &[Role::Hold, Role::Removal] };
+                if !self.role(e).is_some_and(|r| roles.contains(&r)) {
+                    continue;
+                }
+                let EdgeKind::Gate { set } = self.graph.edges[e].kind else { continue };
+                let tgt_v = self.graph.edges[e].from;
+                for (k, arc) in self.graph.arc_set(e, set).arcs.iter().enumerate() {
+                    if arc.to_rf != path.tag.rf {
+                        continue;
+                    }
+                    for (j, tgt) in self.paths[tgt_v].iter().enumerate() {
+                        if tgt.tag.mm != 1 - mm || tgt.tag.rf != arc.from_rf || !tgt.tag.is_clock {
+                            continue;
+                        }
+                        let tgt_edge = tgt.tag.clk_edge.expect("a clock path has an edge");
+                        if !self.sdc.same_clock_group(src_edge / 2, tgt_edge / 2) {
+                            continue;
+                        }
+                        let required = if mm == MAX { self.setup_check_required(path, name, src_edge, e, k, tgt_v, tgt) } else { self.hold_check_required(path, name, src_edge, e, k, tgt_v, tgt) };
+                        out.push(CheckEnd { path: i, edge: e, arc: k, tgt_vertex: tgt_v, tgt_path: j, required });
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// The endpoint's path ends: an output delay end if the port has one, else a check end —
     /// setup for a max path, hold for a min path.
     fn visit_path_ends(&self, v: usize, req: &mut [f32]) {
@@ -1655,14 +1765,7 @@ impl<'g, 'a> Search<'g, 'a> {
                             continue;
                         }
                         // The check's required time.
-                        // An ideal clock's target has no network latency (`targetClkDelay`).
-                        let latency = self.tgt_clk_delay(tgt);
-                        let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MAX);
-                        let mcp = self.mcp_adjustment(path, name, src_edge, tgt_edge, MAX);
-                        let tgt_clk_arrival = (((0.0 + latency) + self.accting(src_edge, tgt_edge).required[ACCT_SETUP]) + unc) + mcp;
-                        let margin = self.check_margin(e, k, MAX);
-                        let crpr = self.check_crpr(path, tgt_v, tgt);
-                        Self::required_set(req, i, (tgt_clk_arrival - (margin + 0.0)) + crpr, MAX);
+                        Self::required_set(req, i, self.setup_check_required(path, name, src_edge, e, k, tgt_v, tgt), MAX);
                     }
                 }
             }
@@ -1926,12 +2029,7 @@ impl<'g, 'a> Search<'g, 'a> {
                         Self::required_set(req, i, required, MIN);
                         continue;
                     }
-                    let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MIN);
-                    let mcp = self.mcp_adjustment(path, &self.graph.vertices[v].name, src_edge, tgt_edge, MIN);
-                    let tgt_clk_arrival = (((0.0 + latency) + self.accting(src_edge, tgt_edge).required[ACCT_HOLD]) + unc) + mcp;
-                    let margin = self.check_margin(e, k, MIN);
-                    let crpr = self.check_crpr(path, tgt_v, tgt);
-                    Self::required_set(req, i, (tgt_clk_arrival + (margin - 0.0)) + (0.0 - crpr), MIN);
+                    Self::required_set(req, i, self.hold_check_required(path, &self.graph.vertices[v].name, src_edge, e, k, tgt_v, tgt), MIN);
                 }
             }
         }
@@ -2804,6 +2902,34 @@ mod tests {
             assert_eq!(s.slack_of(d, MIN, Some(RISE)), r.arrival - r.required);
             assert_eq!(s.slack_of(d, MIN, None), (r.arrival - r.required).min(f.arrival - f.required));
             assert_eq!(s.slack_of(d, MAX, None), s.vertex_slack(d));
+        });
+    }
+
+    /// Rules (`VisitPathEnds::visitCheckEnd`, `PathEnd::slack`): a register's data pin has one
+    /// `PathEndCheck` per clocked data path here — setup for a max path against the MIN capture
+    /// clock path, hold for a min path against the MAX one — each with the check's arc to the
+    /// path's transition; its required is the one the search merged into the path, and its slack
+    /// required − arrival for a max path, arrival − required for a min one. A pin with no check
+    /// has no check end.
+    #[test]
+    fn a_register_data_pin_has_one_check_end_per_clocked_path() {
+        timed(|s, v| {
+            let d = v("f2/D");
+            let ends = s.check_ends(d);
+            let data: Vec<usize> = (0..s.paths[d].len()).filter(|&i| !s.paths[d][i].tag.is_clock && s.paths[d][i].tag.clk_edge.is_some()).collect();
+            assert_eq!(ends.iter().map(|e| e.path).collect::<Vec<_>>(), data);
+            for e in &ends {
+                let p = s.paths[d][e.path];
+                let tgt = s.paths[e.tgt_vertex][e.tgt_path];
+                assert_eq!(e.tgt_vertex, v("f2/CLK"));
+                assert!(tgt.tag.is_clock && tgt.tag.mm == 1 - p.tag.mm);
+                assert_eq!(s.graph.arc_set(e.edge, match s.graph.edges[e.edge].kind { EdgeKind::Gate { set } => set, _ => unreachable!() }).arcs[e.arc].to_rf, p.tag.rf);
+                assert_eq!(e.required, p.required);
+                let slack = if p.tag.mm == MAX { p.required - p.arrival } else { p.arrival - p.required };
+                assert_eq!(e.slack(&p), slack);
+            }
+            assert!(ends.iter().any(|e| s.paths[d][e.path].tag.mm == MIN) && ends.iter().any(|e| s.paths[d][e.path].tag.mm == MAX));
+            assert!(s.check_ends(v("out")).is_empty());
         });
     }
 
