@@ -1149,16 +1149,30 @@ impl<'a> Graph<'a> {
     /// that, the total MINUS the pin cap (so the sum is `pin + (pi − pin)` in float, not the pi
     /// total); a smaller pi model is ignored (wire cap 0); a net `set_load` replaces the pi model.
     pub fn load_cap(&self, drvr: usize, parasitics: &HashMap<String, NetParasitics>) -> f32 {
+        self.load_cap_mm(drvr, parasitics, MAX)
+    }
+
+    /// `GraphDelayCalc::loadCap(drvr_pin, scene, min_max)`: over rise then fall, the larger
+    /// load at max, the smaller at min (`MinMax::minMax` from its init value) — each one
+    /// transition's [`Graph::load_cap_rf`] at that min/max.
+    pub fn load_cap_mm(&self, drvr: usize, parasitics: &HashMap<String, NetParasitics>, mm: usize) -> f32 {
         let index = self.index();
-        let mut load_cap = -1e30f32;
+        let mut load_cap = if mm == MAX { -1e30f32 } else { 1e30f32 };
         for rf in [RISE, FALL] {
-            let (pin_cap, wire_cap, _) = self.parasitic_load(drvr, rf, MAX, parasitics, index);
+            let (pin_cap, wire_cap, _) = self.parasitic_load(drvr, rf, mm, parasitics, index);
             let cap = pin_cap + wire_cap;
-            if cap > load_cap {
+            if (mm == MAX && cap > load_cap) || (mm != MAX && cap < load_cap) {
                 load_cap = cap;
             }
         }
         load_cap
+    }
+
+    /// `GraphDelayCalc::loadCap(drvr_pin, rf, scene, min_max)`: `pin_cap + wire_cap` of one
+    /// transition at one min/max ([`Graph::load_cap`]'s per-transition term).
+    pub fn load_cap_rf(&self, drvr: usize, parasitics: &HashMap<String, NetParasitics>, rf: usize, mm: usize) -> f32 {
+        let (pin_cap, wire_cap, _) = self.parasitic_load(drvr, rf, mm, parasitics, self.index());
+        pin_cap + wire_cap
     }
 
     /// Delay calculation over the whole graph. With `trace`, one line per DMP gate call
@@ -1759,6 +1773,26 @@ mod tests {
         let before = g.load_cap(u2y, &HashMap::new());
         g.sdc.port_pin_cap.insert("y".into(), [[Some(0.2e-12); 2]; 2]);
         assert_eq!(g.load_cap(u2y, &HashMap::new()), before + 0.2e-12);
+    }
+
+    /// Rule (GraphDelayCalc::loadCap(drvr, scene, min_max)): over rise and fall, the LARGER load
+    /// at max and the SMALLER at min (MinMax::minMax from its init value), each one
+    /// transition's pin + wire cap at that min/max.
+    #[test]
+    fn the_min_load_cap_takes_the_smaller_transition() {
+        let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
+        let nl = chain();
+        let mut g = Graph::build(&libs, &nl).unwrap();
+        let u2y = g.vertices.iter().position(|x| x.name == "u2/Y").unwrap();
+        // Port y's pin load: 0.5 pF rising, 0.1 pF falling, at both min and max ([rf][mm]).
+        g.sdc.port_pin_cap.insert("y".into(), [[Some(0.5e-12); 2], [Some(0.1e-12); 2]]);
+        let none = HashMap::new();
+        let (rise_min, fall_min) = (g.load_cap_rf(u2y, &none, RISE, MIN), g.load_cap_rf(u2y, &none, FALL, MIN));
+        let (rise_max, fall_max) = (g.load_cap_rf(u2y, &none, RISE, MAX), g.load_cap_rf(u2y, &none, FALL, MAX));
+        assert!(fall_min < rise_min && fall_max < rise_max, "rise {rise_min} {rise_max} fall {fall_min} {fall_max}");
+        assert_eq!(g.load_cap_mm(u2y, &none, MIN), fall_min);
+        assert_eq!(g.load_cap_mm(u2y, &none, MAX), rise_max);
+        assert_eq!(g.load_cap(u2y, &none), rise_max);
     }
 
     /// Rule (LumpedCapDelayCalc::findParasitic): a driver with a net `set_load` has NO parasitic —
