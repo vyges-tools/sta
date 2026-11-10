@@ -1,7 +1,5 @@
 # vyges-sta
 
-**[Download Loom](https://vyges.com/products/vyges-cli/#install)** · install the free [Vyges CLI](https://vyges.com/products/vyges-cli/), then `vyges install loom`
-
 Static timing analysis with fully specified arithmetic. Every value is narrowed at a defined
 point (`float` or `double`), every table interpolates in a defined order, and every merge visits
 its candidates in a defined order — so delays, arrivals, requireds and slacks are reproducible
