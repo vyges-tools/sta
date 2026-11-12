@@ -1365,9 +1365,15 @@ fn search_sdc_with(
         clocks.push(c);
     }
     let clock_index = |name: &str| s.clocks.iter().position(|c| c.name == name);
-    // A hold uncertainty moves only hold checks: read by a hold repair alone.
-    if s.setup_uncertainty != 0.0 || (s.hold_uncertainty != 0.0 && hold_repair) {
-        return Err("set_clock_uncertainty: not modelled".into());
+    // `hold_repair` (rsz: a hold-only repair_timing) applies the per-clock uncertainties: the
+    // search reads them into its hold checks and the setup checks the hold repair guards
+    // (`PathEnd::checkClkUncertainty`). Witness: repair_hold14 call 2 (0.7 on clk).
+    // A setup repair with setup uncertainty is unwitnessed: refused. A hold uncertainty moves
+    // only hold checks, which a setup repair does not read: left out, as before.
+    if hold_repair {
+        clock_uncertainties(&s.uncertainties, &mut clocks, time_scale)?;
+    } else if s.setup_uncertainty != 0.0 {
+        return Err("set_clock_uncertainty -setup on a setup repair: not modelled".into());
     }
     if s.late_derate.is_some() || s.early_derate.is_some() || !s.exceptions.is_empty() || !s.async_groups.is_empty() {
         return Err("derates, timing exceptions or clock groups: not modelled".into());
@@ -1760,6 +1766,22 @@ mod tests {
             let e = read(lines).unwrap_err();
             assert!(e.contains(why), "{lines}: {e}");
         }
+    }
+
+    /// The search's reader for rsz: a hold-only repair carries the per-clock uncertainties (the
+    /// reference's hold repair reads them through `PathEnd::checkClkUncertainty`, in hold slacks and
+    /// in the setup slacks it guards; witness repair_hold14 call 2); a setup repair with setup
+    /// uncertainty is refused (unwitnessed); a hold uncertainty alone leaves a setup repair as is.
+    #[test]
+    fn a_hold_repair_reads_the_clock_uncertainties() {
+        let sdc = |text: &str| vyges_loom::sdc::Sdc::parse(&format!("create_clock -name clk -period 2 [get_ports clk]\n{text}")).unwrap();
+        let ns = |v: f64| crate::sdc::user_to_sta(v, 1e-9);
+        let both = sdc("set_clock_uncertainty 0.7 clk\n");
+        let hold = search_sdc(&both, 1e-9, false, true).unwrap();
+        assert_eq!(hold.clocks[0].uncertainty, [Some(ns(0.7)), Some(ns(0.7))]);
+        assert!(search_sdc(&both, 1e-9, false, false).unwrap_err().contains("setup repair"));
+        let hold_only = sdc("set_clock_uncertainty -hold 0.2 clk\n");
+        assert_eq!(search_sdc(&hold_only, 1e-9, false, false).unwrap().clocks[0].uncertainty, [None, None], "a setup repair leaves a hold uncertainty out");
     }
 
     /// Rule (`set_clock_uncertainty` in the reference's `sdc/Sdc.tcl`): `-setup` alone sets the
