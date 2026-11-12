@@ -556,6 +556,8 @@ impl IncTimer {
     /// Every vertex's paths into the state (after a full pass).
     fn store_all(&mut self, search: &Search<'_, '_>) {
         let g = search.graph;
+        // Index loop kept as written: the index is used beyond this container (order and bounds unchanged).
+        #[allow(clippy::needless_range_loop)]
         for v in 0..g.vertices.len() {
             let stored: Vec<SPath> = search.paths[v].iter().map(|p| self.spath(g, p)).collect();
             self.paths.insert(g_name(g, v), stored);
