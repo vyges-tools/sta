@@ -1214,7 +1214,11 @@ impl<'g, 'a> Search<'g, 'a> {
         if (pd.from_clock || pd.to_clock) && (pd.false_path || self.sdc.clocks.len() > 1) {
             return Err(format!("{cmd} -from / -to a clock: not modelled{}", if pd.false_path { "" } else { " with several clocks" }));
         }
-        if self.latch_data.iter().any(|&l| l) {
+        // A group path is neither false nor a path delay, so `latchOutArrival`'s `exceptionTo` never
+        // disables D -> Q for it, and a transparent latch's Q takes its states from the D pin and the
+        // enable pin and clock (`exceptionFromStates`) as `latch_out_arrival` does: a group `-from`
+        // a latch enable starts there.
+        if pd.group.is_none() && self.latch_data.iter().any(|&l| l) {
             return Err(format!("{cmd} on a design with latches: not modelled"));
         }
         if pd.multicycle.is_some() && !self.gated.is_empty() {
@@ -2386,6 +2390,32 @@ mod tests {
         }
         assert_eq!(ns(s.slack_of(v("l1/D"), MAX, None)), 0.0, "the latch borrows to zero");
         assert_eq!(ns(s.slack_of(v("f2/D"), MAX, None)), 0.28);
+    }
+
+    /// Rules (`Latches::latchOutArrival`, `Sdc::exceptionFromStates`): a group path is neither
+    /// false nor a path delay, so it never disables a latch's D -> Q, and a transparent latch's Q
+    /// takes its states from the D pin and the enable's pin and clock: a group `-from` the latch
+    /// enable (`all_registers -clock_pins` names it, as rsz's reg2reg does) is modelled on a design
+    /// with latches and reaches the capture at f2/D; a false path there is still refused.
+    /// Witness: repair_timing_path_group2's in2reg and reg2reg counts and its latch D end, equal to
+    /// the reference.
+    #[test]
+    fn a_group_path_is_modelled_on_a_design_with_latches() {
+        let (libs, netlist, mut sdc) = latch_loop();
+        let pd = |group: Option<&str>, false_path: bool| crate::sdc::PathDelay { from_pins: vec!["l1/G".into()], from_clock: false, to_pins: vec!["f2/D".into()], to_clock: false, min_max: MAX, ignore_clk_latency: false, break_path: false, delay: 0.0, false_path, multicycle: None, thrus: Vec::new(), group: group.map(String::from) };
+        sdc.path_delays = vec![pd(Some("r2r"), false)];
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        g.find_delays(&HashMap::new(), None).unwrap();
+        let mut s = Search::in_graph_order(&g, &sdc);
+        s.constraints_modelled().expect("a group path on a latch design is modelled");
+        s.find_arrivals().unwrap();
+        s.find_requireds().unwrap();
+        let ends: Vec<&str> = s.group_path_ends("r2r", MAX, usize::MAX, -1.0, 1.0).iter().map(|e| g.vertices[e.vertex].name.as_str()).collect();
+        assert_eq!(ends, ["f2/D"]);
+        let mut sdc_false = sdc.clone();
+        sdc_false.path_delays = vec![pd(None, true)];
+        let s = Search::in_graph_order(&g, &sdc_false);
+        assert!(s.constraints_modelled().is_err_and(|e| e.contains("on a design with latches")));
     }
 
     /// A register reset asynchronously: `RESET_B` with a rising recovery check and the clear arc on

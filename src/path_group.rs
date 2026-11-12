@@ -9,14 +9,18 @@
 //! [`Search::group_path_ends`] is `findPathEnds(to = none, group_names = {name},
 //! endpoint_path_count = 1, unique_pins, sort_by_slack)`: `MakePathEnds1` keeps, per endpoint,
 //! the group's worst end (`PathEndLess`), then the group's ends sorted by [`cmp_group_ends`].
-//! Named groups only, of one scene; the default groups (clocks, `asynchronous`, `gated clock`,
-//! `path delay`, `unconstrained`) are not modelled here.
+//! Named groups and the built-in [`GATED_CLK_GROUP`], of one scene; the other default groups
+//! (clocks, `asynchronous`, `path delay`, `unconstrained`) are not modelled here.
 
 use std::cmp::Ordering;
 
 use crate::fuzzy;
 use crate::liberty::MAX;
 use crate::search::{Path, Search};
+
+/// `PathGroups::gated_clk_group_name_`: the group a clock gating check's path end is in when no
+/// group path claims it.
+pub const GATED_CLK_GROUP: &str = "gated clock";
 
 /// A named group's path end at one endpoint: the vertex, the index of its path in
 /// [`Search::paths`], and its slack.
@@ -52,12 +56,21 @@ pub fn cmp_group_ends(s: &Search<'_, '_>, a: &GroupEnd, b: &GroupEnd) -> Orderin
 }
 
 impl Search<'_, '_> {
-    /// `PathGroups::inPathGroupNamed(path_end, name)` for a named group: the path's end at `v` is
-    /// in it when one of the group paths [`crate::sdc::Sdc::group_paths_to`] finds is of that name
-    /// (`GroupPaths` have precedence; a named group's ends are only these).
+    /// `PathGroups::inPathGroupNamed(path_end, name)`: the path's end at `v` is in a named group
+    /// when one of the group paths [`crate::sdc::Sdc::group_paths_to`] finds is of that name
+    /// (`GroupPaths` have precedence; a named group's ends are only these); with none, in
+    /// [`GATED_CLK_GROUP`] when it is a clock gating check's end.
     pub fn path_in_group(&self, v: usize, p: &Path, name: &str) -> bool {
-        let clocked = p.tag.clk_edge.is_some() && self.has_target_clock(v);
-        self.sdc.group_paths_to(p.tag.states, &self.graph.vertices[v].name, clocked).into_iter().any(|id| self.sdc.path_delays[id].group.as_deref() == Some(name))
+        // `isGatedClock`: a gated clock enable that is neither a check's end nor a port (where
+        // `isCheck` / `isOutputDelay` would come first; the merged required time here cannot tell
+        // those ends apart). Its end has a target clock (the gate's clock pin) for `groupPathsTo`.
+        let gated_end = self.is_gated_clk_enable(v) && !self.graph.is_port(v) && !self.graph.in_edges[v].iter().any(|&e| self.is_check(e));
+        let clocked = p.tag.clk_edge.is_some() && (self.has_target_clock(v) || gated_end);
+        let groups = self.sdc.group_paths_to(p.tag.states, &self.graph.vertices[v].name, clocked);
+        if !groups.is_empty() {
+            return groups.into_iter().any(|id| self.sdc.path_delays[id].group.as_deref() == Some(name));
+        }
+        name == GATED_CLK_GROUP && clocked && gated_end
     }
 
     /// `Sta::findPathEnds(to = none, group_names = {name}, group_path_count, endpoint_path_count =
@@ -197,6 +210,71 @@ mod tests {
         assert!(ends(-1.0, 0.45).is_empty(), "above slack_max");
         assert!(ends(0.55, 1.0).is_empty(), "under slack_min");
         assert_eq!(ends(0.5, 0.5).len(), 1, "the bounds are inclusive");
+    }
+
+    /// clk -> u1 (and2) B, en -> u1 A, u1/Y clocks r1 (dff); input delay 0.2 ns on en, period
+    /// 1 ns. Rules (`PathGroups::inPathGroupNamed`): u1/A ends a clock gating check, in
+    /// [`GATED_CLK_GROUP`] while no group path claims it; a group path `-to` it takes precedence
+    /// (`GroupPaths` first), and then it is in that group only.
+    #[test]
+    fn a_clock_gating_end_is_in_the_gated_clock_group_unless_a_group_path_claims_it() {
+        const LIB2: &str = r#"library (g) {
+          time_unit : "1ns"; capacitive_load_unit (1, pf);
+          cell (and2) {
+            pin (A) { direction : input; capacitance : 0.001; }
+            pin (B) { direction : input; capacitance : 0.001; }
+            pin (Y) { direction : output; function : "A&B";
+              timing () { related_pin : "A"; timing_sense : positive_unate;
+                cell_rise (scalar) { values ("0.1"); } rise_transition (scalar) { values ("0.05"); }
+                cell_fall (scalar) { values ("0.1"); } fall_transition (scalar) { values ("0.05"); } }
+              timing () { related_pin : "B"; timing_sense : positive_unate;
+                cell_rise (scalar) { values ("0.1"); } rise_transition (scalar) { values ("0.05"); }
+                cell_fall (scalar) { values ("0.1"); } fall_transition (scalar) { values ("0.05"); } } }
+          }
+          cell (dff) {
+            ff (IQ, IQN) { clocked_on : "CK"; next_state : "D"; }
+            pin (CK) { direction : input; clock : true; capacitance : 0.001; }
+            pin (D) { direction : input; capacitance : 0.001;
+              timing () { related_pin : "CK"; timing_type : setup_rising;
+                rise_constraint (scalar) { values ("0.05"); } fall_constraint (scalar) { values ("0.05"); } } }
+            pin (Q) { direction : output; function : "IQ";
+              timing () { related_pin : "CK"; timing_type : rising_edge;
+                cell_rise (scalar) { values ("0.1"); } rise_transition (scalar) { values ("0.05"); }
+                cell_fall (scalar) { values ("0.1"); } fall_transition (scalar) { values ("0.05"); } } }
+          }
+        }"#;
+        let libs = vec![Library::read(&crate::liberty_parse::parse(LIB2).unwrap()).unwrap()];
+        let u = |k: usize, p: &str| Conn::Inst(k, p.into());
+        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins }.into();
+        let netlist = Netlist {
+            insts: vec![crate::netlist::inst("u1", "and2"), crate::netlist::inst("r1", "dff")],
+            ports: vec![("clk".into(), PortDir::Input), ("en".into(), PortDir::Input), ("d".into(), PortDir::Input), ("q".into(), PortDir::Output)],
+            nets: vec![
+                net("clk", vec![Conn::Port(0), u(0, "B")]),
+                net("en", vec![Conn::Port(1), u(0, "A")]),
+                net("gclk", vec![u(0, "Y"), u(1, "CK")]),
+                net("d", vec![Conn::Port(2), u(1, "D")]),
+                net("q", vec![u(1, "Q"), Conn::Port(3)]),
+            ],
+        };
+        let group_ends = |path_delays: Vec<PathDelay>, name: &str| -> Vec<String> {
+            let sdc = Sdc {
+                clocks: vec![Clock::new("c", 1e-9, "clk", false)],
+                input_delays: vec![PortDelay::uniform("en", 0.2e-9), PortDelay::uniform("d", 0.2e-9)],
+                output_delays: Vec::new(),
+                path_delays,
+            };
+            let mut g = Graph::build(&libs, &netlist).unwrap();
+            g.find_delays(&HashMap::new(), None).unwrap();
+            let mut s = Search::in_graph_order(&g, &sdc);
+            s.find_arrivals().unwrap();
+            s.find_requireds().unwrap();
+            s.group_path_ends(name, MAX, usize::MAX, -1.0, 1.0).iter().map(|e| g.vertices[e.vertex].name.clone()).collect()
+        };
+        assert_eq!(group_ends(Vec::new(), GATED_CLK_GROUP), ["u1/A"], "the enable, not the flop's D");
+        let to_en = PathDelay { from_pins: vec!["en".into()], from_clock: false, to_pins: vec!["u1/A".into()], to_clock: false, min_max: MAX, ignore_clk_latency: false, break_path: false, delay: 0.0, false_path: false, multicycle: None, thrus: Vec::new(), group: Some("ge".into()) };
+        assert!(group_ends(vec![to_en.clone()], GATED_CLK_GROUP).is_empty(), "claimed by the group path");
+        assert_eq!(group_ends(vec![to_en], "ge"), ["u1/A"]);
     }
 
     const SEQ: &str = r#"library (s) {
