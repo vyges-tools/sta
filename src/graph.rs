@@ -204,6 +204,20 @@ pub struct SdcEnv {
     /// name: only that transition (`RISE` / `FALL`) is searched from or to them
     /// (`searchThruSimEdge`).
     pub sim_transitions: HashMap<String, usize>,
+    /// `set_clock_transition` (`Clock::slews_`) per clock that takes one (not virtual: Warning
+    /// 419), in clock order: its source pins and its `[rf][min/max]` slews where set. A timer
+    /// with ideal clocks folds these into [`Graph::ideal_clock_slew`] over each clock's network
+    /// (`ClkNetwork::idealClkSlew`); a clock with none is absent.
+    pub clock_slews: Vec<ClockSlew>,
+}
+
+/// One clock's `set_clock_transition` values ([`SdcEnv::clock_slews`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClockSlew {
+    pub name: String,
+    pub sources: Vec<String>,
+    /// `[rf][min/max]`, in the timer's unit; `None` where no command set it (`Clock::slew`: 0).
+    pub slew: [[Option<f32>; 2]; 2],
 }
 
 /// One `set_driving_cell`: the cell (the first library holding it), the port it drives from

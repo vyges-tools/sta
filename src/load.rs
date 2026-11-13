@@ -531,7 +531,7 @@ pub fn timing_derates(ds: &[vyges_loom::sdc::EnvCmd]) -> Result<Option<Box<crate
     Ok(Some(Box::new(f)))
 }
 
-fn clock_transitions(ts: &[vyges_loom::sdc::EnvCmd], clocks: &mut [crate::sdc::Clock], time_scale: f32, notes: &mut Vec<String>) -> Result<(), String> {
+pub fn clock_transitions(ts: &[vyges_loom::sdc::EnvCmd], clocks: &mut [crate::sdc::Clock], time_scale: f32, notes: &mut Vec<String>) -> Result<(), String> {
     use crate::liberty::{FALL, MAX, MIN, RISE};
     for t in ts {
         if let Some(f) = t.flags.iter().find(|f| !matches!(f.as_str(), "-rise" | "-fall" | "-min" | "-max")) {
@@ -1138,6 +1138,7 @@ pub fn sdc_env(s: &vyges_loom::sdc::Sdc, libs: &[Library], nl: &crate::netlist::
             env.input_drive.insert(port, crate::graph::InputDrive { cell: cell.clone(), from_port: d.from_pin.clone(), to_port: pin.clone(), from_slews: slews });
         }
     }
+    env.clock_slews = clock_slews(s, libs)?;
     if s.env.is_empty() {
         return Ok(env);
     }
@@ -1210,6 +1211,25 @@ pub fn sdc_env(s: &vyges_loom::sdc::Sdc, libs: &[Library], nl: &crate::netlist::
         }
     }
     Ok(env)
+}
+
+/// Each clock's `set_clock_transition` values as [`clock_transitions`] sets them on the clock
+/// (`set_clock_slew_cmd` → `Clock::setSlew`, in file order), for the clocks that took any. With no
+/// such command: none, and no library is asked for.
+fn clock_slews(s: &vyges_loom::sdc::Sdc, libs: &[Library]) -> Result<Vec<crate::graph::ClockSlew>, String> {
+    if s.clock_transitions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let lib0 = libs.first().ok_or("set_clock_transition before any liberty library")?;
+    let mut clocks: Vec<crate::sdc::Clock> = s.clocks.iter().map(|c| crate::sdc::Clock::new(&c.name, c.period as f32, &c.source, false)).collect();
+    let mut notes = Vec::new();
+    clock_transitions(&s.clock_transitions, &mut clocks, lib0.time_scale, &mut notes)?;
+    Ok(s.clocks
+        .iter()
+        .zip(&clocks)
+        .filter(|(_, c)| c.slew.iter().flatten().any(Option::is_some))
+        .map(|(lc, c)| crate::graph::ClockSlew { name: lc.name.clone(), sources: lc.sources.clone(), slew: c.slew })
+        .collect())
 }
 
 /// The input and output delays with `[all_inputs]` / `[all_outputs]` expanded, as
@@ -1962,6 +1982,26 @@ mod tests {
         assert_eq!((clocks[0].slew[RISE][MAX], clocks[0].slew[RISE][MIN], clocks[0].slew[FALL][MAX]), (ns(0.25), ns(0.15), ns(0.15)));
         assert_eq!(clocks[1].slew, [[None; 2]; 2], "virtual: none");
         assert_eq!(notes.len(), 1);
+    }
+
+    /// Rule (`set_clock_transition` → `Clock::setSlew`, read by `ClkNetwork::idealClkSlew`): the
+    /// delay-calculation environment carries each clock's slews as its commands left them, with
+    /// the clock's source pins; a virtual clock takes none (Warning 419) and a clock no command
+    /// names is absent.
+    #[test]
+    fn sdc_env_carries_each_clocks_transition() {
+        use crate::liberty::{FALL, MAX, MIN, RISE};
+        let ns = |v: f64| Some(crate::sdc::user_to_sta(v, 1e-9));
+        let src = "module t (ca, cb, y);\n input ca, cb; output y;\n BUF b (.A(ca), .X(y));\nendmodule\n";
+        let nl = netlist(&vyges_loom::netlist::parse_compact(src).unwrap(), &[lib()]).unwrap();
+        let s = vyges_loom::sdc::Sdc::parse("create_clock -name a -period 2 [get_ports ca]\ncreate_clock -name v -period 3\ncreate_clock -name b -period 2 [get_ports cb]\nset_clock_transition 0.15 [get_clocks {a v}]\nset_clock_transition -rise -max 0.25 [get_clocks a]\n").unwrap();
+        let env = sdc_env(&s, &[lib()], &nl).unwrap();
+        assert_eq!(env.clock_slews.len(), 1, "{:?}", env.clock_slews);
+        let a = &env.clock_slews[0];
+        assert_eq!((a.name.as_str(), a.sources.clone()), ("a", vec!["ca".to_string()]));
+        assert_eq!((a.slew[RISE][MAX], a.slew[RISE][MIN], a.slew[FALL][MAX], a.slew[FALL][MIN]), (ns(0.25), ns(0.15), ns(0.15), ns(0.15)));
+        let none = vyges_loom::sdc::Sdc::parse("create_clock -name a -period 2 [get_ports ca]\n").unwrap();
+        assert!(sdc_env(&none, &[lib()], &nl).unwrap().clock_slews.is_empty());
     }
 
     /// Rule (`set_multicycle_path` in `Sdc.tcl`): one exception per command — `-setup` alone is
