@@ -30,7 +30,7 @@ use crate::netlist::{Conn, Netlist, PortDir};
 use crate::parasitics::{reduce_to_pi_elmore, Network, NodePins};
 
 mod edit;
-pub use edit::NotInPlace;
+pub use edit::{NotInPlace, SlotDelta};
 
 /// A vertex: one pin (a bidirect pin is refused).
 #[derive(Debug, Clone)]
@@ -174,6 +174,37 @@ pub struct Graph<'a> {
 
 /// [`Graph::parasitic_load`]: `(pin_cap, wire_cap, the pi model and its node names)`.
 type ParasiticLoad<'p> = (f32, f32, Option<(crate::parasitics::PiElmore, &'p [String])>);
+
+/// A reduced parasitic's loads by name (`ReducedParasitic`'s pin-to-Elmore map, read by
+/// `findElmore(load_pin)`): the first entry for a name, as a pass over the list finds it. Built
+/// only for a net with more loads than a pass is worth: one pass per load was O(fanout²) per
+/// driver — minutes on a net of 10^4 loads.
+struct LoadElmores<'p> {
+    by_name: Option<HashMap<&'p str, f32>>,
+}
+
+impl<'p> LoadElmores<'p> {
+    const PASS_MAX: usize = 16;
+
+    fn new(pe: Option<&(crate::parasitics::PiElmore, &'p [String])>) -> Self {
+        let by_name = pe.filter(|(p, _)| p.elmore.len() > Self::PASS_MAX).map(|(p, names)| {
+            let mut m: HashMap<&'p str, f32> = HashMap::with_capacity(p.elmore.len());
+            for &(n, el) in &p.elmore {
+                m.entry(names[n].as_str()).or_insert(el);
+            }
+            m
+        });
+        LoadElmores { by_name }
+    }
+
+    /// The load's Elmore delay, `None` when the parasitic has none for it.
+    fn get(&self, p: &crate::parasitics::PiElmore, names: &[String], load: &str) -> Option<f32> {
+        match &self.by_name {
+            Some(m) => m.get(load).copied(),
+            None => p.elmore.iter().find(|(n, _)| names[*n] == load).map(|&(_, el)| el),
+        }
+    }
+}
 
 /// The SDC loads and drives delay calculation reads (`Sdc::connectedCap`, `seedDrvrSlew`).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1003,6 +1034,7 @@ impl<'a> Graph<'a> {
         for mm in [MIN, MAX] {
             for rf in [RISE, FALL] {
                 let (pin_cap, wire_cap, pe) = self.parasitic_load(v, rf, mm, parasitics, index);
+                let elmores = LoadElmores::new(pe.as_ref());
                 let load_cap = pin_cap + wire_cap;
                 for arc in arcs.iter().filter(|a| a.to_rf == rf) {
                     let Model::Gate(model) = &arc.model else { continue };
@@ -1026,8 +1058,8 @@ impl<'a> Graph<'a> {
                     for &w in wires {
                         let load = self.edges[w].to;
                         let (mut wire_delay, mut load_slew) = match (&mut dmp, &pe) {
-                            (Some(d), Some((p, names))) => match p.elmore.iter().find(|(n, _)| names[*n] == self.vertices[load].name) {
-                                Some(&(_, el)) => d.load_delay_slew(f64::from(el)),
+                            (Some(d), Some((p, names))) => match elmores.get(p, names, &self.vertices[load].name) {
+                                Some(el) => d.load_delay_slew(f64::from(el)),
                                 None => (0.0, drvr_slew),
                             },
                             _ => (0.0, drvr_slew),
@@ -1200,6 +1232,11 @@ impl<'a> Graph<'a> {
         for &v in &order {
             if reached[v] {
                 self.find_vertex_delays(v, parasitics, &index, trace.as_deref_mut())?;
+            } else if !self.vertices[v].is_driver && self.slew_limit.contains_key(&v) && !self.slew_annotated.contains_key(&v) {
+                // 🔑 A load the search does not reach (its driver held constant: `searchFrom`)
+                // still has the slews its driver's arcs gave it, and the limit is read off them
+                // all the same (repair_design's forward pass reads `graph_->slew` of EVERY load).
+                self.hold_load_at_limit(v);
             }
         }
         // Timing-check delays, after every slew is known.
@@ -1273,6 +1310,20 @@ impl<'a> Graph<'a> {
         reached
     }
 
+    /// A load with a slew limit ([`Graph::slew_limit`]): its driver set its slew; before its
+    /// fanout reads it, an excess on either transition holds BOTH max slews at the limit.
+    fn hold_load_at_limit(&mut self, v: usize) {
+        let Some(&limit) = self.slew_limit.get(&v) else { return };
+        if self.in_edges[v].iter().all(|&e| self.is_check(e)) {
+            return;
+        }
+        if self.slew[v][RISE][MAX] > limit || self.slew[v][FALL][MAX] > limit {
+            self.slew[v][RISE][MAX] = limit;
+            self.slew[v][FALL][MAX] = limit;
+            self.clamped.push(v);
+        }
+    }
+
     pub fn is_constant(&self, v: usize) -> bool {
         !self.sdc.constants.is_empty() && self.sdc.constants.contains_key(&self.vertices[v].name)
     }
@@ -1303,14 +1354,8 @@ impl<'a> Graph<'a> {
             } else if let Some(&value) = self.slew_annotated.get(&v) {
                 self.slew[v][RISE][MAX] = value;
                 self.slew[v][FALL][MAX] = value;
-            } else if let Some(&limit) = self.slew_limit.get(&v) {
-                // Its driver set its slew; before its fanout reads it, an excess on either
-                // transition holds BOTH max slews at the limit.
-                if self.slew[v][RISE][MAX] > limit || self.slew[v][FALL][MAX] > limit {
-                    self.slew[v][RISE][MAX] = limit;
-                    self.slew[v][FALL][MAX] = limit;
-                    self.clamped.push(v);
-                }
+            } else {
+                self.hold_load_at_limit(v);
             }
             return Ok(());
         }
@@ -1334,11 +1379,12 @@ impl<'a> Graph<'a> {
                     let in_slew = self.sdc.input_slew.get(&self.vertices[v].name).and_then(|s| s[rf][mm]).unwrap_or(0.0);
                     self.slew[v][rf][mm] = annotated.unwrap_or(in_slew);
                     let (_, _, pe) = self.parasitic_load(v, rf, mm, parasitics, index);
+                    let elmores = LoadElmores::new(pe.as_ref());
                     for &e in &wires {
                         let load = self.edges[e].to;
                         let mut wire_delay = 0.0f64;
                         let mut load_slew = f64::from(in_slew);
-                        let elmore = pe.as_ref().and_then(|(p, names)| p.elmore.iter().find(|(n, _)| names[*n] == self.vertices[load].name).map(|(_, e)| *e));
+                        let elmore = pe.as_ref().and_then(|(p, names)| elmores.get(p, names, &self.vertices[load].name));
                         let ll = self.threshold_library(load);
                         if let Some(el) = elmore {
                             let l = &self.libs[ll];
@@ -1376,6 +1422,7 @@ impl<'a> Graph<'a> {
         // `parasiticLoad` depends on the driver, the transition and min/max only, not on the arc:
         // reduced once per pair, on first use, rather than once per arc.
         let mut loads: [[Option<ParasiticLoad>; 2]; 2] = Default::default();
+        let mut elmore_maps: [[Option<LoadElmores>; 2]; 2] = Default::default();
         // Edges are PREPENDED to a vertex's in-edge list, so they are visited newest first —
         // the reverse of the cell's arc-set order.
         for &e in fanin.iter().rev() {
@@ -1405,6 +1452,7 @@ impl<'a> Graph<'a> {
                         loads[rf][mm] = Some(self.parasitic_load(v, rf, mm, parasitics, index));
                     }
                     let (pin_cap, wire_cap, pe) = loads[rf][mm].as_ref().expect("set above");
+                    let elmores = elmore_maps[rf][mm].get_or_insert_with(|| LoadElmores::new(pe.as_ref()));
                     let load_cap = pin_cap + wire_cap;
                     let l = &self.libs[drvr_lib];
                     let th = Thresholds { vth: l.output_threshold[rf], vl: l.slew_lower_threshold[rf], vh: l.slew_upper_threshold[rf], slew_derate: l.slew_derate };
@@ -1438,8 +1486,8 @@ impl<'a> Graph<'a> {
                     for &w in &wires {
                         let load = self.edges[w].to;
                         let (mut wire_delay, mut load_slew) = match (&mut dmp, &pe) {
-                            (Some(d), Some((p, names))) => match p.elmore.iter().find(|(n, _)| names[*n] == self.vertices[load].name) {
-                                Some(&(_, el)) => d.load_delay_slew(f64::from(el)),
+                            (Some(d), Some((p, names))) => match elmores.get(p, names, &self.vertices[load].name) {
+                                Some(el) => d.load_delay_slew(f64::from(el)),
                                 None => (0.0, drvr_slew),
                             },
                             _ => (0.0, f64::from(ds32)),
@@ -1531,6 +1579,26 @@ impl<'a> Graph<'a> {
 mod tests {
     use super::*;
     use crate::netlist::{Conn, Net, Netlist, PortDir};
+
+    /// Rule (`ReducedParasitic` keeps a load's Elmore delay in a pin map; `findElmore` finds it or
+    /// reports none): a load's delay by name is the first entry a pass over the list finds, on a
+    /// net small enough for the pass and on one large enough for the map, and none for a pin the
+    /// parasitic does not hold.
+    #[test]
+    fn a_loads_elmore_by_name_is_the_one_the_pass_finds() {
+        for n in [3usize, 40] {
+            let names: Vec<String> = (0..n).map(|k| format!("u{}/A", k % (n - 1))).collect();
+            let p = crate::parasitics::PiElmore { c2: 0.0, rpi: 0.0, c1: 0.0, elmore: (0..n).map(|k| (k, k as f32)).collect() };
+            let pe = (p.clone(), names.as_slice());
+            let ix = LoadElmores::new(Some(&pe));
+            assert_eq!(ix.by_name.is_some(), n > LoadElmores::PASS_MAX);
+            for name in names.iter().map(String::as_str).chain(["nowhere"]) {
+                let pass = p.elmore.iter().find(|(k, _)| names[*k] == name).map(|&(_, e)| e);
+                assert_eq!(ix.get(&p, &names, name), pass, "{name} of {n}");
+            }
+            assert_eq!(ix.get(&p, &names, "u0/A"), Some(0.0), "the repeated name: its first entry");
+        }
+    }
 
     const LIB: &str = r#"library (t) {
       time_unit : "1ns"; capacitive_load_unit (1, pf);
@@ -1742,6 +1810,25 @@ mod tests {
         assert_eq!([g.slew[u2a][RISE][MAX], g.slew[u2a][FALL][MAX]], [0.5e-9, 0.5e-9]);
         // u1/Y takes the B arc's slew (newest first, see below); the lumped load inherits it.
         assert_eq!(g.slew[u2a][RISE][MIN], 1.000_000_5f32 * 1e-9, "only max is held");
+    }
+
+    /// Rule (`RepairDesign::repairDesign`'s forward pass reads `graph_->slew` of every load;
+    /// `findDriverArcDelays` sets a load's slew from its driver's arcs whether or not the search
+    /// goes on from the driver): u1/Y held constant (u1/A = 0, the AND's output 0) is still timed
+    /// through u1/B, so its load u2/A, which the search never reaches, is held at its limit too.
+    #[test]
+    fn a_load_of_a_constant_driver_over_its_limit_is_held_at_it() {
+        let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
+        let nl = chain();
+        let mut g = Graph::build(&libs, &nl).unwrap();
+        for p in ["u1/A", "u1/Y", "u2/A"] {
+            g.sdc.constants.insert(p.into(), false);
+        }
+        let u2a = g.vertices.iter().position(|v| v.name == "u2/A").unwrap();
+        g.slew_limit.insert(u2a, 0.5e-9);
+        g.find_delays(&HashMap::new(), None).unwrap();
+        assert_eq!(g.clamped, vec![u2a]);
+        assert_eq!([g.slew[u2a][RISE][MAX], g.slew[u2a][FALL][MAX]], [0.5e-9, 0.5e-9]);
     }
 
     /// Rule (an annotated slew): the annotation IS the max slew, even below what the calculation

@@ -82,6 +82,39 @@ struct NetMoves {
     named_new: Vec<(String, usize)>,
 }
 
+/// What the netlists since a graph's last edit changed, by slot, when no slot moves (the caller
+/// holds the order: what an edit makes is appended): the instance and net slots replaced or
+/// appended, in any order, repeats allowed. With it a graph keeps a netlist of its own and
+/// patches those slots ([`Graph::apply_edits_held`]) — the reference's network is edited, never
+/// copied — instead of comparing every instance and net of two generations.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SlotDelta {
+    pub insts: Vec<usize>,
+    pub nets: Vec<usize>,
+}
+
+impl SlotDelta {
+    /// `other`'s slots added to these.
+    pub fn extend(&mut self, other: &SlotDelta) {
+        self.insts.extend_from_slice(&other.insts);
+        self.nets.extend_from_slice(&other.nets);
+    }
+}
+
+/// The net names the edits named (made, connected to, disconnected from), in first-named order.
+fn named_nets(events: &[String]) -> Vec<&str> {
+    let mut named: Vec<&str> = Vec::new();
+    for ev in events {
+        let f: Vec<&str> = ev.split('|').collect();
+        if let ["net_create", net, ..] | ["iterm_connect" | "bterm_connect" | "iterm_disconnect" | "bterm_disconnect", _, net, _] = f.as_slice() {
+            if !named.contains(net) {
+                named.push(net);
+            }
+        }
+    }
+    named
+}
+
 /// An old instance at `k` moves up by the number of new ones at or before it.
 fn shifted(at: &[usize], k: usize) -> usize {
     k + at.partition_point(|&p| p <= k)
@@ -92,6 +125,107 @@ impl<'a> Graph<'a> {
     /// takes `netlist` — the generation after them. `pins` is the build's master-pin filter.
     pub fn apply_edits(&mut self, events: &[String], netlist: Arc<Netlist>, pins: Option<&HashMap<String, Vec<String>>>) -> Result<(), NotInPlace> {
         let moves = self.check_extends(&netlist, events)?;
+        let mut b = self.batch(pins)?;
+        self.shift_instances(&moves.at);
+        self.edit_events(&moves, events, &mut b)?;
+        let old_nets = self.netlist.nets.len();
+        self.shift_nets(&moves.nets, &mut b);
+        self.netlist = NetlistRef::Shared(netlist);
+        self.update_vertex_nets(&b, old_nets, true)?;
+        let _ = self.index_cache.set(Arc::new(b.index));
+        Ok(())
+    }
+
+    /// [`Graph::apply_edits`] when no slot of the netlist moved since the graph's last edit and
+    /// `slots` lists every one replaced or appended: the graph's own netlist is patched at those
+    /// slots to `next` (made its own the first time), with no pass over the netlist. Each batch
+    /// costs what it edits; comparing two generations and copying one cost the whole design per
+    /// repeater. `VYGES_STA_CHECK_EDIT` also checks the patched netlist equals `next`.
+    pub fn apply_edits_held(&mut self, events: &[String], next: &Netlist, slots: &SlotDelta, pins: Option<&HashMap<String, Vec<String>>>) -> Result<(), NotInPlace> {
+        let moves = self.held_moves(next, events, slots)?;
+        let mut b = self.batch(pins)?;
+        self.edit_events(&moves, events, &mut b)?;
+        let old_nets = self.netlist.nets.len();
+        // the vertices on a replaced net the edits named, read again by name (as `shift_nets`)
+        for &k in &moves.nets.named_old {
+            for c in &self.netlist.nets[k].pins {
+                if let Some(&v) = b.index.get(&self.netlist.pin_name(c)) {
+                    b.touched.push(v);
+                }
+            }
+        }
+        self.patch_netlist(next, slots);
+        // the kept slot map takes the slots replaced (a rename moves a name) and appended; a name
+        // it then misses is on no net
+        if let Some(map) = self.net_slots.as_mut() {
+            for &k in &slots.nets {
+                if let Some(n) = self.netlist.nets.get(k) {
+                    map.insert(n.name.clone(), k);
+                }
+            }
+        }
+        self.update_vertex_nets(&b, old_nets, false)?;
+        let _ = self.index_cache.set(Arc::new(b.index));
+        if std::env::var_os("VYGES_STA_CHECK_EDIT").is_some() && *self.netlist != *next {
+            return Err(NotInPlace::Netlist("the patched netlist differs from the next one".into()));
+        }
+        Ok(())
+    }
+
+    /// [`Graph::apply_edits_held`]'s moves: the instances made are the ones appended; no net moved;
+    /// a replaced net whose old name the edits named is read again.
+    fn held_moves(&self, next: &Netlist, events: &[String], slots: &SlotDelta) -> Result<Moves, NotInPlace> {
+        let old = &*self.netlist;
+        if next.ports.len() != old.ports.len() {
+            return Err(NotInPlace::Netlist("the ports changed".into()));
+        }
+        if next.insts.len() < old.insts.len() || next.nets.len() < old.nets.len() {
+            return Err(NotInPlace::Netlist("a held netlist shrank".into()));
+        }
+        let made: std::collections::HashSet<&str> = events.iter().filter_map(|e| e.strip_prefix("inst_create|")).filter_map(|r| r.split('|').next()).collect();
+        let mut made_at = HashMap::new();
+        for (j, i) in next.insts.iter().enumerate().skip(old.insts.len()) {
+            if !made.contains(i.0.as_str()) {
+                return Err(NotInPlace::Netlist("an instance moved".into()));
+            }
+            made_at.insert(i.0.clone(), j);
+        }
+        let named = named_nets(events);
+        let mut named_old: Vec<usize> = slots.nets.iter().copied().filter(|&k| k < old.nets.len() && named.contains(&old.nets[k].name.as_str())).collect();
+        named_old.sort_unstable();
+        named_old.dedup();
+        Ok(Moves { at: vec![old.insts.len(); made_at.len()], made_at, nets: NetMoves { named_old, ..NetMoves::default() } })
+    }
+
+    /// The graph's netlist made its own (copied once, the first time another holds it) and set to
+    /// `next` at the slots listed and the ones appended.
+    fn patch_netlist(&mut self, next: &Netlist, slots: &SlotDelta) {
+        let unique = matches!(&self.netlist, NetlistRef::Shared(a) if Arc::strong_count(a) == 1 && Arc::weak_count(a) == 0);
+        if !unique {
+            if std::env::var_os("VYGES_STA_INDEX_TRACE").is_some() {
+                eprintln!("VYGINDEX|netlist-copied|{}", self.netlist.nets.len());
+            }
+            self.netlist = NetlistRef::Shared(Arc::new((*self.netlist).clone()));
+        }
+        let NetlistRef::Shared(a) = &mut self.netlist else { unreachable!("made shared above") };
+        let own = Arc::get_mut(a).expect("held by this graph alone");
+        let (ni, nn) = (own.insts.len(), own.nets.len());
+        for &k in &slots.insts {
+            if k < ni {
+                own.insts[k] = next.insts[k].clone();
+            }
+        }
+        own.insts.extend(next.insts[ni..].iter().cloned());
+        for &k in &slots.nets {
+            if k < nn {
+                own.nets[k] = next.nets[k].clone();
+            }
+        }
+        own.nets.extend(next.nets[nn..].iter().cloned());
+    }
+
+    /// The batch state: the vertex index taken over from the last build or edit.
+    fn batch<'p>(&mut self, pins: Option<&'p HashMap<String, Vec<String>>>) -> Result<Batch<'p>, NotInPlace> {
         let index = match self.index_cache.take() {
             Some(ix) => Arc::try_unwrap(ix).unwrap_or_else(|shared| {
                 // ⚠️ O(graph): another holder of the index makes every edit copy it
@@ -111,22 +245,25 @@ impl<'a> Graph<'a> {
         if index.len() != self.vertices.len() {
             return Err(NotInPlace::Event("a pin name shared by two vertices".into()));
         }
-        let mut b = Batch { index, free: Vec::new(), touched: Vec::new(), nets: std::collections::HashSet::new(), pins, swap_equiv: false, swapped: Vec::new() };
-        self.shift_instances(&moves.at);
+        Ok(Batch { index, free: Vec::new(), touched: Vec::new(), nets: std::collections::HashSet::new(), pins, swap_equiv: false, swapped: Vec::new() })
+    }
+
+    /// Each event made on the graph, in order (one function per callback).
+    fn edit_events(&mut self, moves: &Moves, events: &[String], b: &mut Batch<'_>) -> Result<(), NotInPlace> {
         for ev in events {
             let f: Vec<&str> = ev.split('|').collect();
             match f.as_slice() {
-                ["inst_create", inst, master] => self.make_instance_after(&moves, inst, master, &mut b)?,
+                ["inst_create", inst, master] => self.make_instance_after(moves, inst, master, b)?,
                 ["iterm_connect" | "bterm_connect", pin, net, on_net] => {
                     b.nets.insert(net.to_string());
-                    self.connect_pin_after(pin, on_net, &mut b);
+                    self.connect_pin_after(pin, on_net, b);
                 }
                 ["iterm_disconnect" | "bterm_disconnect", pin, net, _on_net] => {
                     b.nets.insert(net.to_string());
-                    self.disconnect_pin_before(pin, &mut b);
+                    self.disconnect_pin_before(pin, b);
                 }
-                ["swap_before", inst, from, to, _terms] => self.replace_cell_before(inst, from, to, ev, &mut b)?,
-                ["swap_after", inst, _terms] => self.replace_cell_after(inst, &mut b),
+                ["swap_before", inst, from, to, _terms] => self.replace_cell_before(inst, from, to, ev, b)?,
+                ["swap_after", inst, _terms] => self.replace_cell_after(inst, b),
                 // a net made under one name may hold another by the end (`swapNetNames`): the
                 // name it was made with is looked for too
                 ["net_create", net, ..] => {
@@ -138,11 +275,6 @@ impl<'a> Graph<'a> {
         if !b.free.is_empty() {
             return Err(NotInPlace::Holes(b.free.len()));
         }
-        let old_nets = self.netlist.nets.len();
-        self.shift_nets(&moves.nets, &mut b);
-        self.netlist = NetlistRef::Shared(netlist);
-        self.update_vertex_nets(&b, old_nets)?;
-        let _ = self.index_cache.set(Arc::new(b.index));
         Ok(())
     }
 
@@ -185,15 +317,7 @@ impl<'a> Graph<'a> {
         }
         // The names the edits named, as a short list: most batches name a few nets, and this is
         // asked of every net whose entry the edit did not share.
-        let mut named: Vec<&str> = Vec::new();
-        for ev in events {
-            let f: Vec<&str> = ev.split('|').collect();
-            if let ["net_create", net, ..] | ["iterm_connect" | "bterm_connect" | "iterm_disconnect" | "bterm_disconnect", _, net, _] = f.as_slice() {
-                if !named.contains(net) {
-                    named.push(net);
-                }
-            }
-        }
+        let named = named_nets(events);
         let big = (named.len() > 16).then(|| named.iter().copied().collect::<std::collections::HashSet<&str>>());
         let is_named = |n: &str| match &big {
             Some(set) => set.contains(n),
@@ -499,11 +623,11 @@ impl<'a> Graph<'a> {
     /// The net of each pin the batch connected, disconnected or made, from the netlist it moved
     /// to: the nets its edits named, and the ones the netlist added; a pin on none of them is on no
     /// net.
-    fn update_vertex_nets(&mut self, b: &Batch<'_>, old_nets: usize) -> Result<(), NotInPlace> {
+    fn update_vertex_nets(&mut self, b: &Batch<'_>, old_nets: usize, look_for_misses: bool) -> Result<(), NotInPlace> {
         if b.touched.is_empty() {
             return Ok(());
         }
-        let slots = self.named_net_slots(&b.nets, old_nets);
+        let slots = self.named_net_slots(&b.nets, old_nets, look_for_misses);
         let mut want: HashMap<&str, usize> = b.touched.iter().map(|&v| (self.vertices[v].name.as_str(), v)).collect();
         let mut found: Vec<(usize, Option<usize>)> = Vec::with_capacity(want.len());
         for n in slots {
@@ -527,7 +651,7 @@ impl<'a> Graph<'a> {
     /// slot where the netlist has another name (a rename moves a name, not a slot), or a name it
     /// does not hold, is looked for by a pass over the netlist and entered — the names missed, not
     /// the map again (on picorv32 a miss came every twentieth edit, each a whole-map rebuild).
-    fn named_net_slots(&mut self, names: &std::collections::HashSet<String>, old_nets: usize) -> Vec<usize> {
+    fn named_net_slots(&mut self, names: &std::collections::HashSet<String>, old_nets: usize, look_for_misses: bool) -> Vec<usize> {
         let nets = &self.netlist.nets;
         let map = match self.net_slots.as_mut() {
             Some(map) => {
@@ -539,7 +663,7 @@ impl<'a> Graph<'a> {
             None => self.net_slots.insert(nets.iter().enumerate().map(|(k, n)| (n.name.clone(), k)).collect()),
         };
         let held = |map: &HashMap<String, usize>, name: &String| map.get(name).copied().filter(|&k| nets.get(k).is_some_and(|n| &n.name == name));
-        let mut missed: Vec<&String> = names.iter().filter(|name| held(map, name).is_none()).collect();
+        let mut missed: Vec<&String> = if look_for_misses { names.iter().filter(|name| held(map, name).is_none()).collect() } else { Vec::new() };
         if !missed.is_empty() {
             if std::env::var_os("VYGES_STA_NET_SLOTS_TRACE").is_some() {
                 eprintln!("VYGSLOTS|missed|{missed:?}");
@@ -698,6 +822,24 @@ mod tests {
         assert_eq!(g.differs_from_build(&fresh), None);
     }
 
+    /// Rule (the reference's network is edited, never copied): with the order held, the slots an
+    /// edit replaced or appended patch the graph's own netlist; the result is the next netlist,
+    /// the graph equals a fresh build of it, and the caller's netlist is left as it was.
+    #[test]
+    fn a_held_edit_patches_its_slots_and_matches_a_fresh_build() {
+        let libs = libs();
+        let first = Arc::new(chain(false));
+        let mut g = Graph::build_shared(&libs, first.clone(), None).unwrap();
+        let next = chain(true);
+        let slots = SlotDelta { insts: vec![2], nets: vec![2, 5] };
+        g.apply_edits_held(&insertion(), &next, &slots, None).unwrap();
+        assert_eq!(*g.netlist, next, "the patched slots give the next netlist");
+        assert_eq!(*first, chain(false), "the netlist the graph was built from is not written");
+        let fresh = Graph::build(&libs, &next).unwrap();
+        assert_eq!(g.differs_from_build(&fresh), None);
+        assert!(edge(&g, "buf1/Y", "u2/A").is_some());
+    }
+
     /// Rule (an edit replaces nets in their slots or appends them; a rename moves a NAME, not a
     /// slot): the slot map kept across edits answers as a pass over every net — after an append,
     /// and after two slots trade names (both stale in the map: found by the pass).
@@ -706,20 +848,20 @@ mod tests {
         let libs = libs();
         let mut g = Graph::build_shared(&libs, Arc::new(chain(false)), None).unwrap();
         let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<std::collections::HashSet<String>>();
-        assert_eq!(g.named_net_slots(&names(&["n1", "y"]), 5), vec![2, 4]);
+        assert_eq!(g.named_net_slots(&names(&["n1", "y"]), 5, true), vec![2, 4]);
         g.netlist = NetlistRef::Shared(Arc::new(chain(true)));
-        assert_eq!(g.named_net_slots(&names(&["n2", "n1"]), 5), vec![2, 5], "an appended net enters the map");
+        assert_eq!(g.named_net_slots(&names(&["n2", "n1"]), 5, true), vec![2, 5], "an appended net enters the map");
         let mut traded = chain(true);
         Arc::make_mut(&mut traded.nets[2]).name = "n2".into();
         Arc::make_mut(&mut traded.nets[5]).name = "n1".into();
         g.netlist = NetlistRef::Shared(Arc::new(traded));
-        assert_eq!(g.named_net_slots(&names(&["n1"]), 6), vec![5]);
-        assert_eq!(g.named_net_slots(&names(&["n2"]), 6), vec![2]);
+        assert_eq!(g.named_net_slots(&names(&["n1"]), 6, true), vec![5]);
+        assert_eq!(g.named_net_slots(&names(&["n2"]), 6, true), vec![2]);
         // a name the map never held, at a slot below the old count; a name on no net has no slot
         let mut moved = chain(true);
         Arc::make_mut(&mut moved.nets[3]).name = "fresh".into();
         g.netlist = NetlistRef::Shared(Arc::new(moved));
-        assert_eq!(g.named_net_slots(&names(&["fresh", "nowhere", "n1"]), 6), vec![2, 3], "n1 back at 2: its kept slot 5 is stale");
+        assert_eq!(g.named_net_slots(&names(&["fresh", "nowhere", "n1"]), 6, true), vec![2, 3], "n1 back at 2: its kept slot 5 is stale");
     }
 
     /// Rule: an entry the next netlist shares with the graph's (the same allocation) is the same

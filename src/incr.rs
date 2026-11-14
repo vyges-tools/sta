@@ -144,6 +144,11 @@ pub struct IncTimer {
     /// Each instance's cell and each top port's direction (input: true), kept by the events.
     pub cells: HashMap<String, String>,
     pub port_input: HashMap<String, bool>,
+    /// Each net's drivers as the last connect or disconnect on it listed them: a load moved
+    /// between nets (a fanout repair moves every load of a net) reads them here, not from a pass
+    /// over every pin on the net (that was O(fanout) per event, O(fanout²) per repair). Dropped
+    /// for a net when a driver of it is connected or disconnected, and whole on any other event.
+    net_drivers: HashMap<String, Vec<String>>,
     /// This timer prints the graph-edit trace (`VYGES_STA_GRAPH_TRACE`): one timer per design
     /// does — the reference has ONE graph for every scene, a caller one timer per scene.
     pub trace_edits: bool,
@@ -1117,9 +1122,12 @@ impl IncTimer {
         if self.tracing() {
             trace_callback(&f);
         }
+        if !matches!(f.first(), Some(&("iterm_connect" | "bterm_connect" | "iterm_disconnect" | "bterm_disconnect"))) {
+            self.net_drivers.clear();
+        }
         match f.as_slice() {
-            ["iterm_connect" | "bterm_connect", pin, _net, pins] => self.connect_pin_after(cx, pin, pins),
-            ["iterm_disconnect" | "bterm_disconnect", pin, _net, pins] => self.disconnect_pin_before(cx, pin, pins),
+            ["iterm_connect" | "bterm_connect", pin, net, pins] => self.connect_pin_after(cx, pin, net, pins),
+            ["iterm_disconnect" | "bterm_disconnect", pin, net, pins] => self.disconnect_pin_before(cx, pin, net, pins),
             ["iterm_destroy", pin, _net] => self.delete_vertex(pin),
             ["inst_create", inst, master] => {
                 // `makeInstanceAfter`: new vertices (level 0) and instance edges.
@@ -1151,7 +1159,7 @@ impl IncTimer {
             ["net_destroy", _net, pins] => {
                 // `deleteNetBefore`: each pin still on the net disconnected.
                 for p in pins.split(',').filter(|p| !p.is_empty()) {
-                    self.disconnect_pin_before(cx, p, pins);
+                    self.disconnect_pin_before(cx, p, "", pins);
                 }
             }
             // A port's vertex: made at level 0, or forgotten with its level.
@@ -1168,12 +1176,33 @@ impl IncTimer {
         Ok(())
     }
 
+    /// The drivers among `pins`, the pins on `net` (an event's list): kept per net while only
+    /// loads come and go ([`IncTimer::net_drivers`]); a driver pin's own event reads them whole.
+    /// `VYGES_STA_CHECK_EVENTS`: each kept answer against the pass.
+    fn net_drivers_of(&mut self, cx: &EventCtx<'_>, pin_is_driver: bool, net: &str, pins: &str) -> (Vec<String>, Option<Vec<String>>) {
+        if pin_is_driver || net.is_empty() {
+            self.net_drivers.remove(net);
+            let (d, l) = self.drivers_loads(cx, pins);
+            return (d, Some(l));
+        }
+        if let Some(d) = self.net_drivers.get(net) {
+            if std::env::var_os("VYGES_STA_CHECK_EVENTS").is_some() {
+                assert_eq!(*d, self.drivers_loads(cx, pins).0, "kept drivers of {net} stale");
+            }
+            return (d.clone(), None);
+        }
+        let (d, _) = self.drivers_loads(cx, pins);
+        self.net_drivers.insert(net.to_string(), d.clone());
+        (d, None)
+    }
+
     /// `Sta::connectPinAfter` (+ `connectDrvrPinAfter` / `connectLoadPinAfter`).
-    fn connect_pin_after(&mut self, cx: &EventCtx<'_>, pin: &str, pins: &str) {
+    fn connect_pin_after(&mut self, cx: &EventCtx<'_>, pin: &str, net: &str, pins: &str) {
         let Some((is_drv, is_load)) = self.pin_kind(cx, pin) else { return };
         self.arrival_invalid(pin.to_string());
         self.required_invalid(pin.to_string());
-        let (drivers, loads) = self.drivers_loads(cx, pins);
+        let (drivers, loads) = self.net_drivers_of(cx, is_drv, net, pins);
+        let loads = loads.unwrap_or_default();
         if is_drv {
             for l in loads.iter().filter(|l| *l != pin) {
                 if self.tracing() {
@@ -1202,9 +1231,10 @@ impl IncTimer {
     }
 
     /// `Sta::disconnectPinBefore`: the pin's wire edges deleted.
-    fn disconnect_pin_before(&mut self, cx: &EventCtx<'_>, pin: &str, pins: &str) {
+    fn disconnect_pin_before(&mut self, cx: &EventCtx<'_>, pin: &str, net: &str, pins: &str) {
         let Some((is_drv, is_load)) = self.pin_kind(cx, pin) else { return };
-        let (drivers, loads) = self.drivers_loads(cx, pins);
+        let (drivers, loads) = self.net_drivers_of(cx, is_drv, net, pins);
+        let loads = loads.unwrap_or_default();
         if is_drv {
             for l in loads.iter().filter(|l| *l != pin) {
                 self.delete_edge(pin, l, EdgeKey::Wire { from: pin.to_string(), to: l.clone() });
@@ -1515,6 +1545,34 @@ mod tests {
         assert!(inc.delay_queue.contains("b2/A"));
         inc.find_delays(&mut g, &HashMap::new(), None).unwrap();
         assert_eq!(inc.visited[..2], ["b2/A".to_string(), "b2/X".into()]);
+    }
+
+    // Rule (`connectPinAfter` / `disconnectPinBefore` read the net's drivers at the event): the
+    // drivers kept per net while only loads come and go answer as a pass over the event's pins;
+    // a driver's own event reads them again, and any other event drops every kept net.
+    #[test]
+    fn the_kept_drivers_of_a_net_answer_as_the_pass() {
+        let libs = libs();
+        let cx = EventCtx { libs: &libs, ideal_clock_mode: false };
+        let mut inc = IncTimer::default();
+        for i in ["b1", "b2", "b3", "b4"] {
+            inc.cells.insert(i.into(), "buf".into());
+        }
+        let pass = |inc: &IncTimer, pins: &str| inc.drivers_loads(&cx, pins).0;
+        let pins = "b1/X,b2/A,b3/A";
+        assert_eq!(inc.net_drivers_of(&cx, false, "n1", pins).0, pass(&inc, pins));
+        assert!(inc.net_drivers.contains_key("n1"), "a load's event keeps them");
+        // loads leave one at a time (a fanout repair): each answer from the kept list
+        for pins in ["b1/X,b3/A", "b1/X"] {
+            assert_eq!(inc.net_drivers_of(&cx, false, "n1", pins).0, pass(&inc, pins));
+        }
+        // the driver moves: its own event reads the net again; the next load sees the new one
+        let (d, loads) = inc.net_drivers_of(&cx, true, "n1", "b4/X");
+        assert_eq!((d, loads), (vec!["b4/X".to_string()], Some(vec![])));
+        let pins = "b4/X,b2/A";
+        assert_eq!(inc.net_drivers_of(&cx, false, "n1", pins).0, ["b4/X"]);
+        inc.apply_event(&cx, "net_create|n9").unwrap();
+        assert!(inc.net_drivers.is_empty(), "another event drops every kept net");
     }
 }
 
