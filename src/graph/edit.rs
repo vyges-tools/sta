@@ -11,11 +11,14 @@
 //!   driver to another keeps the id of the edge it lost;
 //! - an equivalent-arcs swap keeps every edge (the arc sets correspond index for index); any other
 //!   swap deletes the arcs out of the instance's inputs, newest first, and makes the new cell's;
-//! - a vertex's slews and an edge's delays stay with it: nothing is imported.
+//! - a vertex's slews and an edge's delays stay with it: nothing is imported;
+//! - an instance or net the database made at a reused id lands mid-order in the netlist: the
+//!   instance and net indices the vertices hold move up past it; the vertices themselves do not
+//!   (the vertex table appends) — see [`Graph::check_extends`].
 //!
 //! What is not edited in place — a vertex or net deleted, a port made, an edit that leaves an edge
-//! id free, a netlist whose existing instances or nets moved — is refused, and the caller builds
-//! the graph again.
+//! id free, a netlist whose existing instances or nets moved other than by an insertion — is
+//! refused, and the caller builds the graph again.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -60,11 +63,35 @@ struct Batch<'p> {
     swapped: Vec<usize>,
 }
 
+/// [`Graph::check_extends`]'s answer: where the new instances went — `at[j]` is the number of old
+/// instances before the `j`-th new one, `made_at` its index — and where the old nets went.
+struct Moves {
+    at: Vec<usize>,
+    made_at: HashMap<String, usize>,
+    nets: NetMoves,
+}
+
+/// Each old net's slot in the new netlist (`map`, empty when every slot stands; `None`: a net the
+/// edits named), whether any moved, the old slots the edits named, and the new slots of the names
+/// the edits named.
+#[derive(Default)]
+struct NetMoves {
+    map: Vec<Option<usize>>,
+    moved: bool,
+    named_old: Vec<usize>,
+    named_new: Vec<(String, usize)>,
+}
+
+/// An old instance at `k` moves up by the number of new ones at or before it.
+fn shifted(at: &[usize], k: usize) -> usize {
+    k + at.partition_point(|&p| p <= k)
+}
+
 impl<'a> Graph<'a> {
     /// The netlist edits `events` (the database's callbacks, in order) made on the graph, which then
     /// takes `netlist` — the generation after them. `pins` is the build's master-pin filter.
     pub fn apply_edits(&mut self, events: &[String], netlist: Arc<Netlist>, pins: Option<&HashMap<String, Vec<String>>>) -> Result<(), NotInPlace> {
-        self.check_extends(&netlist)?;
+        let moves = self.check_extends(&netlist, events)?;
         let index = match self.index_cache.take() {
             Some(ix) => Arc::try_unwrap(ix).unwrap_or_else(|shared| {
                 // ⚠️ O(graph): another holder of the index makes every edit copy it
@@ -85,10 +112,11 @@ impl<'a> Graph<'a> {
             return Err(NotInPlace::Event("a pin name shared by two vertices".into()));
         }
         let mut b = Batch { index, free: Vec::new(), touched: Vec::new(), nets: std::collections::HashSet::new(), pins, swap_equiv: false, swapped: Vec::new() };
+        self.shift_instances(&moves.at);
         for ev in events {
             let f: Vec<&str> = ev.split('|').collect();
             match f.as_slice() {
-                ["inst_create", inst, master] => self.make_instance_after(&netlist, inst, master, &mut b)?,
+                ["inst_create", inst, master] => self.make_instance_after(&moves, inst, master, &mut b)?,
                 ["iterm_connect" | "bterm_connect", pin, net, on_net] => {
                     b.nets.insert(net.to_string());
                     self.connect_pin_after(pin, on_net, &mut b);
@@ -99,7 +127,11 @@ impl<'a> Graph<'a> {
                 }
                 ["swap_before", inst, from, to, _terms] => self.replace_cell_before(inst, from, to, ev, &mut b)?,
                 ["swap_after", inst, _terms] => self.replace_cell_after(inst, &mut b),
-                ["net_create", ..] => {}
+                // a net made under one name may hold another by the end (`swapNetNames`): the
+                // name it was made with is looked for too
+                ["net_create", net, ..] => {
+                    b.nets.insert(net.to_string());
+                }
                 _ => return Err(NotInPlace::Event(ev.clone())),
             }
         }
@@ -107,48 +139,181 @@ impl<'a> Graph<'a> {
             return Err(NotInPlace::Holes(b.free.len()));
         }
         let old_nets = self.netlist.nets.len();
+        self.shift_nets(&moves.nets, &mut b);
         self.netlist = NetlistRef::Shared(netlist);
         self.update_vertex_nets(&b, old_nets)?;
         let _ = self.index_cache.set(Arc::new(b.index));
         Ok(())
     }
 
-    /// Every instance, port and net the graph indexes keeps its index in `next`: the database
-    /// appends what it makes, so an insertion leaves them; a deletion moves the ones after it.
-    /// A net renamed keeps its slot (a rename raises no callback): a buffer before a port makes its
-    /// net and swaps the two names, so the port's name moves to the appended net — a name found
-    /// there is a rename; one found anywhere else, a move.
-    /// An entry shared with the old netlist (the same allocation) is the same entry: only the
-    /// ones an edit replaced are compared by name.
-    fn check_extends(&self, next: &Netlist) -> Result<(), NotInPlace> {
+    /// Where the database put what the edits made, against the graph's netlist (`dbTable::create`
+    /// takes the LAST freed id, `dbBlock` iterates by id: after a deletion — `remove_buffers`, or a
+    /// database written after one — a new instance or net lands at its id's rank, in the middle).
+    ///
+    /// - Instances: the old ones, in order, are the new list less the ones `inst_create` named; any
+    ///   other difference is a move.
+    /// - Nets: an edit replaces the nets it names in their slots, inserts the ones it makes, and may
+    ///   trade two of their names (`swapNetNames`: no callback). So the old nets the edits did not
+    ///   name, in order, are the new list less the names the edits named; a net named by no edit
+    ///   that is not where that says is a move. An entry shared with the old netlist (the same
+    ///   allocation) is the same net.
+    ///
+    /// The graph's own vertices are not moved: `Graph::makeVertex` takes the next id of the
+    /// vertex table (appended, as here), whatever the network's order; only the netlist indices a
+    /// vertex holds — its instance, its net's slot — follow the insertion.
+    fn check_extends(&self, next: &Netlist, events: &[String]) -> Result<Moves, NotInPlace> {
         let old = &*self.netlist;
-        if next.insts.len() < old.insts.len() || old.insts.iter().zip(&next.insts).any(|(a, b)| !Arc::ptr_eq(a, b) && a.0 != b.0) {
-            return Err(NotInPlace::Netlist("an instance moved".into()));
-        }
         if next.ports != old.ports {
             return Err(NotInPlace::Netlist("the ports changed".into()));
         }
-        let appended = next.nets.get(old.nets.len()..).unwrap_or_default();
-        if let Some(i) = old.nets.iter().zip(&next.nets).position(|(a, b)| !Arc::ptr_eq(a, b) && a.name != b.name && !appended.iter().any(|n| n.name == a.name)) {
-            return Err(NotInPlace::Netlist(format!("a net moved: {} at {i} is now {} ({} nets, were {})", old.nets[i].name, next.nets[i].name, next.nets.len(), old.nets.len())));
+        let made: std::collections::HashSet<&str> = events.iter().filter_map(|e| e.strip_prefix("inst_create|")).filter_map(|r| r.split('|').next()).collect();
+        let mut at = Vec::new();
+        let mut made_at = HashMap::new();
+        let mut i = 0;
+        for (j, b) in next.insts.iter().enumerate() {
+            if old.insts.get(i).is_some_and(|a| Arc::ptr_eq(a, b) || a.0 == b.0) {
+                i += 1;
+            } else if made.contains(b.0.as_str()) {
+                at.push(i);
+                made_at.insert(b.0.clone(), j);
+            } else {
+                return Err(NotInPlace::Netlist("an instance moved".into()));
+            }
         }
-        if next.nets.len() < old.nets.len() {
-            return Err(NotInPlace::Netlist(format!("a net moved: {} nets, were {}", next.nets.len(), old.nets.len())));
+        if i != old.insts.len() {
+            return Err(NotInPlace::Netlist("an instance moved".into()));
         }
-        Ok(())
+        // The names the edits named, as a short list: most batches name a few nets, and this is
+        // asked of every net whose entry the edit did not share.
+        let mut named: Vec<&str> = Vec::new();
+        for ev in events {
+            let f: Vec<&str> = ev.split('|').collect();
+            if let ["net_create", net, ..] | ["iterm_connect" | "bterm_connect" | "iterm_disconnect" | "bterm_disconnect", _, net, _] = f.as_slice() {
+                if !named.contains(net) {
+                    named.push(net);
+                }
+            }
+        }
+        let big = (named.len() > 16).then(|| named.iter().copied().collect::<std::collections::HashSet<&str>>());
+        let is_named = |n: &str| match &big {
+            Some(set) => set.contains(n),
+            None => named.iter().any(|x| x.len() == n.len() && *x == n),
+        };
+        match Self::align_nets(old, next, &at, &is_named) {
+            Ok(nets) => Ok(Moves { at, made_at, nets }),
+            // a rename no edit named (a name swapped onto an appended net): the slots stand
+            Err(_) if at.iter().all(|&p| p >= old.insts.len()) && Self::renamed_to_appended(old, next) => Ok(Moves { at, made_at, nets: NetMoves::default() }),
+            Err(why) => Err(why),
+        }
+    }
+
+    /// The old nets the edits did not name, in order, against the new list less the names the edits
+    /// named: each found at the same allocation, or by name with the same pins (its instance
+    /// indices moved past the new instances, `at`). An old net the edits named is not placed: its
+    /// pins are read again by name.
+    fn align_nets(old: &Netlist, next: &Netlist, at: &[usize], is_named: &dyn Fn(&str) -> bool) -> Result<NetMoves, NotInPlace> {
+        let same_pins = |a: &crate::netlist::Net, b: &crate::netlist::Net| {
+            a.pins.len() == b.pins.len()
+                && a.pins.iter().zip(&b.pins).all(|(x, y)| match (x, y) {
+                    (Conn::Inst(i, p), Conn::Inst(j, q)) => shifted(at, *i) == *j && p == q,
+                    (Conn::Port(i), Conn::Port(j)) => i == j,
+                    _ => false,
+                })
+        };
+        let mut m = NetMoves { map: vec![None; old.nets.len()], ..NetMoves::default() };
+        let mut j = 0;
+        for (k, a) in old.nets.iter().enumerate() {
+            while let Some(b) = next.nets.get(j).filter(|b| !Arc::ptr_eq(a, b) && is_named(&b.name)) {
+                m.named_new.push((b.name.clone(), j));
+                j += 1;
+            }
+            let b = next.nets.get(j);
+            if b.is_some_and(|b| Arc::ptr_eq(a, b)) || (!is_named(&a.name) && b.is_some_and(|b| b.name == a.name && same_pins(a, b))) {
+                m.map[k] = Some(j);
+                m.moved |= j != k;
+                j += 1;
+            } else if is_named(&a.name) {
+                m.named_old.push(k);
+            } else {
+                let now = b.map_or("the end", |b| b.name.as_str());
+                return Err(NotInPlace::Netlist(format!("a net moved: {} at {k} meets {now} at {j} ({} nets, were {})", a.name, next.nets.len(), old.nets.len())));
+            }
+        }
+        for (j, b) in next.nets.iter().enumerate().skip(j) {
+            if !is_named(&b.name) {
+                return Err(NotInPlace::Netlist(format!("a net no edit named: {}", b.name)));
+            }
+            m.named_new.push((b.name.clone(), j));
+        }
+        Ok(m)
+    }
+
+    /// The rule before reused ids: every old net keeps its slot, nets are appended, and a slot whose
+    /// name differs was renamed to one of the appended nets' names (`swapNetNames` raises no
+    /// callback).
+    fn renamed_to_appended(old: &Netlist, next: &Netlist) -> bool {
+        let Some(appended) = next.nets.get(old.nets.len()..) else { return false };
+        old.nets.iter().zip(&next.nets).all(|(a, b)| Arc::ptr_eq(a, b) || a.name == b.name || appended.iter().any(|n| n.name == a.name))
+    }
+
+    /// The instance indices the vertices hold, moved up past the instances made before them
+    /// ([`Moves::at`]).
+    fn shift_instances(&mut self, at: &[usize]) {
+        let Some(&first) = at.first().filter(|&&p| p < self.netlist.insts.len()) else { return };
+        for v in &mut self.vertices {
+            if let Conn::Inst(i, _) = &mut v.conn {
+                if *i >= first {
+                    *i = shifted(at, *i);
+                }
+            }
+        }
+    }
+
+    /// Each vertex's net slot, moved to where its net went ([`NetMoves`]); a vertex on a net the
+    /// edits named is read again by name ([`Graph::update_vertex_nets`]) — found from the old
+    /// net's own pins, before the netlist moves on. The kept slot map follows.
+    fn shift_nets(&mut self, moves: &NetMoves, b: &mut Batch<'_>) {
+        for &k in &moves.named_old {
+            for c in &self.netlist.nets[k].pins {
+                if let Some(&v) = b.index.get(&self.netlist.pin_name(c)) {
+                    b.touched.push(v);
+                }
+            }
+        }
+        if moves.moved {
+            for n in &mut self.vertex_net {
+                if let Some(k) = *n {
+                    // a net the edits named: its vertices were just listed to be read again
+                    *n = moves.map[k];
+                }
+            }
+        }
+        if let Some(slots) = self.net_slots.as_mut() {
+            if moves.moved {
+                slots.retain(|_, k| match moves.map.get(*k).copied().flatten() {
+                    Some(j) => {
+                        *k = j;
+                        true
+                    }
+                    None => false,
+                });
+            }
+            for (name, j) in &moves.named_new {
+                slots.insert(name.clone(), *j);
+            }
+        }
     }
 
     /// `Sta::makeInstanceAfter`: `makePinVertices` (the liberty cell's ports, as the master has
     /// them), then `makeInstanceEdges`.
-    fn make_instance_after(&mut self, next: &Netlist, inst: &str, master: &str, b: &mut Batch<'_>) -> Result<(), NotInPlace> {
+    /// The vertices are appended (the vertex table's next ids); each holds the instance's index in
+    /// the new netlist, which after a deletion is mid-order ([`Graph::check_extends`]).
+    fn make_instance_after(&mut self, moves: &Moves, inst: &str, master: &str, b: &mut Batch<'_>) -> Result<(), NotInPlace> {
         let Some(lib) = self.libs.iter().position(|l| l.cells.contains_key(master)) else {
             // a physical-only cell: nothing to time
             return Ok(());
         };
-        let i = (self.netlist.insts.len()..next.insts.len())
-            .find(|&i| next.insts[i].0 == inst)
-            .or_else(|| next.insts.iter().position(|i| i.0 == inst))
-            .ok_or_else(|| NotInPlace::Netlist(format!("instance {inst} not in the netlist")))?;
+        let i = *moves.made_at.get(inst).ok_or_else(|| NotInPlace::Netlist(format!("instance {inst} not in the netlist")))?;
         let has = b.pins.and_then(|m| m.get(master));
         let c = cell(self.libs, lib, master);
         for p in &c.ports {
@@ -566,9 +731,118 @@ mod tests {
         let old = Arc::new(chain(false));
         let g = Graph::build_shared(&libs, old.clone(), None).unwrap();
         let mut next = (*old).clone();
-        assert_eq!(g.check_extends(&next), Ok(()), "every entry shared");
+        assert!(g.check_extends(&next, &[]).is_ok(), "every entry shared");
         next.insts[1] = crate::netlist::inst("u9", "and2");
-        assert!(matches!(g.check_extends(&next), Err(NotInPlace::Netlist(_))));
+        assert!(matches!(g.check_extends(&next, &[]), Err(NotInPlace::Netlist(_))));
+    }
+
+    /// Rule (odb `dbTable::create` takes the LAST freed id and `dbBlock` iterates by id, so after a
+    /// deletion a new instance and its net land mid-order; OpenSTA `Graph::makeVertex` takes the
+    /// vertex table's next id, and its `VertexIterator` walks the network, not the table): the
+    /// buffer's vertices are appended, the instance and net indices the old vertices hold move up
+    /// past the insertion, and the graph equals a fresh build of the new netlist modulo ids.
+    #[test]
+    fn a_buffer_at_a_reused_id_lands_mid_order_and_the_indices_move_up() {
+        let libs = libs();
+        let pin = |i: usize, p: &str| Conn::Inst(i, p.into());
+        let old = chain(false);
+        let mut g = Graph::build_shared(&libs, Arc::new(old.clone()), None).unwrap();
+        let nv = g.vertices.len();
+        let mut nl = old;
+        nl.insts.insert(1, crate::netlist::inst("buf1", "buf"));
+        Arc::make_mut(&mut nl.nets[2]).pins = vec![pin(0, "Y"), pin(1, "A")];
+        nl.nets.insert(3, Net { name: "n2".into(), pins: vec![pin(1, "Y"), pin(2, "A")] }.into());
+        for net in &mut nl.nets[4..6] {
+            for c in &mut Arc::make_mut(net).pins {
+                if let Conn::Inst(i, _) = c {
+                    *i += 1;
+                }
+            }
+        }
+        let nl = Arc::new(nl);
+        g.apply_edits(&insertion(), nl.clone(), None).unwrap();
+        assert_eq!(g.vertices[nv].name, "buf1/A", "the buffer's vertices are appended");
+        assert!(matches!(g.vertices[nv].conn, Conn::Inst(1, _)), "and hold its mid-order index");
+        let u2y = g.vertices.iter().position(|v| v.name == "u2/Y").unwrap();
+        assert!(matches!(g.vertices[u2y].conn, Conn::Inst(2, _)), "u2 moved up one");
+        assert_eq!(g.vertex_net[u2y], Some(5), "y moved up one");
+        let fresh = Graph::build_shared(&libs, nl, None).unwrap();
+        assert_eq!(g.differs_from_build(&fresh), None);
+    }
+
+    /// Rule (as above, with `swapNetNames`, which raises no callback): a buffer at an output port,
+    /// its instance first in the order and its net inserted BEFORE the port's net, the two names
+    /// traded — the port's old slot now carries the new name. Every pin of a net the edits named
+    /// is read again by name; the rest move up by slot; a fresh build agrees.
+    #[test]
+    fn a_port_buffer_mid_order_with_traded_names_matches_a_fresh_build() {
+        let libs = libs();
+        let pin = |i: usize, p: &str| Conn::Inst(i, p.into());
+        let mut g = Graph::build_shared(&libs, Arc::new(chain(false)), None).unwrap();
+        let nl = Netlist {
+            insts: vec![crate::netlist::inst("obuf", "buf"), crate::netlist::inst("u1", "and2"), crate::netlist::inst("u2", "and2")],
+            ports: chain(false).ports,
+            nets: vec![
+                Net { name: "a".into(), pins: vec![pin(1, "A"), Conn::Port(0)] }.into(),
+                Net { name: "b".into(), pins: vec![pin(1, "B"), Conn::Port(1)] }.into(),
+                Net { name: "y".into(), pins: vec![pin(2, "Y"), pin(0, "A")] }.into(),
+                Net { name: "n1".into(), pins: vec![pin(1, "Y"), pin(2, "A")] }.into(),
+                Net { name: "c".into(), pins: vec![pin(2, "B"), Conn::Port(2)] }.into(),
+                Net { name: "net9".into(), pins: vec![pin(0, "Y"), Conn::Port(3)] }.into(),
+            ],
+        };
+        let ev = [
+            "inst_create|obuf|buf",
+            "net_create|net9",
+            "iterm_disconnect|u2/Y|y|u2/Y,y",
+            "iterm_connect|u2/Y|net9|u2/Y",
+            "iterm_connect|obuf/A|net9|u2/Y,obuf/A",
+            "iterm_connect|obuf/Y|y|y,obuf/Y",
+        ]
+        .map(String::from);
+        let nl = Arc::new(nl);
+        g.apply_edits(&ev, nl.clone(), None).unwrap();
+        let fresh = Graph::build_shared(&libs, nl, None).unwrap();
+        assert_eq!(g.differs_from_build(&fresh), None);
+    }
+
+    /// Rule (`swapNetNames` raises no callback): a name traded from a net no edit named onto a
+    /// new one is not the old net — a net found by name is taken only with the same pins; else the
+    /// edit is refused (or, kept in place, equals a fresh build).
+    #[test]
+    fn a_name_traded_from_a_net_no_edit_named_is_not_taken_by_name() {
+        let libs = libs();
+        let pin = |i: usize, p: &str| Conn::Inst(i, p.into());
+        let mut g = Graph::build_shared(&libs, Arc::new(chain(false)), None).unwrap();
+        let nl = Netlist {
+            insts: vec![crate::netlist::inst("ibuf", "buf"), crate::netlist::inst("u1", "and2"), crate::netlist::inst("u2", "and2")],
+            ports: chain(false).ports,
+            nets: vec![
+                Net { name: "a".into(), pins: vec![pin(1, "A"), Conn::Port(0)] }.into(),
+                Net { name: "b".into(), pins: vec![pin(1, "B"), Conn::Port(1)] }.into(),
+                Net { name: "n1".into(), pins: vec![pin(1, "Y"), pin(2, "A")] }.into(),
+                Net { name: "c".into(), pins: vec![pin(0, "Y")] }.into(),
+                Net { name: "net8".into(), pins: vec![pin(2, "B"), Conn::Port(2)] }.into(),
+                Net { name: "y".into(), pins: vec![pin(2, "Y"), Conn::Port(3)] }.into(),
+            ],
+        };
+        let ev = ["inst_create|ibuf|buf", "net_create|net8", "iterm_connect|ibuf/Y|net8|ibuf/Y"].map(String::from);
+        let nl = Arc::new(nl);
+        if g.apply_edits(&ev, nl.clone(), None).is_ok() {
+            let fresh = Graph::build_shared(&libs, nl, None).unwrap();
+            assert_eq!(g.differs_from_build(&fresh), None);
+        }
+    }
+
+    /// Rule: a net no edit named that is not where the insertion puts it is a move, not an
+    /// insertion — refused, so the caller builds again.
+    #[test]
+    fn an_unnamed_net_out_of_place_is_refused() {
+        let libs = libs();
+        let mut g = Graph::build_shared(&libs, Arc::new(chain(false)), None).unwrap();
+        let mut nl = chain(false);
+        nl.nets.insert(1, Net { name: "stray".into(), pins: vec![] }.into());
+        assert!(matches!(g.apply_edits(&[], Arc::new(nl), None), Err(NotInPlace::Netlist(_))));
     }
 
     /// Rule: an edit that leaves an edge id free (a load disconnected and never reconnected) is not
