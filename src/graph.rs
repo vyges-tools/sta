@@ -29,6 +29,15 @@ use crate::liberty::{Cell, Direction, Library, Model, Role, FALL, MAX, MIN, RISE
 use crate::netlist::{Conn, Netlist, PortDir};
 use crate::parasitics::{reduce_to_pi_elmore, Network, NodePins};
 
+/// Whether delay calculation leaves vertex `v`'s `mm` slews as they are ([`Graph::slew_blocked`]);
+/// by field, so a caller may write the graph's slews while asking.
+fn slew_blocked_by(blocked: &Option<std::sync::Arc<HashMap<usize, [bool; 2]>>>, annotated: &HashMap<usize, f32>, v: usize, mm: usize) -> bool {
+    match blocked {
+        Some(b) => b.get(&v).is_some_and(|x| x[mm]),
+        None => mm == MAX && annotated.contains_key(&v),
+    }
+}
+
 mod edit;
 pub use edit::{NotInPlace, SlotDelta};
 
@@ -129,6 +138,18 @@ pub struct Graph<'a> {
     /// Annotated max slews (`setAnnotatedSlew`): the vertex's max slew on both transitions IS the
     /// value, whatever the delay calculation finds — applied before its fanout reads it.
     pub slew_annotated: HashMap<usize, f32>,
+    /// Which of a vertex's slews delay calculation may not overwrite, per min/max
+    /// (`Vertex::slewAnnotated(rf, min_max)`), when the graph is one scene of several. `None`: this
+    /// scene's own max annotations ([`Graph::slew_annotated`]) are the blocked ones.
+    ///
+    /// 🔑 The reference keeps ONE set of annotation bits per vertex for every scene: the bit is
+    /// `ap_index * 2 + rf` with any `ap_index > 1` folded to 0 (`Vertex::setSlewAnnotated`), and a
+    /// scene's max index is `scene * 2 + 1`. So a max annotation in the FIRST scene sets the max
+    /// bit (that load's max slew is then kept in EVERY scene), and one in any later scene sets the
+    /// MIN bit (its min slews are kept in every scene, and its own max is not protected at all).
+    /// It looks unintended (the bits predate scenes), but it decides results: transcribed as is
+    /// (asked upstream: parallaxsw/OpenSTA#581).
+    pub slew_blocked: Option<std::sync::Arc<HashMap<usize, [bool; 2]>>>,
     /// The SDC environment the delay calculation reads; empty unless a caller sets it.
     pub sdc: SdcEnv,
     /// Per vertex, the (library, cell) its pin capacitance is read from instead of its own — a
@@ -651,7 +672,7 @@ impl<'a> Graph<'a> {
                 let _ = index_cache.set(std::sync::Arc::new(map));
             }
         }
-        Some(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: std::collections::HashSet::new(), bidirect_port_paths: std::collections::HashSet::new(), index_cache, net_slots: None, edit_seq: None, state_seq: None })
+        Some(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: std::collections::HashSet::new(), bidirect_port_paths: std::collections::HashSet::new(), index_cache, net_slots: None, edit_seq: None, state_seq: None })
     }
 
     /// [`Graph::build_with_pins`] with each pin found by its name.
@@ -867,7 +888,7 @@ impl<'a> Graph<'a> {
                 EdgeKind::Wire => vec![[0.0f32; 2]; 2],
             })
             .collect();
-        Ok(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths, bidirect_port_paths, index_cache: std::sync::OnceLock::new(), net_slots: None, edit_seq: None, state_seq: None })
+        Ok(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths, bidirect_port_paths, index_cache: std::sync::OnceLock::new(), net_slots: None, edit_seq: None, state_seq: None })
     }
 
     /// Whether vertex `v` is a top-level port's (an instance's vertex may have no library too:
@@ -1066,10 +1087,11 @@ impl<'a> Graph<'a> {
                         };
                         let ll = self.threshold_library(load);
                         threshold_adjust(ll == li, &self.lib_thresholds(li, rf), &self.lib_thresholds(ll, rf), rf == RISE, &mut wire_delay, &mut load_slew);
-                        self.slew[load][rf][mm] = match self.slew_annotated.get(&load) {
-                            Some(&a) if mm == MAX => a,
-                            _ => load_slew as f32,
-                        };
+                        if !slew_blocked_by(&self.slew_blocked, &self.slew_annotated, load, mm) {
+                            self.slew[load][rf][mm] = load_slew as f32;
+                        } else if let (Some(&a), MAX) = (self.slew_annotated.get(&load), mm) {
+                            self.slew[load][rf][mm] = a;
+                        }
                         self.delay[w][rf][mm] = wire_delay as f32 + load_delay;
                     }
                 }
@@ -1352,8 +1374,13 @@ impl<'a> Graph<'a> {
                 // A root load's slew is 0.
                 self.slew[v] = [[0.0; 2]; 2];
             } else if let Some(&value) = self.slew_annotated.get(&v) {
-                self.slew[v][RISE][MAX] = value;
-                self.slew[v][FALL][MAX] = value;
+                // Kept only while it is blocked: an annotation the bits do not protect
+                // ([`Graph::slew_blocked`]) was overwritten by its driver, and visiting the load
+                // (`findVertexDelay`) writes no slew.
+                if slew_blocked_by(&self.slew_blocked, &self.slew_annotated, v, MAX) {
+                    self.slew[v][RISE][MAX] = value;
+                    self.slew[v][FALL][MAX] = value;
+                }
             } else {
                 self.hold_load_at_limit(v);
             }
@@ -1393,10 +1420,11 @@ impl<'a> Graph<'a> {
                         }
                         threshold_adjust(ll == 0, &self.lib_thresholds(0, rf), &self.lib_thresholds(ll, rf), rf == RISE, &mut wire_delay, &mut load_slew);
                         // A load's own annotation stands (`annotateLoadDelays`), as from a cell driver.
-                        self.slew[load][rf][mm] = match self.slew_annotated.get(&load) {
-                            Some(&a) if mm == MAX => a,
-                            _ => annotated.unwrap_or(load_slew as f32),
-                        };
+                        if !slew_blocked_by(&self.slew_blocked, &self.slew_annotated, load, mm) {
+                            self.slew[load][rf][mm] = annotated.unwrap_or(load_slew as f32);
+                        } else if let (Some(&a), MAX) = (self.slew_annotated.get(&load), mm) {
+                            self.slew[load][rf][mm] = a;
+                        }
                         self.delay[e][rf][mm] = wire_delay as f32;
                     }
                 }
@@ -1408,12 +1436,17 @@ impl<'a> Graph<'a> {
         // `annotateLoadDelays` merges into a load only where its slew is not annotated: an annotated
         // load (`setAnnotatedSlew`, max rise and fall) keeps its annotation through its driver's
         // timing, not just after its own visit.
+        // (`initLoadSlews`: a blocked slew is not reset — [`Graph::slew_blocked`].)
         for &e in &wires {
             let load = self.edges[e].to;
-            self.slew[load] = [[INIT[MIN], INIT[MAX]], [INIT[MIN], INIT[MAX]]];
-            if let Some(&a) = self.slew_annotated.get(&load) {
-                self.slew[load][RISE][MAX] = a;
-                self.slew[load][FALL][MAX] = a;
+            for mm in [MIN, MAX] {
+                if !slew_blocked_by(&self.slew_blocked, &self.slew_annotated, load, mm) {
+                    self.slew[load][RISE][mm] = INIT[mm];
+                    self.slew[load][FALL][mm] = INIT[mm];
+                } else if let (Some(&a), MAX) = (self.slew_annotated.get(&load), mm) {
+                    self.slew[load][RISE][MAX] = a;
+                    self.slew[load][FALL][MAX] = a;
+                }
             }
             self.delay[e] = vec![[INIT[MIN], INIT[MAX]]; 2];
         }
@@ -1497,7 +1530,7 @@ impl<'a> Graph<'a> {
                         }
                         let ll = self.threshold_library(load);
                         threshold_adjust(ll == drvr_lib, &self.lib_thresholds(drvr_lib, rf), &self.lib_thresholds(ll, rf), rf == RISE, &mut wire_delay, &mut load_slew);
-                        if worse(mm, load_slew as f32, self.slew[load][rf][mm]) && !(mm == MAX && self.slew_annotated.contains_key(&load)) {
+                        if worse(mm, load_slew as f32, self.slew[load][rf][mm]) && !slew_blocked_by(&self.slew_blocked, &self.slew_annotated, load, mm) {
                             self.slew[load][rf][mm] = load_slew as f32;
                         }
                         if worse(mm, wire_delay as f32, self.delay[w][rf][mm]) {
@@ -1514,7 +1547,7 @@ impl<'a> Graph<'a> {
                     for &w in &wires {
                         self.delay[w][rf][mm] = 0.0;
                         let load = self.edges[w].to;
-                        if !(mm == MAX && self.slew_annotated.contains_key(&load)) {
+                        if !slew_blocked_by(&self.slew_blocked, &self.slew_annotated, load, mm) {
                             self.slew[load][rf][mm] = 0.0;
                         }
                     }
@@ -1854,6 +1887,45 @@ mod tests {
         g.slew_annotated.insert(u1a, 3.0e-9);
         g.find_vertex_delays(a, &HashMap::new(), &index, None).unwrap();
         assert_eq!([g.slew[u1a][RISE][MAX], g.slew[u1a][FALL][MAX]], [3.0e-9, 3.0e-9], "kept from a port driver too");
+    }
+
+    /// Rule (`Vertex::setSlewAnnotated` / `slewAnnotated(rf, min_max)`): the annotation bits are
+    /// shared by every scene, and a scene past the first folds onto the MIN bit. With scenes
+    /// wc, tc, bc (the reference, `set_assigned_transition -corner <c> -max` on a load, then a
+    /// load change): annotated in wc, the load's MAX slew in tc and bc stays as it was while their
+    /// min slews are re-timed; annotated in bc (or tc), its bc MAX slew is re-timed over the
+    /// annotation and the MIN slews of every scene stay.
+    #[test]
+    fn annotation_bits_are_shared_across_scenes() {
+        let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
+        let nl = chain();
+        let mut g = Graph::build(&libs, &nl).unwrap();
+        g.find_delays(&HashMap::new(), None).unwrap();
+        let u2a = g.vertices.iter().position(|v| v.name == "u2/A").unwrap();
+        let u1y = g.vertices.iter().position(|v| v.name == "u1/Y").unwrap();
+        let timed = g.slew[u2a];
+        let index = g.pin_index();
+        let stale = [[7.0e-12, 8.0e-12], [9.0e-12, 6.0e-12]];
+        // A later scene (tc) of a load annotated in the FIRST scene only: the max bit — its max
+        // slews are left as they were, its min slews re-timed.
+        g.slew_blocked = Some(std::sync::Arc::new(HashMap::from([(u2a, [false, true])])));
+        g.slew[u2a] = stale;
+        g.find_vertex_delays(u1y, &HashMap::new(), &index, None).unwrap();
+        assert_eq!([g.slew[u2a][RISE][MAX], g.slew[u2a][FALL][MAX]], [stale[RISE][MAX], stale[FALL][MAX]]);
+        assert_eq!([g.slew[u2a][RISE][MIN], g.slew[u2a][FALL][MIN]], [timed[RISE][MIN], timed[FALL][MIN]]);
+        // The scene that annotated it, a later one (bc): the min bit — the driver writes the max
+        // slew over the annotation, the min slews stay; visiting the load does not restore it.
+        g.slew_blocked = Some(std::sync::Arc::new(HashMap::from([(u2a, [true, false])])));
+        g.slew_annotated.insert(u2a, 2.0e-9);
+        g.slew[u2a] = stale;
+        g.find_vertex_delays(u1y, &HashMap::new(), &index, None).unwrap();
+        g.find_vertex_delays(u2a, &HashMap::new(), &index, None).unwrap();
+        assert_eq!([g.slew[u2a][RISE][MAX], g.slew[u2a][FALL][MAX]], [timed[RISE][MAX], timed[FALL][MAX]]);
+        assert_eq!([g.slew[u2a][RISE][MIN], g.slew[u2a][FALL][MIN]], [stale[RISE][MIN], stale[FALL][MIN]]);
+        // Unset (one scene): this scene's max annotation is the blocked one, as before.
+        g.slew_blocked = None;
+        g.find_vertex_delays(u1y, &HashMap::new(), &index, None).unwrap();
+        assert_eq!([g.slew[u2a][RISE][MAX], g.slew[u2a][FALL][MAX]], [2.0e-9, 2.0e-9]);
     }
 
     /// Rules (Sdc::connectedCap, parasiticLoad): a net `set_load` is keyed by its DRIVER pin and
