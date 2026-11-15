@@ -1728,6 +1728,64 @@ impl<'a> Graph<'a> {
     }
 }
 
+/// The graph as loop breaking reads it ([`crate::levelize::LoopGraph`]): vertex and edge ids are
+/// the indices (the reference's ids less one), a vertex's out-edges newest first.
+struct LevelizeView<'g, 'a>(&'g Graph<'a>);
+
+impl crate::levelize::LoopGraph for LevelizeView<'_, '_> {
+    fn vertex_count(&self) -> usize {
+        self.0.vertices.len()
+    }
+    fn edge_count(&self) -> usize {
+        self.0.edges.len()
+    }
+    fn out_edge(&self, v: usize, k: usize) -> Option<usize> {
+        let o = &self.0.out_edges[v];
+        (k < o.len()).then(|| o[o.len() - 1 - k])
+    }
+    fn in_edges(&self, v: usize) -> &[usize] {
+        &self.0.in_edges[v]
+    }
+    fn edge_from(&self, e: usize) -> usize {
+        self.0.edges[e].from
+    }
+    fn edge_to(&self, e: usize) -> usize {
+        self.0.edges[e].to
+    }
+    fn search_thru(&self, e: usize) -> bool {
+        self.0.levelize_thru_unlooped(e)
+    }
+    /// `bidirect_inst_paths_enabled` is off (its default; no job here sets it).
+    fn bidirect_load_fanout(&self, _v: usize) -> bool {
+        false
+    }
+    /// `from -> to` and the arc set's index on its cell, for the loop trace.
+    fn edge_label(&self, e: usize) -> String {
+        let ed = &self.0.edges[e];
+        let set = match ed.kind {
+            EdgeKind::Gate { set } => set.to_string(),
+            EdgeKind::Wire => "wire".to_string(),
+        };
+        format!("{} -> {} {set}", self.0.vertices[ed.from].name, self.0.vertices[ed.to].name)
+    }
+    /// `Network::pathNameCmp` over a flat netlist: a top port (the top instance, an empty path)
+    /// before any instance pin; then the instance name, then the port name, bytewise.
+    fn name_cmp(&self, a: usize, b: usize) -> std::cmp::Ordering {
+        let key = |v: usize| {
+            let name = self.0.vertices[v].name.as_str();
+            if self.0.is_port(v) {
+                (0u8, "", name)
+            } else {
+                match name.rfind('/') {
+                    Some(i) => (1, &name[..i], &name[i + 1..]),
+                    None => (1, "", name),
+                }
+            }
+        };
+        key(a).cmp(&key(b))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2523,63 +2581,5 @@ mod tests {
         check(&nl3, Graph::build(&libs, &nl2).unwrap());
         // and back: a recycled graph larger than the next
         check(&nl1, Graph::build(&libs, &nl3).unwrap());
-    }
-}
-
-/// The graph as loop breaking reads it ([`crate::levelize::LoopGraph`]): vertex and edge ids are
-/// the indices (the reference's ids less one), a vertex's out-edges newest first.
-struct LevelizeView<'g, 'a>(&'g Graph<'a>);
-
-impl crate::levelize::LoopGraph for LevelizeView<'_, '_> {
-    fn vertex_count(&self) -> usize {
-        self.0.vertices.len()
-    }
-    fn edge_count(&self) -> usize {
-        self.0.edges.len()
-    }
-    fn out_edge(&self, v: usize, k: usize) -> Option<usize> {
-        let o = &self.0.out_edges[v];
-        (k < o.len()).then(|| o[o.len() - 1 - k])
-    }
-    fn in_edges(&self, v: usize) -> &[usize] {
-        &self.0.in_edges[v]
-    }
-    fn edge_from(&self, e: usize) -> usize {
-        self.0.edges[e].from
-    }
-    fn edge_to(&self, e: usize) -> usize {
-        self.0.edges[e].to
-    }
-    fn search_thru(&self, e: usize) -> bool {
-        self.0.levelize_thru_unlooped(e)
-    }
-    /// `bidirect_inst_paths_enabled` is off (its default; no job here sets it).
-    fn bidirect_load_fanout(&self, _v: usize) -> bool {
-        false
-    }
-    /// `from -> to` and the arc set's index on its cell, for the loop trace.
-    fn edge_label(&self, e: usize) -> String {
-        let ed = &self.0.edges[e];
-        let set = match ed.kind {
-            EdgeKind::Gate { set } => set.to_string(),
-            EdgeKind::Wire => "wire".to_string(),
-        };
-        format!("{} -> {} {set}", self.0.vertices[ed.from].name, self.0.vertices[ed.to].name)
-    }
-    /// `Network::pathNameCmp` over a flat netlist: a top port (the top instance, an empty path)
-    /// before any instance pin; then the instance name, then the port name, bytewise.
-    fn name_cmp(&self, a: usize, b: usize) -> std::cmp::Ordering {
-        let key = |v: usize| {
-            let name = self.0.vertices[v].name.as_str();
-            if self.0.is_port(v) {
-                (0u8, "", name)
-            } else {
-                match name.rfind('/') {
-                    Some(i) => (1, &name[..i], &name[i + 1..]),
-                    None => (1, "", name),
-                }
-            }
-        };
-        key(a).cmp(&key(b))
     }
 }
