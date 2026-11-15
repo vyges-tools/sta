@@ -659,11 +659,14 @@ impl<'a> Graph<'a> {
         let slots = self.named_net_slots(&b.nets, old_nets, look_for_misses);
         let mut want: HashMap<String, usize> = b.touched.iter().map(|&v| (self.vname(v), v)).collect();
         let mut found: Vec<(usize, Option<usize>)> = Vec::with_capacity(want.len());
+        let mut buf = String::new();
         for n in slots {
             let net = &self.netlist.nets[n];
             for c in &net.pins {
-                let name = self.netlist.pin_name(c);
-                if let Some(v) = want.remove(name.as_str()) {
+                if want.is_empty() {
+                    break;
+                }
+                if let Some(v) = want.remove(self.netlist.pin_name_into(c, &mut buf)) {
                     found.push((v, Some(n)));
                 }
             }

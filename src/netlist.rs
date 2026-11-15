@@ -44,7 +44,15 @@ impl Netlist {
     /// A pin's path name: `inst/port` or the port's name.
     pub fn pin_name(&self, c: &Conn) -> String {
         match c {
-            Conn::Inst(i, p) => format!("{}/{p}", self.insts[*i].0),
+            Conn::Inst(i, p) => {
+                // pushed, not `format!`: the same string without the formatting machinery
+                let inst = &self.insts[*i].0;
+                let mut name = String::with_capacity(inst.len() + 1 + p.len());
+                name.push_str(inst);
+                name.push('/');
+                name.push_str(p);
+                name
+            }
             Conn::Port(i) => self.ports[*i].0.clone(),
         }
     }
@@ -63,6 +71,14 @@ impl Netlist {
         }
         buf
     }
+
+    /// Is [`Netlist::pin_name`] of `c` equal to `s`? Compared piece by piece; no string is made.
+    pub fn pin_name_is(&self, c: &Conn, s: &str) -> bool {
+        match c {
+            Conn::Inst(i, p) => s.strip_prefix(self.insts[*i].0.as_str()).and_then(|r| r.strip_prefix('/')).is_some_and(|r| r == p),
+            Conn::Port(i) => self.ports[*i].0 == s,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -79,6 +95,23 @@ mod tests {
         let mut buf = String::from("left over");
         for c in [Conn::Inst(0, "A".into()), Conn::Port(0)] {
             assert_eq!(n.pin_name_into(&c, &mut buf), n.pin_name(&c));
+        }
+    }
+
+    /// A comparison by pin answers what comparing the formatted name would, near misses included.
+    #[test]
+    fn a_pin_name_compared_by_pieces_is_the_pin_name_compared() {
+        let n = Netlist {
+            insts: vec![inst("u1", "buf"), inst("u1/x", "buf")],
+            ports: vec![("clk".into(), PortDir::Input), ("u1/A".into(), PortDir::Input)],
+            nets: vec![],
+        };
+        let pins = [Conn::Inst(0, "A".into()), Conn::Inst(1, "A".into()), Conn::Inst(0, "x/A".into()), Conn::Port(0), Conn::Port(1)];
+        let names = ["u1/A", "u1/x/A", "u1", "u1/", "u1A", "clk", "clk/", "", "u1/AB", "u1/x"];
+        for c in &pins {
+            for s in names {
+                assert_eq!(n.pin_name_is(c, s), n.pin_name(c) == s, "{c:?} {s}");
+            }
         }
     }
 }

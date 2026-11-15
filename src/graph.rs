@@ -1248,7 +1248,7 @@ impl<'a> Graph<'a> {
         match (&self.vertices[v].lib, &self.vertices[v].cell, self.vertices[v].port()) {
             (Some(l), Some(c), Some(p)) => cell(self.libs, *l, c).port(p).map_or(0.0, |p| p.capacitance(rf, mm)),
             _ => match self.vertices[v].conn {
-                Conn::Port(_) => self.sdc.port_pin_cap.get(&self.vname(v)).and_then(|c| c[rf][mm]).unwrap_or(0.0),
+                Conn::Port(_) => self.sdc_at(&self.sdc.port_pin_cap, v).and_then(|c| c[rf][mm]).unwrap_or(0.0),
                 Conn::Inst(..) => 0.0,
             },
         }
@@ -1260,7 +1260,7 @@ impl<'a> Graph<'a> {
     fn connected_cap(&self, drvr: usize, rf: usize, mm: usize, index: &HashMap<String, usize>) -> (f32, f32, bool) {
         let mut pin_cap = self.net_pin_cap(drvr, rf, mm, index);
         let mut wire_cap = 0.0f32;
-        let net_load = self.sdc.net_wire_cap.get(&self.vname(drvr)).and_then(|c| c[mm]);
+        let net_load = self.sdc_at(&self.sdc.net_wire_cap, drvr).and_then(|c| c[mm]);
         if let Some((cap, subtract_pin_cap)) = net_load {
             if subtract_pin_cap {
                 pin_cap = 0.0;
@@ -1277,7 +1277,7 @@ impl<'a> Graph<'a> {
     /// dropped. `(pin_cap, wire_cap, the pi model)`.
     fn parasitic_load<'p>(&self, drvr: usize, rf: usize, mm: usize, parasitics: &'p HashMap<String, NetParasitics>, index: &HashMap<String, usize>) -> ParasiticLoad<'p> {
         let (pin_cap, mut wire_cap, has_net_load) = self.connected_cap(drvr, rf, mm, index);
-        let mut parasitic = if self.sdc.net_wire_cap.contains_key(&self.vname(drvr)) { None } else { self.reduced(drvr, rf, mm, parasitics, index) };
+        let mut parasitic = if self.sdc_at(&self.sdc.net_wire_cap, drvr).is_some() { None } else { self.reduced(drvr, rf, mm, parasitics, index) };
         if !has_net_load {
             if let Some((p, _)) = &parasitic {
                 let parasitic_cap = p.c1 + p.c2;
@@ -1310,7 +1310,7 @@ impl<'a> Graph<'a> {
     fn reduced<'p>(&self, drvr: usize, rf: usize, mm: usize, parasitics: &'p HashMap<String, NetParasitics>, index: &HashMap<String, usize>) -> Option<(crate::parasitics::PiElmore, &'p [String])> {
         let n = self.vertex_net[drvr]?;
         let np = parasitics.get(&self.netlist.nets[n].name)?;
-        let d = np.node_names.iter().position(|x| x == &self.vname(drvr))?;
+        let d = np.node_names.iter().position(|x| self.vname_is(drvr, x))?;
         let names = &np.node_names;
         if let Some(p) = &np.pi {
             if np.pi_rise_only && rf == FALL {
@@ -1479,7 +1479,7 @@ impl<'a> Graph<'a> {
     }
 
     pub fn is_constant(&self, v: usize) -> bool {
-        !self.sdc.constants.is_empty() && self.sdc.constants.contains_key(&self.vname(v))
+        self.sdc_at(&self.sdc.constants, v).is_some()
     }
 
     /// Every vertex's index by name (the parasitics name their nodes by pin).
@@ -1515,6 +1515,32 @@ impl<'a> Graph<'a> {
         self.netlist.pin_name(&self.vertices[v].conn)
     }
 
+    /// Is vertex `v`'s name `s`? Compared against the pin; no name is made.
+    pub fn vname_is(&self, v: usize, s: &str) -> bool {
+        self.netlist.pin_name_is(&self.vertices[v].conn, s)
+    }
+
+    /// `f` of vertex `v`'s name, borrowed: the name is written into a per-thread buffer, so a
+    /// lookup by name makes no string of its own. Reentrant: a nested call takes a fresh buffer.
+    pub fn with_vname<R>(&self, v: usize, f: impl FnOnce(&str) -> R) -> R {
+        thread_local! {
+            static BUF: std::cell::Cell<String> = const { std::cell::Cell::new(String::new()) };
+        }
+        let mut buf = BUF.with(std::cell::Cell::take);
+        let r = f(self.netlist.pin_name_into(&self.vertices[v].conn, &mut buf));
+        BUF.with(|b| b.set(buf));
+        r
+    }
+
+    /// The SDC entry keyed by vertex `v`'s name: an empty map is not looked in, a full one by
+    /// the borrowed name. The same entry as `map.get(&self.vname(v))`.
+    fn sdc_at<'m, T>(&self, map: &'m HashMap<String, T>, v: usize) -> Option<&'m T> {
+        if map.is_empty() {
+            return None;
+        }
+        self.with_vname(v, |n| map.get(n))
+    }
+
     /// One vertex of the delay calculation (`findVertexDelay`): a load takes its root slew, its
     /// annotation or its limit; an input port its drive; a driver every arc of every in-edge,
     /// its slew and its loads' slews and wire delays merged from the initial values.
@@ -1544,7 +1570,7 @@ impl<'a> Graph<'a> {
         // `findVertexDelay`: a root, or a top-level bidirect port's driver vertex (its load's wire
         // into it aside), is seeded as an input.
         if fanin.is_empty() || self.is_port(v) {
-            if let Some(drive) = self.sdc.input_drive.get(&self.vname(v)).cloned() {
+            if let Some(drive) = self.sdc_at(&self.sdc.input_drive, v).cloned() {
                 self.time_input_drive(v, &wires, &drive, parasitics, index)?;
                 return Ok(());
             }
@@ -1558,7 +1584,7 @@ impl<'a> Graph<'a> {
             let annotated = self.slew_annotated.get(&v).copied();
             for rf in [RISE, FALL] {
                 for mm in [MIN, MAX] {
-                    let in_slew = self.sdc.input_slew.get(&self.vname(v)).and_then(|s| s[rf][mm]).unwrap_or(0.0);
+                    let in_slew = self.sdc_at(&self.sdc.input_slew, v).and_then(|s| s[rf][mm]).unwrap_or(0.0);
                     self.slew[v][rf][mm] = annotated.unwrap_or(in_slew);
                     let (_, _, pe) = self.parasitic_load(v, rf, mm, parasitics, index);
                     let elmores = LoadElmores::new(pe.as_ref());
