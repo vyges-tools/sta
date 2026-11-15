@@ -598,25 +598,31 @@ impl<'a> Graph<'a> {
                 }
             }
         }
-        let port_base = vertices.len();
+        // Each port's first vertex: a bidirect port is two (`makePinVertices`: its load, then its
+        // driver), as in the by-name build.
+        let mut port_at: Vec<usize> = Vec::with_capacity(netlist.ports.len());
         let mut pc = 0usize;
         for (i, (name, dir)) in netlist.ports.iter().enumerate() {
-            if *dir == PortDir::Inout {
-                return None;
-            }
-            let is_driver = *dir == PortDir::Input;
-            let reuse = old_ports.get(pc).copied().filter(|&k| old[k].as_ref().is_some_and(|v| v.name == *name && v.is_driver == is_driver && matches!(v.conn, Conn::Port(_))));
-            match reuse {
-                Some(k) => {
-                    let mut v = old[k].take().expect("a matching port");
-                    v.conn = Conn::Port(i);
-                    reused_from.push(Some(k));
-                    vertices.push(v);
-                    pc += 1;
-                }
-                None => {
-                    vertices.push(Vertex { name: name.clone(), conn: Conn::Port(i), is_driver, lib: None, cell: None, port: None });
-                    reused_from.push(None);
+            port_at.push(vertices.len());
+            let kinds: &[bool] = match dir {
+                PortDir::Inout => &[false, true],
+                PortDir::Input => &[true],
+                _ => &[false],
+            };
+            for &is_driver in kinds {
+                let reuse = old_ports.get(pc).copied().filter(|&k| old[k].as_ref().is_some_and(|v| v.name == *name && v.is_driver == is_driver && matches!(v.conn, Conn::Port(_))));
+                match reuse {
+                    Some(k) => {
+                        let mut v = old[k].take().expect("a matching port");
+                        v.conn = Conn::Port(i);
+                        reused_from.push(Some(k));
+                        vertices.push(v);
+                        pc += 1;
+                    }
+                    None => {
+                        vertices.push(Vertex { name: name.clone(), conn: Conn::Port(i), is_driver, lib: None, cell: None, port: None });
+                        reused_from.push(None);
+                    }
                 }
             }
         }
@@ -645,10 +651,14 @@ impl<'a> Graph<'a> {
         for (n, net) in netlist.nets.iter().enumerate() {
             net_at.push(net_vs.len());
             let first = net_vs.len();
-            net_vs.extend(net.pins.iter().filter_map(|c| match c {
-                Conn::Inst(i, p) => tpl(*i).and_then(|t| t.first.get(p.as_str())).map(|&l| base[*i] + l),
-                Conn::Port(i) => Some(port_base + i),
-            }));
+            for c in &net.pins {
+                match c {
+                    Conn::Inst(i, p) => net_vs.extend(tpl(*i).and_then(|t| t.first.get(p.as_str())).map(|&l| base[*i] + l)),
+                    // a bidirect port is both: its load and its driver vertex
+                    Conn::Port(i) if netlist.ports[*i].1 == PortDir::Inout => net_vs.extend([port_at[*i], port_at[*i] + 1]),
+                    Conn::Port(i) => net_vs.push(port_at[*i]),
+                }
+            }
             if net_vs[first..].iter().filter(|&&v| vertices[v].is_driver).count() > 1 {
                 return None;
             }
@@ -658,12 +668,23 @@ impl<'a> Graph<'a> {
         }
         net_at.push(net_vs.len());
         // `makeWireEdges`: the drivers in pin order — each leaf instance's pins, then the top
-        // instance's (the ports) — each to its net's loads in the net's pin order.
+        // instance's (the ports) — each to its net's loads in the net's pin order but its own pin;
+        // then, at a bidirect port, its load-to-driver path (`makeInstDrvrWireEdges` on the top
+        // instance, `setIsBidirectPortPath`).
+        let mut bidirect_port_paths = std::collections::HashSet::new();
         for d in (0..vertices.len()).filter(|&v| vertices[v].is_driver) {
-            let Some(n) = vertex_net[d] else { continue };
-            for &l in net_vs[net_at[n]..net_at[n + 1]].iter().filter(|&&v| !vertices[v].is_driver) {
-                edges.push(Edge { from: d, to: l, kind: EdgeKind::Wire });
-                delay.push(row(2));
+            if let Some(n) = vertex_net[d] {
+                for &l in net_vs[net_at[n]..net_at[n + 1]].iter().filter(|&&v| !vertices[v].is_driver && vertices[v].conn != vertices[d].conn) {
+                    edges.push(Edge { from: d, to: l, kind: EdgeKind::Wire });
+                    delay.push(row(2));
+                }
+            }
+            if let Conn::Port(i) = vertices[d].conn {
+                if netlist.ports[i].1 == PortDir::Inout {
+                    bidirect_port_paths.insert(edges.len());
+                    edges.push(Edge { from: d - 1, to: d, kind: EdgeKind::Wire });
+                    delay.push(row(2));
+                }
             }
         }
         let n = vertices.len();
@@ -699,7 +720,7 @@ impl<'a> Graph<'a> {
                 let _ = index_cache.set(std::sync::Arc::new(map));
             }
         }
-        Some(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: std::collections::HashSet::new(), bidirect_port_paths: std::collections::HashSet::new(), disabled_loops: std::collections::HashSet::new(), loops: Default::default(), index_cache, net_slots: None, edit_seq: None, state_seq: None }.with_loops_broken())
+        Some(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: std::collections::HashSet::new(), bidirect_port_paths, disabled_loops: std::collections::HashSet::new(), loops: Default::default(), index_cache, net_slots: None, edit_seq: None, state_seq: None }.with_loops_broken())
     }
 
     /// [`Graph::build_with_pins`] with each pin found by its name.
@@ -772,9 +793,6 @@ impl<'a> Graph<'a> {
         }
         for (i, (name, dir)) in netlist.ports.iter().enumerate() {
             if *dir == PortDir::Inout {
-                if !whole {
-                    return Err(format!("port {name}: bidirect ports are not modelled"));
-                }
                 index.insert(name.clone(), vertices.len());
                 for is_driver in [false, true] {
                     vertices.push(Vertex { name: name.clone(), conn: Conn::Port(i), is_driver, lib: None, cell: None, port: None });
@@ -832,7 +850,8 @@ impl<'a> Graph<'a> {
             let first = net_vs.len();
             for c in &net.pins {
                 if let Some(&v) = index.get(netlist.pin_name_into(c, &mut buf)) {
-                    if whole {
+                    // a bidirect port is both, in every build; an instance's only in the whole one
+                    if whole || matches!(c, Conn::Port(i) if netlist.ports[*i].1 == PortDir::Inout) {
                         net_vs.extend(pin_vertices(v));
                     } else {
                         net_vs.push(v);
@@ -864,7 +883,7 @@ impl<'a> Graph<'a> {
                 let vs = &net_vs[net_at[n]..net_at[n + 1]];
                 if !whole {
                     for &d in vs.iter().filter(|&&x| vertices[x].is_driver) {
-                        for &l in vs.iter().filter(|&&x| !vertices[x].is_driver) {
+                        for &l in vs.iter().filter(|&&x| !vertices[x].is_driver && vertices[x].conn != vertices[d].conn) {
                             edges.push(Edge { from: d, to: l, kind: EdgeKind::Wire });
                         }
                     }
@@ -909,7 +928,7 @@ impl<'a> Graph<'a> {
             // `makeInstDrvrWireEdges` on the top instance: a bidirect port's load vertex reaches
             // its driver vertex (a bidirect port path).
             if let Conn::Port(i) = vertices[v].conn {
-                if whole && netlist.ports[i].1 == PortDir::Inout {
+                if netlist.ports[i].1 == PortDir::Inout {
                     bidirect_port_paths.insert(edges.len());
                     edges.push(Edge { from: v, to: v + 1, kind: EdgeKind::Wire });
                 }
@@ -1435,6 +1454,24 @@ impl<'a> Graph<'a> {
     /// Every vertex's index by name (the parasitics name their nodes by pin).
     pub fn pin_index(&self) -> std::sync::Arc<HashMap<String, usize>> {
         self.index_cache.get_or_init(|| std::sync::Arc::new(self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect())).clone()
+    }
+
+    /// Whether every name shared by two vertices is a bidirect top-level port's (its load and its
+    /// driver, adjacent): the name index then holds one vertex of each, and
+    /// [`Graph::vertices_named`] gives both.
+    pub fn names_shared_only_by_bidirect_ports(&self) -> bool {
+        let ports: Vec<&str> = self.netlist.ports.iter().filter(|p| p.1 == PortDir::Inout).map(|p| p.0.as_str()).collect();
+        let index = self.index();
+        index.len() + ports.len() == self.vertices.len() && ports.iter().all(|p| index.get(*p).is_some_and(|&v| matches!(self.vertices[v].conn, Conn::Port(_)) && self.vertices_named(v).count() == 2))
+    }
+
+    /// The vertices of `v`'s pin: `v`, and the other of a bidirect pin's two (adjacent, same name
+    /// and connection).
+    pub fn vertices_named(&self, v: usize) -> std::ops::RangeInclusive<usize> {
+        let same = |a: usize, b: usize| self.vertices[a].name == self.vertices[b].name && self.vertices[a].conn == self.vertices[b].conn;
+        let lo = if v > 0 && same(v - 1, v) { v - 1 } else { v };
+        let hi = if v + 1 < self.vertices.len() && same(v, v + 1) { v + 1 } else { v };
+        lo..=hi
     }
 
     /// [`Graph::pin_index`], built once and borrowed.
@@ -1982,7 +2019,51 @@ mod tests {
         assert_eq!(g.bidirect_port_paths.iter().copied().collect::<Vec<_>>(), [9]);
         assert!(level[9] > 0, "b is loaded by w/pad+");
         assert_eq!(level[10], 0, "b+ levels as a root, not past b");
+        assert!(!g.names_shared_only_by_bidirect_ports(), "instance bidirect pins share names too");
         assert!(Graph::build(&libs, &nl).is_err());
+    }
+
+    // Rules (OpenSTA at the 4155ac3 pin): `Graph::makePinVertices` gives a bidirect TOP-LEVEL
+    // port two vertices, its load then its driver; `makeWireEdgesFromPin` wires the port's driver
+    // to its net's loads but itself; and `makeInstDrvrWireEdges` on the top instance then makes
+    // the port's load-to-driver edge (`setIsBidirectPortPath`), which levelization skips. Every
+    // build does this, not only the whole one: a design's inout pads (a DDR `dq` bus) reach the
+    // repairer's graph, alone on their nets or driving a cell.
+    #[test]
+    fn a_bidirect_port_is_two_vertices_in_every_build() {
+        let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
+        let pin = |i: usize, p: &str| Conn::Inst(i, p.into());
+        let nl = Netlist {
+            insts: vec![crate::netlist::inst("u1", "and2")],
+            ports: vec![("a".into(), PortDir::Input), ("io1".into(), PortDir::Inout), ("io2".into(), PortDir::Inout), ("y".into(), PortDir::Output)],
+            nets: vec![
+                Net { name: "a".into(), pins: vec![pin(0, "A"), Conn::Port(0)] }.into(),
+                Net { name: "io1".into(), pins: vec![Conn::Port(1)] }.into(),
+                Net { name: "io2".into(), pins: vec![pin(0, "B"), Conn::Port(2)] }.into(),
+                Net { name: "y".into(), pins: vec![pin(0, "Y"), Conn::Port(3)] }.into(),
+            ],
+        };
+        let pins: HashMap<String, Vec<String>> = [("and2".to_string(), vec!["Y".to_string(), "A".to_string(), "B".to_string()])].into();
+        let keep = || NetlistRef::Borrowed(&nl);
+        let by_cell = Graph::build_by_cell(&libs, &nl, keep(), Some(&pins)).expect("a template build");
+        let by_name = Graph::build_by_name(&libs, &nl, keep(), Some(&pins), None).unwrap();
+        for g in [&by_cell, &by_name] {
+            let label = |v: usize| format!("{}{}", g.vertices[v].name, if g.vertices[v].is_driver { "+" } else { "" });
+            let names: Vec<String> = (0..g.vertices.len()).map(label).collect();
+            assert_eq!(names, ["u1/Y+", "u1/A", "u1/B", "a+", "io1", "io1+", "io2", "io2+", "y"]);
+            let wires: Vec<String> = g.edges.iter().filter(|e| matches!(e.kind, EdgeKind::Wire)).map(|e| format!("{}>{}", label(e.from), label(e.to))).collect();
+            assert_eq!(wires, ["u1/Y+>y", "a+>u1/A", "io1>io1+", "io2+>u1/B", "io2>io2+"]);
+            let paths: Vec<String> = g.bidirect_port_paths.iter().map(|&e| format!("{}>{}", label(g.edges[e].from), label(g.edges[e].to))).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+            assert_eq!(paths, ["io1>io1+", "io2>io2+"]);
+            let level = g.levels().unwrap();
+            assert_eq!((level[5], level[7]), (0, 0), "a bidirect port's driver is a root, not past its load");
+            // the incremental timer keeps to the vertices an edit touched: only the ports share names
+            assert!(g.names_shared_only_by_bidirect_ports());
+            assert_eq!(g.vertices_named(g.index()["io2"]), 6..=7);
+        }
+        let ends = |g: &Graph| g.edges.iter().map(|e| (e.from, e.to)).collect::<Vec<_>>();
+        assert_eq!(ends(&by_cell), ends(&by_name));
+        assert!(Graph::build_with_pins(&libs, &nl, Some(&pins)).is_ok(), "the repairer's build takes them");
     }
 
     /// Two `and2` in a chain: ports a, b into u1; u1/Y and port c into u2; u2/Y out to y.

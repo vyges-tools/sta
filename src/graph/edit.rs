@@ -62,6 +62,9 @@ struct Batch<'p> {
     swap_equiv: bool,
     /// The vertices of the instance being swapped.
     swapped: Vec<usize>,
+    /// The bidirect top-level ports: two vertices under one name, which the name index cannot
+    /// tell apart, so an edit that names one is not made in place.
+    bidirect_ports: std::collections::HashSet<String>,
 }
 
 /// [`Graph::check_extends`]'s answer: where the new instances went — `at[j]` is the number of old
@@ -253,16 +256,28 @@ impl<'a> Graph<'a> {
                 self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect()
             }
         };
-        if index.len() != self.vertices.len() {
+        // A bidirect top-level port is two vertices under one name (load, then driver); a design's
+        // inout pads alone on their nets are never edited, so they do not stop the edit. Any other
+        // shared name does.
+        let bidirect_ports: std::collections::HashSet<String> = self.netlist.ports.iter().filter(|p| p.1 == crate::netlist::PortDir::Inout).map(|p| p.0.clone()).collect();
+        if index.len() + bidirect_ports.len() != self.vertices.len() {
             return Err(NotInPlace::Event("a pin name shared by two vertices".into()));
         }
-        Ok(Batch { index, free: Vec::new(), touched: Vec::new(), nets: std::collections::HashSet::new(), pins, swap_equiv: false, swapped: Vec::new() })
+        Ok(Batch { index, free: Vec::new(), touched: Vec::new(), nets: std::collections::HashSet::new(), pins, swap_equiv: false, swapped: Vec::new(), bidirect_ports })
     }
 
     /// Each event made on the graph, in order (one function per callback).
     fn edit_events(&mut self, moves: &Moves, events: &[String], b: &mut Batch<'_>) -> Result<(), NotInPlace> {
         for ev in events {
             let f: Vec<&str> = ev.split('|').collect();
+            // an edit naming a bidirect port (as the pin, or on the pin's net) is not made in place
+            if !b.bidirect_ports.is_empty() {
+                if let ["iterm_connect" | "bterm_connect" | "iterm_disconnect" | "bterm_disconnect", pin, _, on_net] = f.as_slice() {
+                    if b.bidirect_ports.contains(*pin) || on_net.split(',').any(|p| b.bidirect_ports.contains(p)) {
+                        return Err(NotInPlace::Event(format!("{ev}: a bidirect port")));
+                    }
+                }
+            }
             match f.as_slice() {
                 ["inst_create", inst, master] => self.make_instance_after(moves, inst, master, b)?,
                 ["iterm_connect" | "bterm_connect", pin, net, on_net] => {
@@ -850,6 +865,33 @@ mod tests {
         assert_eq!(of_buf(&g), ["buf1/Y", "buf1/A"]);
         assert_eq!(of_buf(&g), of_buf(&fresh));
         assert_eq!(g.differs_from_build(&fresh), None);
+    }
+
+    /// Rule (`Graph::makePinVertices`: a bidirect top-level port is two vertices, load then
+    /// driver, under one name): a design's inout pad alone on its net does not stop an edit
+    /// elsewhere being made in place — the graph still equals a fresh build — while an edit that
+    /// names the port is not made in place (the name index holds one of its two vertices).
+    #[test]
+    fn a_bidirect_port_does_not_stop_an_edit_elsewhere() {
+        let libs = libs();
+        let with_pad = |buffered: bool| {
+            let mut nl = chain(buffered);
+            nl.ports.push(("io".into(), PortDir::Inout));
+            nl.nets.push(Net { name: "io".into(), pins: vec![Conn::Port(4)] }.into());
+            nl
+        };
+        let mut g = Graph::build_shared(&libs, Arc::new(with_pad(false)), None).unwrap();
+        // the pad's net sits after n1 in the buffered netlist only if appended last: keep it last
+        let mut next = with_pad(false);
+        next.insts.push(crate::netlist::inst("buf1", "buf"));
+        Arc::make_mut(&mut next.nets[2]).pins = vec![Conn::Inst(0, "Y".into()), Conn::Inst(2, "A".into())];
+        next.nets.push(Net { name: "n2".into(), pins: vec![Conn::Inst(2, "Y".into()), Conn::Inst(1, "A".into())] }.into());
+        g.apply_edits(&insertion(), Arc::new(next.clone()), None).unwrap();
+        let fresh = Graph::build(&libs, &next).unwrap();
+        assert_eq!(g.differs_from_build(&fresh), None);
+        let mut h = Graph::build_shared(&libs, Arc::new(with_pad(false)), None).unwrap();
+        let named = ["bterm_connect|io|n1|u1/Y,u2/A,io".to_string()];
+        assert!(matches!(h.apply_edits(&named, Arc::new(with_pad(false)), None), Err(NotInPlace::Event(_))));
     }
 
     /// Rule (the reference's network is edited, never copied): with the order held, the slots an

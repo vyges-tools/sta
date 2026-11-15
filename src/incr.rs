@@ -234,14 +234,17 @@ impl IncTimer {
 
     pub fn import(&self, g: &mut Graph<'_>) {
         match g.state_seq {
-            // one name, two vertices (a bidirect pin): the index holds one of them
-            Some((stamp, n)) if stamp == self.stamp.0 && n >= self.written_base && n <= self.written_base + self.written.len() && g.index().len() == g.vertices.len() => {
+            // one name, two vertices (a bidirect pin): the index holds one of them, so only a
+            // bidirect top-level port's pair (both taken) keeps the import to what was written
+            Some((stamp, n)) if stamp == self.stamp.0 && n >= self.written_base && n <= self.written_base + self.written.len() && (g.index().len() == g.vertices.len() || g.names_shared_only_by_bidirect_ports()) => {
                 let index = g.pin_index();
                 let mut seen = std::collections::HashSet::new();
                 for name in &self.written[n - self.written_base..] {
                     if seen.insert(name.as_str()) {
                         if let Some(&v) = index.get(name) {
-                            self.import_vertex(g, v);
+                            for u in g.vertices_named(v) {
+                                self.import_vertex(g, u);
+                            }
                         }
                     }
                 }
@@ -351,7 +354,7 @@ impl IncTimer {
         let index = g.pin_index();
         // One vertex per name: only the vertices the visits raise change, so only they are read
         // and written. `VYGES_STA_CHECK_LEVELS=1`: against the whole pass, every call.
-        if index.len() == g.vertices.len() {
+        if index.len() == g.vertices.len() || g.names_shared_only_by_bidirect_ports() {
             let full = std::env::var_os("VYGES_STA_CHECK_LEVELS").is_some().then(|| {
                 let mut t = self.clone();
                 t.relevelize_all(g, &index);
@@ -379,8 +382,8 @@ impl IncTimer {
         for name in std::mem::take(&mut self.relevelize_from) {
             let Some(&v) = index.get(&name) else { continue };
             // As the whole pass: a vertex is pushed at the level it was raised to, and levels only
-            // rise, so it is never below its push.
-            let mut stack = vec![(v, at(&raised, v))];
+            // rise, so it is never below its push. (A bidirect port's name: both its vertices.)
+            let mut stack: Vec<(usize, i32)> = g.vertices_named(v).map(|u| (u, at(&raised, u))).collect();
             while let Some((u, l)) = stack.pop() {
                 for &e in &g.out_edges[u] {
                     if !Self::search_thru(g, e) {
@@ -427,8 +430,8 @@ impl IncTimer {
             let Some(&v) = index.get(&name) else { continue };
             // `visit(vertex, level, 1)`: depth first; a fanout not above `level` is raised to
             // `level + 1` and visited from there. The final levels are the maxima over the paths,
-            // whatever the visiting order.
-            let mut stack = vec![(v, level[v])];
+            // whatever the visiting order. (A bidirect port's name: both its vertices.)
+            let mut stack: Vec<(usize, i32)> = g.vertices_named(v).map(|u| (u, level[u])).collect();
             while let Some((u, l)) = stack.pop() {
                 level[u] = level[u].max(l);
                 for &e in &g.out_edges[u] {
