@@ -50,7 +50,7 @@ pub fn cmp_group_ends(s: &Search<'_, '_>, a: &GroupEnd, b: &GroupEnd) -> Orderin
     }
     let (pa, pb) = (&s.paths[a.vertex][a.path], &s.paths[b.vertex][b.path]);
     if a.vertex != b.vertex {
-        return s.graph.vertices[a.vertex].name.cmp(&s.graph.vertices[b.vertex].name);
+        return s.graph.vname(a.vertex).cmp(&s.graph.vname(b.vertex));
     }
     pa.tag.rf.cmp(&pb.tag.rf).then(pa.tag.clk_edge.map_or(-1, |e| e as i64).cmp(&pb.tag.clk_edge.map_or(-1, |e| e as i64)))
 }
@@ -66,7 +66,7 @@ impl Search<'_, '_> {
         // those ends apart). Its end has a target clock (the gate's clock pin) for `groupPathsTo`.
         let gated_end = self.is_gated_clk_enable(v) && !self.graph.is_port(v) && !self.graph.in_edges[v].iter().any(|&e| self.graph.is_timed_check(e));
         let clocked = p.tag.clk_edge.is_some() && (self.has_target_clock(v) || gated_end);
-        let groups = self.sdc.group_paths_to(p.tag.states, &self.graph.vertices[v].name, clocked);
+        let groups = self.sdc.group_paths_to(p.tag.states, &self.graph.vname(v), clocked);
         if !groups.is_empty() {
             return groups.into_iter().any(|id| self.sdc.path_delays[id].group.as_deref() == Some(name));
         }
@@ -137,7 +137,7 @@ pub fn register_pins(g: &crate::graph::Graph<'_>, data: bool) -> Vec<usize> {
     let regs: std::collections::BTreeSet<usize> = (0..g.vertices.len()).filter(|&v| reg_clk(v)).filter_map(inst_of).collect();
     let port_timed = |v: usize| {
         let x = &g.vertices[v];
-        let port = x.lib.zip(x.cell.as_deref()).zip(x.port.as_deref()).and_then(|((l, c), p)| g.libs[l].cells.get(c).and_then(|c| c.port(p)));
+        let port = x.lib.zip(x.cell.as_deref()).zip(x.port()).and_then(|((l, c), p)| g.libs[l].cells.get(c).and_then(|c| c.port(p)));
         port.is_some_and(|p| p.min_period.is_some() || p.min_pulse_width.iter().any(Option::is_some))
     };
     (0..g.vertices.len())
@@ -194,7 +194,7 @@ mod tests {
         let mut s = Search::in_graph_order(&g, &sdc);
         s.find_arrivals().unwrap();
         s.find_requireds().unwrap();
-        s.group_path_ends("ga", MAX, usize::MAX, slack_min * 1e-9, slack_max * 1e-9).iter().map(|e| (g.vertices[e.vertex].name.clone(), e.slack * 1e9)).collect()
+        s.group_path_ends("ga", MAX, usize::MAX, slack_min * 1e-9, slack_max * 1e-9).iter().map(|e| (g.vname(e.vertex), e.slack * 1e9)).collect()
     }
 
     /// Rules (`MakePathEnds1`, `PathGroup::saveable`): a group's end at an endpoint is the worst of
@@ -269,7 +269,7 @@ mod tests {
             let mut s = Search::in_graph_order(&g, &sdc);
             s.find_arrivals().unwrap();
             s.find_requireds().unwrap();
-            s.group_path_ends(name, MAX, usize::MAX, -1.0, 1.0).iter().map(|e| g.vertices[e.vertex].name.clone()).collect()
+            s.group_path_ends(name, MAX, usize::MAX, -1.0, 1.0).iter().map(|e| g.vname(e.vertex)).collect()
         };
         assert_eq!(group_ends(Vec::new(), GATED_CLK_GROUP), ["u1/A"], "the enable, not the flop's D");
         let to_en = PathDelay { from_pins: vec!["en".into()], from_clock: false, to_pins: vec!["u1/A".into()], to_clock: false, min_max: MAX, ignore_clk_latency: false, break_path: false, delay: 0.0, false_path: false, multicycle: None, thrus: Vec::new(), group: Some("ge".into()) };
@@ -321,7 +321,7 @@ mod tests {
         };
         let g = Graph::build(&libs, &netlist).unwrap();
         let names = |data: bool| {
-            let mut v: Vec<String> = register_pins(&g, data).into_iter().map(|v| g.vertices[v].name.clone()).collect();
+            let mut v: Vec<String> = register_pins(&g, data).into_iter().map(|v| g.vname(v)).collect();
             v.sort();
             v
         };

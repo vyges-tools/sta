@@ -1008,7 +1008,7 @@ pub fn time_design_with(libs: &[Library], nl: &Netlist, sdc: &crate::sdc::Sdc, e
     let pin_slacks = (0..g.vertices.len())
         .filter_map(|v| {
             let slack = s.slack_of(v, mm, None);
-            (slack < crate::search::INF).then(|| (g.vertices[v].name.clone(), slack))
+            (slack < crate::search::INF).then(|| (g.vname(v), slack))
         })
         .collect();
     let group_ends = sdc
@@ -1017,7 +1017,7 @@ pub fn time_design_with(libs: &[Library], nl: &Netlist, sdc: &crate::sdc::Sdc, e
         .filter_map(|pd| pd.group.clone())
         .map(|name| {
             let ends = s.group_path_ends(&name, mm, usize::MAX, -crate::search::INF, crate::search::INF);
-            let ends = ends.into_iter().map(|e| (g.vertices[e.vertex].name.clone(), e.slack)).collect();
+            let ends = ends.into_iter().map(|e| (g.vname(e.vertex), e.slack)).collect();
             (name, ends)
         })
         .collect();
@@ -1171,8 +1171,8 @@ pub fn sdc_env(s: &vyges_loom::sdc::Sdc, libs: &[Library], nl: &crate::netlist::
                         Some(g) => g,
                         none => none.insert(crate::graph::Graph::build(libs, nl).map_err(|e| format!("{e} (not modelled)"))?),
                     };
-                    for d in graph.vertices.iter().enumerate().filter(|(i, v)| v.is_driver && graph.vertex_net[*i] == Some(n)) {
-                        let slot = env.net_wire_cap.entry(d.1.name.clone()).or_insert([None; 2]);
+                    for d in (0..graph.vertices.len()).filter(|&i| graph.vertices[i].is_driver && graph.vertex_net[i] == Some(n)) {
+                        let slot = env.net_wire_cap.entry(graph.vname(d)).or_insert([None; 2]);
                         for k in 0..2 {
                             if mm[k] {
                                 slot[k] = Some((cap, subtract));

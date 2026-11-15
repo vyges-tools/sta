@@ -311,10 +311,10 @@ mod tests {
         let mut s = Search::in_graph_order(&g, &sdc);
         s.find_arrivals().unwrap();
         s.find_requireds().unwrap();
-        let y = g.vertices.iter().position(|x| x.name == "y").unwrap();
+        let y = (0..g.vertices.len()).position(|x| g.vname(x) == "y").unwrap();
         s.endpoint_path_ends(y, 100, endpoint_path_count)
             .iter()
-            .map(|pe| (pe.nodes.iter().map(|n| g.vertices[n.vertex].name.clone()).collect(), pe.nodes[0].tag.rf, pe.slack))
+            .map(|pe| (pe.nodes.iter().map(|n| g.vname(n.vertex)).collect(), pe.nodes[0].tag.rf, pe.slack))
             .collect()
     }
 

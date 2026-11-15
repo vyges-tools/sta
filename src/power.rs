@@ -509,7 +509,7 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
         let (mut pin_key, mut pin_drvr, mut bidir): (Vec<usize>, Vec<usize>, Vec<bool>) = ((0..n).collect(), (0..n).collect(), vec![false; n]);
         for v in 1..n {
             let (a, b) = (&g.vertices[v - 1], &g.vertices[v]);
-            if a.name == b.name && a.conn == b.conn {
+            if a.conn == b.conn {
                 pin_key[v] = v - 1;
                 pin_drvr[v - 1] = v;
                 bidir[v - 1] = true;
@@ -559,7 +559,7 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
     /// `Vertex::to_string`: the pin's path name, and for a bidirect pin's vertex ` load` or
     /// ` driver`.
     fn label(&self, v: usize) -> String {
-        let name = path_name(&self.g.vertices[v].name);
+        let name = path_name(&self.g.vname(v));
         match (self.bidir[v], self.g.vertices[v].is_driver) {
             (true, true) => format!("{name} driver"),
             (true, false) => format!("{name} load"),
@@ -625,7 +625,7 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
                 if self.pin_key[v] != v {
                     continue;
                 }
-                let Some(port) = self.g.vertices[v].port.as_deref() else { continue };
+                let Some(port) = self.g.vertices[v].port() else { continue };
                 let Some(p) = cell.ports.iter().find(|p| p.name == port) else { continue };
                 if is_any_output(p.direction) && p.function.is_none() && !self.inp.is_clock[v] {
                     self.act.pin[v] = Some(input);
@@ -670,7 +670,7 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
         }
         let inst = self.inst_of(v);
         if self.is_driver(v) {
-            if let (Some(i), Some(port)) = (inst, self.g.vertices[v].port.clone()) {
+            if let (Some(i), Some(port)) = (inst, self.g.vertices[v].port().map(str::to_string)) {
                 if let Some(cell) = self.cell_of_inst(i) {
                     let mut func = self.func(cell, &port);
                     if func.is_none() {
@@ -715,7 +715,7 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
         let mut out = [None; 3];
         let Some(cell) = self.cell_of_inst(i) else { return out };
         for &v in &self.inst_pins[i] {
-            let Some(port) = self.g.vertices[v].port.as_deref() else { continue };
+            let Some(port) = self.g.vertices[v].port() else { continue };
             let Some(p) = cell.ports.iter().find(|p| p.name == port) else { continue };
             for (k, on) in [p.is_clock_gate_enable, p.is_clock_gate_clock, p.is_clock_gate_out].into_iter().enumerate() {
                 if on {
@@ -757,7 +757,7 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
         let changed = density_delta > CHANGE_TOLERANCE || duty_delta > CHANGE_TOLERANCE || a.origin != prev.origin;
         self.act.trace.push(format!(
             "VYG-SET {} slew {} dens {} duty {} origin {} changed {}",
-            path_name(&self.g.vertices[v].name),
+            path_name(&self.g.vname(v)),
             bits(slew),
             bits(a.density),
             bits(a.duty),
@@ -805,7 +805,7 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
             self.seed_reg_seqs(i, test, Some(test));
         } else if cell.is_clock_gate {
             for v in self.inst_pins[i].clone() {
-                let port = self.g.vertices[v].port.as_deref().unwrap_or("");
+                let port = self.g.vertices[v].port().unwrap_or("");
                 if cell.ports.iter().any(|p| p.name == port && p.is_clock_gate_out) {
                     self.bfs.enqueue(v, self.inp.level[v]);
                 }
@@ -820,7 +820,7 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
             self.seed_reg_output(i, seq, seq.output.as_deref(), false);
             self.seed_reg_output(i, seq, seq.output_inv.as_deref(), true);
             for v in self.inst_pins[i].clone() {
-                let Some(port) = self.g.vertices[v].port.clone() else { continue };
+                let Some(port) = self.g.vertices[v].port().map(str::to_string) else { continue };
                 let cell = match test_cell {
                     Some(t) => t,
                     None => match self.cell_of_inst(i) {
@@ -833,7 +833,7 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
                 }
                 if let Some(func) = self.func(cell, &port) {
                     if reads_state(&func, seq) {
-                        self.act.trace.push(format!("enqueue reg output {}", path_name(&self.g.vertices[v].name)));
+                        self.act.trace.push(format!("enqueue reg output {}", path_name(&self.g.vname(v))));
                         self.bfs.enqueue(v, self.inp.level[v]);
                     }
                 }
@@ -991,11 +991,11 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
     }
 
     fn port_of(&self, v: usize, cell: &'a Cell) -> Option<&'a crate::liberty::Port> {
-        self.g.vertices[v].port.as_deref().and_then(|p| cell.port(p))
+        self.g.vertices[v].port().and_then(|p| cell.port(p))
     }
 
     fn pin_on(&self, i: usize, port: &str) -> Option<usize> {
-        self.inst_pins[i].iter().copied().find(|&v| self.g.vertices[v].port.as_deref() == Some(port))
+        self.inst_pins[i].iter().copied().find(|&v| self.g.vertices[v].port() == Some(port))
     }
 
     /// `getSlew(vertex, rf, scene)`: an ideal clock pin's clock slew, else the max slew.
@@ -1159,9 +1159,9 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
     fn sim_is_one(&self, expr: &FuncExpr, i: usize, pw: &PowerInputs<'_>) -> bool {
         let (mut b, mut f) = Bdd::of(expr);
         for &v in &self.inst_pins[i] {
-            let Some(port) = self.g.vertices[v].port.as_deref() else { continue };
+            let Some(port) = self.g.vertices[v].port() else { continue };
             let Some(var) = b.var_index(port) else { continue };
-            if let Some(&value) = pw.constants.get(&self.g.vertices[v].name) {
+            if let Some(&value) = pw.constants.get(&self.g.vname(v)) {
                 f = b.restrict(f, var, value);
             }
         }
@@ -1257,7 +1257,7 @@ struct InstView<'p, 'x, 'g, 'a> {
 
 impl InstView<'_, '_, '_, '_> {
     fn pin(&self, port: &str) -> Option<usize> {
-        self.p.inst_pins[self.inst].iter().copied().find(|&v| self.p.g.vertices[v].port.as_deref() == Some(port))
+        self.p.inst_pins[self.inst].iter().copied().find(|&v| self.p.g.vertices[v].port() == Some(port))
     }
 }
 
@@ -1580,7 +1580,7 @@ mod tests {
         let nl = macro_chain();
         let g = Graph::build(&libs, &nl).unwrap();
         let act = propagate(&g, 1e-8, None);
-        let at = |n: &str| act.pin[g.vertices.iter().position(|v| v.name == n).unwrap()];
+        let at = |n: &str| act.pin[(0..g.vertices.len()).position(|v| g.vname(v) == n).unwrap()];
         let input = input_activity(1e-8, 1e-9);
         assert_eq!(at("m/Q"), Some(input));
         assert_eq!(at("u/Y").map(|a| (a.density, a.duty)), Some((input.density, 0.5)));
@@ -1596,7 +1596,7 @@ mod tests {
         let nl = macro_chain();
         let g = Graph::build(&libs, &nl).unwrap();
         let n = g.vertices.len();
-        let at = |n: &str| g.vertices.iter().position(|v| v.name == n).unwrap();
+        let at = |n: &str| (0..g.vertices.len()).position(|v| g.vname(v) == n).unwrap();
         let level = g.levels().unwrap();
         let (f, none, zero) = (vec![false; n], vec![None; n], vec![0.0; n]);
         let mut is_clock = f.clone();

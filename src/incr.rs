@@ -40,14 +40,15 @@ type EdgeDelays = Vec<[f32; 2]>;
 /// An [`EdgeKey`] without its to-vertex.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EdgeTail {
-    Gate { from: String, cell: String, set: usize },
+    /// `cell`: the to-vertex's cell name, shared with the graph's vertices.
+    Gate { from: String, cell: std::sync::Arc<str>, set: usize },
     Wire { from: String },
 }
 
 impl EdgeTail {
     fn of(g: &Graph<'_>, e: usize) -> EdgeTail {
         let ed = &g.edges[e];
-        let from = g.vertices[ed.from].name.clone();
+        let from = g.vname(ed.from);
         match ed.kind {
             EdgeKind::Gate { set } => EdgeTail::Gate { from, cell: g.vertices[ed.to].cell.clone().unwrap_or_default(), set },
             EdgeKind::Wire => EdgeTail::Wire { from },
@@ -58,8 +59,8 @@ impl EdgeTail {
     fn is(&self, g: &Graph<'_>, e: usize) -> bool {
         let ed = &g.edges[e];
         match (self, &ed.kind) {
-            (EdgeTail::Gate { from, cell, set }, EdgeKind::Gate { set: s }) => set == s && *from == g.vertices[ed.from].name && cell == g.vertices[ed.to].cell.as_deref().unwrap_or(""),
-            (EdgeTail::Wire { from }, EdgeKind::Wire) => *from == g.vertices[ed.from].name,
+            (EdgeTail::Gate { from, cell, set }, EdgeKind::Gate { set: s }) => set == s && *from == g.vname(ed.from) && &**cell == g.vertices[ed.to].cell.as_deref().unwrap_or(""),
+            (EdgeTail::Wire { from }, EdgeKind::Wire) => *from == g.vname(ed.from),
             _ => false,
         }
     }
@@ -200,9 +201,9 @@ pub struct SPath {
 impl IncTimer {
     pub fn edge_key(g: &Graph<'_>, e: usize) -> EdgeKey {
         let ed = &g.edges[e];
-        let (from, to) = (g.vertices[ed.from].name.clone(), g.vertices[ed.to].name.clone());
+        let (from, to) = (g.vname(ed.from), g.vname(ed.to));
         match ed.kind {
-            EdgeKind::Gate { set } => EdgeKey::Gate { from, to, cell: g.vertices[ed.to].cell.clone().unwrap_or_default(), set },
+            EdgeKind::Gate { set } => EdgeKey::Gate { from, to, cell: g.vertices[ed.to].cell.as_deref().unwrap_or_default().to_string(), set },
             EdgeKind::Wire => EdgeKey::Wire { from, to },
         }
     }
@@ -251,7 +252,7 @@ impl IncTimer {
             }
             _ => {
                 for v in 0..g.vertices.len() {
-                    g.slew[v] = self.slews.get(&g.vertices[v].name).copied().unwrap_or([[0.0; 2]; 2]);
+                    g.slew[v] = self.slews.get(&g.vname(v)).copied().unwrap_or([[0.0; 2]; 2]);
                 }
                 for e in 0..g.edges.len() {
                     self.import_delay(g, e);
@@ -263,7 +264,7 @@ impl IncTimer {
 
     /// Vertex `v`'s slew and its in-edges' delays.
     fn import_vertex(&self, g: &mut Graph<'_>, v: usize) {
-        g.slew[v] = self.slews.get(&g.vertices[v].name).copied().unwrap_or([[0.0; 2]; 2]);
+        g.slew[v] = self.slews.get(&g.vname(v)).copied().unwrap_or([[0.0; 2]; 2]);
         for i in 0..g.in_edges[v].len() {
             self.import_delay(g, g.in_edges[v][i]);
         }
@@ -279,13 +280,13 @@ impl IncTimer {
 
     /// The stored delays of edge `e` of `g`.
     fn delay_of(&self, g: &Graph<'_>, e: usize) -> Option<&Vec<[f32; 2]>> {
-        let to = g.vertices[g.edges[e].to].name.as_str();
-        self.delays.get(to)?.iter().find(|(t, _)| t.is(g, e)).map(|(_, d)| d)
+        let to = g.vname(g.edges[e].to);
+        self.delays.get(&to)?.iter().find(|(t, _)| t.is(g, e)).map(|(_, d)| d)
     }
 
     /// Store `g`'s delays of edge `e`, replacing what its key held.
     fn store_delay(&mut self, g: &Graph<'_>, e: usize) {
-        let to = &g.vertices[g.edges[e].to].name;
+        let to = &g.vname(g.edges[e].to);
         let d = g.delay[e].clone();
         match self.delays.get_mut(to.as_str()) {
             Some(bucket) => match bucket.iter_mut().find(|(t, _)| t.is(g, e)) {
@@ -300,7 +301,7 @@ impl IncTimer {
 
     /// The graph's slews and delays back into the state.
     pub fn export(&mut self, g: &Graph<'_>) {
-        self.slews = (0..g.vertices.len()).map(|v| (g.vertices[v].name.clone(), g.slew[v])).collect();
+        self.slews = (0..g.vertices.len()).map(|v| (g.vname(v), g.slew[v])).collect();
         self.delays.clear();
         self.written.clear();
         self.written_base = 0;
@@ -314,15 +315,15 @@ impl IncTimer {
     /// delays, and the slews at its fanout (a driver sets its loads'). Keeps the state current
     /// after a visit without exporting the whole graph.
     pub fn export_around(&mut self, g: &Graph<'_>, v: usize) {
-        self.slews.insert(g.vertices[v].name.clone(), g.slew[v]);
-        self.written.push(g.vertices[v].name.clone());
+        self.slews.insert(g.vname(v), g.slew[v]);
+        self.written.push(g.vname(v));
         for &e in g.in_edges[v].iter().chain(g.out_edges[v].iter()) {
             self.store_delay(g, e);
         }
         for &e in &g.out_edges[v] {
             let to = g.edges[e].to;
-            self.slews.insert(g.vertices[to].name.clone(), g.slew[to]);
-            self.written.push(g.vertices[to].name.clone());
+            self.slews.insert(g.vname(to), g.slew[to]);
+            self.written.push(g.vname(to));
         }
     }
 
@@ -341,7 +342,7 @@ impl IncTimer {
     pub fn relevelize(&mut self, g: &Graph<'_>) -> Result<(), String> {
         if self.levels.is_empty() {
             let l = g.levels()?;
-            self.levels = (0..g.vertices.len()).map(|v| (g.vertices[v].name.clone(), l[v] * LEVEL_SPACE)).collect();
+            self.levels = (0..g.vertices.len()).map(|v| (g.vname(v), l[v] * LEVEL_SPACE)).collect();
             self.relevelize_from.clear();
             self.made.clear();
             return Ok(());
@@ -377,7 +378,7 @@ impl IncTimer {
     /// by their events).
     fn relevelize_raised(&mut self, g: &Graph<'_>, index: &HashMap<String, usize>) {
         let levels = &self.levels;
-        let at = |raised: &HashMap<usize, i32>, u: usize| raised.get(&u).copied().unwrap_or_else(|| levels.get(&g.vertices[u].name).copied().unwrap_or(0));
+        let at = |raised: &HashMap<usize, i32>, u: usize| raised.get(&u).copied().unwrap_or_else(|| levels.get(&g.vname(u)).copied().unwrap_or(0));
         let mut raised: HashMap<usize, i32> = HashMap::new();
         for name in std::mem::take(&mut self.relevelize_from) {
             let Some(&v) = index.get(&name) else { continue };
@@ -399,7 +400,7 @@ impl IncTimer {
         }
         // Every raised vertex rose: `levelChangedBefore`.
         for &v in raised.keys() {
-            let name = &g.vertices[v].name;
+            let name = &g.vname(v);
             if self.delays_exist {
                 self.invalid_delays.insert(name.clone());
             }
@@ -411,7 +412,7 @@ impl IncTimer {
             }
         }
         for (v, l) in raised {
-            self.levels.insert(g.vertices[v].name.clone(), l);
+            self.levels.insert(g.vname(v), l);
         }
         for name in std::mem::take(&mut self.made) {
             if index.contains_key(&name) {
@@ -424,7 +425,7 @@ impl IncTimer {
     fn relevelize_all(&mut self, g: &Graph<'_>, index: &HashMap<String, usize>) {
         self.made.clear();
         // A new vertex starts at level 0 (`makeVertex`); a deleted one is forgotten.
-        let mut level: Vec<i32> = (0..g.vertices.len()).map(|v| self.levels.get(&g.vertices[v].name).copied().unwrap_or(0)).collect();
+        let mut level: Vec<i32> = (0..g.vertices.len()).map(|v| self.levels.get(&g.vname(v)).copied().unwrap_or(0)).collect();
         let start = level.clone();
         for name in std::mem::take(&mut self.relevelize_from) {
             let Some(&v) = index.get(&name) else { continue };
@@ -449,7 +450,7 @@ impl IncTimer {
         for v in 0..g.vertices.len() {
             if level[v] != start[v] {
                 // `levelChangedBefore`: delay, arrival and required invalid.
-                let name = &g.vertices[v].name;
+                let name = &g.vname(v);
                 if self.delays_exist {
                     self.invalid_delays.insert(name.clone());
                 }
@@ -465,7 +466,7 @@ impl IncTimer {
         // vertex's level (a new one inserted, a later one of a repeated name last), then any name no
         // longer in the graph dropped.
         for (v, &l) in level.iter().enumerate() {
-            let name = &g.vertices[v].name;
+            let name = &g.vname(v);
             match self.levels.get_mut(name.as_str()) {
                 Some(x) => *x = l,
                 None => {
@@ -552,9 +553,9 @@ impl IncTimer {
         let g = search.graph;
         let index = g.pin_index();
         let edges: HashMap<EdgeKey, usize> = (0..g.edges.len()).map(|e| (Self::edge_key(g, e), e)).collect();
-        for v in 0..g.vertices.len() {
-            let Some(stored) = self.paths.get(&g.vertices[v].name) else { continue };
-            search.paths[v] = stored
+        for (v, paths) in search.paths.iter_mut().enumerate().take(g.vertices.len()) {
+            let Some(stored) = self.paths.get(&g.vname(v)) else { continue };
+            *paths = stored
                 .iter()
                 .filter_map(|sp| {
                     let tag = Self::tag(&index, &sp.tag)?;
@@ -1352,7 +1353,7 @@ pub fn gate_delay_changed(prev: f32, new: f32) -> bool {
 }
 
 fn g_name(g: &Graph<'_>, v: usize) -> String {
-    g.vertices[v].name.clone()
+    g.vname(v)
 }
 
 fn is_latch_d_to_q(g: &Graph<'_>, e: usize) -> bool {
@@ -1432,7 +1433,7 @@ mod tests {
         let load = a.index()["b2/A"];
         assert_ne!(a.slew[load], [[0.0; 2]; 2]);
         for v in (0..a.vertices.len()).filter(|&v| v != port) {
-            assert_eq!(a.slew[v], b.slew[v], "{}", a.vertices[v].name);
+            assert_eq!(a.slew[v], b.slew[v], "{}", a.vname(v));
         }
         assert_eq!(a.delay, b.delay);
         assert_eq!(b.slew[port], [[7.0; 2]; 2], "not written since: left as it was");

@@ -39,7 +39,7 @@ fn main() -> Result<(), String> {
         s.find_arrivals()?;
         s.find_requireds()?;
         for pin in pins.split(',') {
-            let Some(v) = g.vertices.iter().position(|x| x.name == pin) else { eprintln!("{pin}: no such pin"); continue };
+            let Some(v) = (0..g.vertices.len()).position(|x| g.vname(x) == *pin) else { eprintln!("{pin}: no such pin"); continue };
             for (rf, edge) in [(0, "^"), (1, "v")] {
                 let max = vyges_sta::liberty::MAX;
                 eprintln!("{pin} {edge} slew {:.9} arrival {:.9} required {:.9}", g.slew[v][rf][max] / libs[0].time_scale, s.arrival_rf(v, rf, max) / libs[0].time_scale, s.required_rf(v, rf, max) / libs[0].time_scale);

@@ -264,7 +264,7 @@ pub fn ideal_clock_slews(graph: &Graph<'_>, sdc: &Sdc) -> HashMap<usize, [[f32; 
 fn clock_network_of(graph: &Graph<'_>, sdc: &Sdc, want: impl Fn(&crate::sdc::Clock) -> bool) -> Vec<bool> {
     let n = graph.vertices.len();
     let mut seen = vec![false; n];
-    let sources: Vec<usize> = sdc.clocks.iter().filter(|c| !c.source.is_empty() && want(c)).filter_map(|c| graph.vertices.iter().position(|v| v.name == c.source)).collect();
+    let sources: Vec<usize> = sdc.clocks.iter().filter(|c| !c.source.is_empty() && want(c)).filter_map(|c| (0..graph.vertices.len()).position(|v| graph.vname(v) == c.source)).collect();
     let mut queue: std::collections::VecDeque<usize> = sources.iter().copied().collect();
     for &v in &sources {
         seen[v] = true;
@@ -479,7 +479,7 @@ fn sim_edges(graph: &Graph<'_>) -> SimEdges {
         crate::netlist::Conn::Inst(i, _) => Some(graph.netlist.insts[*i].0.as_str()),
         crate::netlist::Conn::Port(_) => None,
     };
-    let annotated: std::collections::HashSet<&str> = graph.vertices.iter().enumerate().filter(|(_, x)| constants.contains_key(&x.name)).filter_map(|(v, _)| inst_name(v)).collect();
+    let annotated: std::collections::HashSet<&str> = (0..graph.vertices.len()).filter(|&v| constants.contains_key(&graph.vname(v))).filter_map(inst_name).collect();
     for (e, ed) in graph.edges.iter().enumerate() {
         let EdgeKind::Gate { set } = ed.kind else { continue };
         let Some(inst) = inst_name(ed.to) else { continue };
@@ -607,7 +607,7 @@ impl<'g, 'a> Search<'g, 'a> {
         let sim = sim_edges(graph);
         let (latch_en, latch_data) = latch_enables(graph);
         let clk_network = clock_network(graph, sdc);
-        let clock_leaf = graph.vertices.iter().map(|v| sdc.clocks.iter().any(|c| !c.source.is_empty() && v.name == c.source)).collect();
+        let clock_leaf = (0..graph.vertices.len()).map(|v| { let name = graph.vname(v); sdc.clocks.iter().any(|c| !c.source.is_empty() && name == c.source) }).collect();
         let mut search = Search { graph, sdc, paths: vec![Vec::new(); n], vertex_id, input_delay, output_delay, is_reg_clk, internal_from, internal_from_break, internal_to, internal_to_break, sim, latch_en, latch_data, clk_network, clock_leaf, gated: HashMap::new() };
         search.gated = search.gated_clk_enables();
         search
@@ -626,7 +626,7 @@ impl<'g, 'a> Search<'g, 'a> {
         }
         let index = g.pin_index();
         for (v, vx) in g.vertices.iter().enumerate() {
-            let (Some(lib), Some(cell_name), Some(port), crate::netlist::Conn::Inst(i, _)) = (vx.lib, vx.cell.as_deref(), vx.port.as_deref(), &vx.conn) else { continue };
+            let (Some(lib), Some(cell_name), Some(port), crate::netlist::Conn::Inst(i, _)) = (vx.lib, vx.cell.as_deref(), vx.port(), &vx.conn) else { continue };
             let cell = &g.libs[lib].cells[cell_name];
             if vx.is_driver || self.clk_network[v] || !self.search_from(v) || cell.port(port).is_none_or(|p| p.direction != crate::liberty::Direction::Input) {
                 continue;
@@ -638,7 +638,7 @@ impl<'g, 'a> Search<'g, 'a> {
                 if g.arc_set(e, set).role != Role::Combinational || !self.search_to(gclk) || !self.search_thru(e) || !self.clk_network[gclk] {
                     continue;
                 }
-                let Some(f) = g.vertices[gclk].port.as_deref().and_then(|op| cell.port(op)).and_then(|p| p.function.as_deref()).and_then(|f| crate::func_expr::FuncExpr::parse(f).ok()) else { continue };
+                let Some(f) = g.vertices[gclk].port().and_then(|op| cell.port(op)).and_then(|p| p.function.as_deref()).and_then(|f| crate::func_expr::FuncExpr::parse(f).ok()) else { continue };
                 let mut fports = Vec::new();
                 func_ports(&f, &mut fports);
                 for clk_port in cell.ports.iter().map(|p| p.name.as_str()).filter(|p| fports.iter().any(|f| f == p) && *p != port) {
@@ -742,7 +742,7 @@ impl<'g, 'a> Search<'g, 'a> {
     /// from and to in that transition only.
     fn search_thru_sense(&self, e: usize, from_rf: usize, to_rf: usize) -> bool {
         let held = &self.graph.sdc.sim_transitions;
-        let sim_edge = |v: usize, rf: usize| held.is_empty() || held.get(&self.graph.vertices[v].name).is_none_or(|&only| only == rf);
+        let sim_edge = |v: usize, rf: usize| held.is_empty() || held.get(&self.graph.vname(v)).is_none_or(|&only| only == rf);
         let ed = &self.graph.edges[e];
         self.search_thru_timing_sense(e, from_rf, to_rf) && sim_edge(ed.from, from_rf) && sim_edge(ed.to, to_rf)
     }
@@ -793,7 +793,7 @@ impl<'g, 'a> Search<'g, 'a> {
     /// output delay), or no fanout, or a path delay's internal `-to` pin.
     pub fn is_endpoint(&self, v: usize) -> bool {
         let vx = &self.graph.vertices[v];
-        let constrained = self.graph.is_port(v) && (!vx.is_driver || self.output_delay.contains_key(&vx.name));
+        let constrained = self.graph.is_port(v) && (!vx.is_driver || self.output_delay.contains_key(&self.graph.vname(v)));
         let checks = self.graph.in_edges[v].iter().any(|&e| self.graph.is_timed_check(e));
         self.has_fanin(v) && (checks || constrained || !self.has_fanout(v) || self.internal_to[v] || self.gated.contains_key(&v))
     }
@@ -1044,7 +1044,7 @@ impl<'g, 'a> Search<'g, 'a> {
                 // seed launches too, unclocked, at its arrival (`clkPathArrival` of a non-clock path).
                 if from.tag.clk_edge.is_none() && from.tag.segment_start {
                     // `exceptionFromStates` false: a false path from the pin starts nothing.
-                    let states = self.sdc.from_states(&self.thru_pin(from_v, false), false, mm)?;
+                    let states = self.sdc.from_states(&self.thru_pin(from_v, false, &self.graph.vname(from_v)), false, mm)?;
                     let states = self.mutate_states(states, e, false, mm)?;
                     let tag = Tag { rf: arc.to_rf, mm, clk_edge: None, is_clock: false, crpr: None, states, latency: 0, segment_start: false };
                     return Some((tag, delay, from.arrival + delay));
@@ -1057,7 +1057,7 @@ impl<'g, 'a> Search<'g, 'a> {
                 // `fromRegClkTag`: the states of the path delays from the clock pin (or the
                 // clock), then `thruTag` over the clock-to-Q edge — no tag when a false path from
                 // the pin is complete there.
-                let states = self.sdc.from_states(&self.thru_pin(from_v, false), true, mm)?;
+                let states = self.sdc.from_states(&self.thru_pin(from_v, false, &self.graph.vname(from_v)), true, mm)?;
                 let states = self.mutate_states(states, e, false, mm)?;
                 let tag = Tag { rf: arc.to_rf, mm, clk_edge: from.tag.clk_edge, is_clock: false, crpr, states, latency: from.tag.latency, segment_start: false };
                 // `clkPathArrival`: an IDEAL clock launches at its edge + its latency (no insertion
@@ -1092,7 +1092,7 @@ impl<'g, 'a> Search<'g, 'a> {
                 // `thruClkInfo`: a latency on the pin (for the clock EDGE's transition) replaces
                 // the one carried (pin before hierarchical pin; no hierarchy here).
                 let edge = from.tag.clk_edge.unwrap();
-                let latency = self.edge_clock(edge).pin_latency(&self.graph.vertices[to_v].name, edge % 2, mm).map_or(from.tag.latency, f32::to_bits);
+                let latency = self.edge_clock(edge).pin_latency(&self.graph.vname(to_v), edge % 2, mm).map_or(from.tag.latency, f32::to_bits);
                 let tag = Tag { rf: arc.to_rf, mm, clk_edge: from.tag.clk_edge, is_clock: to_is_clk, crpr, states, latency, segment_start: false };
                 Some((tag, delay, from.arrival + delay))
             }
@@ -1115,12 +1115,12 @@ impl<'g, 'a> Search<'g, 'a> {
         }
         let edge = &self.graph.edges[e];
         let wire = matches!(edge.kind, crate::graph::EdgeKind::Wire);
-        self.sdc.mutate(states, &self.thru_pin(edge.from, false), &self.thru_pin(edge.to, wire), from_is_clk, mm)
+        self.sdc.mutate(states, &self.thru_pin(edge.from, false, &self.graph.vname(edge.from)), &self.thru_pin(edge.to, wire, &self.graph.vname(edge.to)), from_is_clk, mm)
     }
 
     /// Vertex `v` as a `-through` point sees it: its pin, net and instance; `wire`: the edge into
     /// it is a wire edge (a net's driver-to-load pair).
-    pub(crate) fn thru_pin(&self, v: usize, wire: bool) -> crate::sdc::ThruPin<'_> {
+    pub(crate) fn thru_pin<'s>(&'s self, v: usize, wire: bool, name: &'s str) -> crate::sdc::ThruPin<'s> {
         let vx = &self.graph.vertices[v];
         let net = self.graph.vertex_net[v].map(|n| self.graph.netlist.nets[n].name.as_str());
         let inst = match &vx.conn {
@@ -1129,7 +1129,7 @@ impl<'g, 'a> Search<'g, 'a> {
         };
         // `direction(to_pin)->isAnyOutput() || isLatchData(to_pin)`: latch data pins are outside
         // the subset an exception is modelled on (`exception_modelled`).
-        crate::sdc::ThruPin { pin: &vx.name, net, inst, wire, output_or_latch_data: vx.is_driver && inst.is_some() }
+        crate::sdc::ThruPin { pin: name, net, inst, wire, output_or_latch_data: vx.is_driver && inst.is_some() }
     }
 
     /// Whether every path delay is of the form this search models, else what is not: `-from` pins
@@ -1155,7 +1155,7 @@ impl<'g, 'a> Search<'g, 'a> {
         if uncertain && self.latch_data.iter().any(|&l| l) {
             return Err("set_clock_uncertainty on a design with latches: not modelled".into());
         }
-        let find = |pin: &str| self.graph.vertices.iter().position(|x| x.name == pin);
+        let find = |pin: &str| (0..self.graph.vertices.len()).position(|x| self.graph.vname(x) == pin);
         for pd in &self.sdc.path_delays {
             for t in &pd.thrus {
                 if let Some(p) = t.pins.iter().find(|p| find(p).is_none()) {
@@ -1226,7 +1226,7 @@ impl<'g, 'a> Search<'g, 'a> {
         if pd.multicycle.is_some() && !self.gated.is_empty() {
             return Err("set_multicycle_path on a design with gated clock checks: not modelled".into());
         }
-        let find = |pin: &str| self.graph.vertices.iter().position(|x| x.name == pin);
+        let find = |pin: &str| (0..self.graph.vertices.len()).position(|x| self.graph.vname(x) == pin);
         for pin in &pd.from_pins {
             let Some(v) = find(pin) else { return Err(format!("{cmd} -from {pin}: no such pin")) };
             let top_input = self.graph.is_port(v) && self.graph.vertices[v].is_driver;
@@ -1325,7 +1325,7 @@ impl<'g, 'a> Search<'g, 'a> {
         if self.is_reg_clk[v] && !has_clk_tag {
             for mm in [MIN, MAX] {
                 // `fromUnclkedInputTag`: none when `exceptionFromStates` stops the path.
-                let Some(states) = self.sdc.from_states(&self.thru_pin(v, false), false, mm) else { continue };
+                let Some(states) = self.sdc.from_states(&self.thru_pin(v, false, &self.graph.vname(v)), false, mm) else { continue };
                 for rf in [0, 1] {
                     set_arrival(&mut bldr, Tag { rf, mm, clk_edge: None, is_clock: false, crpr: None, states, latency: 0, segment_start: true }, 0.0);
                 }
@@ -1335,7 +1335,7 @@ impl<'g, 'a> Search<'g, 'a> {
             // `makeUnclkedPaths(vertex, false, require_exception = true)`: per min/max and
             // transition, an unclocked path at 0 carrying the delays from the pin — none without.
             for mm in [MIN, MAX] {
-                let states = self.sdc.exception_from_states(&self.thru_pin(v, false), false, mm);
+                let states = self.sdc.exception_from_states(&self.thru_pin(v, false, &self.graph.vname(v)), false, mm);
                 if states == States::NONE {
                     continue;
                 }
@@ -1417,7 +1417,7 @@ impl<'g, 'a> Search<'g, 'a> {
     /// `set_input_delay` and the default arrival clock off (`use_default_arrival_clock_` is false
     /// and nothing sets it) — every other input port, UNCLOCKED at 0.
     fn seed_arrivals(&self, v: usize, bldr: &mut Bldr) {
-        let name = &self.graph.vertices[v].name;
+        let name = &self.graph.vname(v);
         // `isLeafPinClock`: a clock seeds on its source pin wherever it is — a port or an
         // instance pin; the input arrivals below seed on top ports only.
         let sources: Vec<usize> = self.sdc.clocks.iter().enumerate().filter(|(_, c)| !c.source.is_empty() && *name == c.source).map(|(k, _)| k).collect();
@@ -1428,7 +1428,7 @@ impl<'g, 'a> Search<'g, 'a> {
                 for mm in [MIN, MAX] {
                     // `seedClkArrival` → `exceptionFromClkStates`: the path delays from the clock's
                     // pin or from the clock ride on its clock tags too.
-                    let states = self.sdc.clock_from_states(&self.thru_pin(v, false), mm);
+                    let states = self.sdc.clock_from_states(&self.thru_pin(v, false, &self.graph.vname(v)), mm);
                     for rf in [0, 1] {
                         let edge = 2 * c + rf;
                         // `seedClkArrival`: a latency on the clock's own pin, else the clock's
@@ -1464,7 +1464,7 @@ impl<'g, 'a> Search<'g, 'a> {
                     let clk_arrival = (self.edge_time(edge) + ck.insertion_of(edge % 2, mm, mm)) + latency;
                     // `inputDelayTag` → `exceptionFromStates(pin, clk)`: from the port, or its clock
                     // — no tag when a false path from either is complete at the start.
-                    let Some(states) = self.sdc.from_states(&self.thru_pin(v, false), true, mm) else { continue };
+                    let Some(states) = self.sdc.from_states(&self.thru_pin(v, false, &self.graph.vname(v)), true, mm) else { continue };
                     for rf in [0, 1] {
                         let tag = Tag { rf, mm, clk_edge: Some(edge), is_clock: false, crpr: None, states, latency: 0, segment_start: false };
                         set_arrival(bldr, tag, clk_arrival + self.sdc.input_delays[d].delay[rf][mm]);
@@ -1475,7 +1475,7 @@ impl<'g, 'a> Search<'g, 'a> {
             // `seedInputDelayArrival(input_delay = null)` → `inputDelayTag` with no clock edge:
             // the states of the path delays from the port alone.
             for mm in [MIN, MAX] {
-                let Some(states) = self.sdc.from_states(&self.thru_pin(v, false), false, mm) else { continue };
+                let Some(states) = self.sdc.from_states(&self.thru_pin(v, false, &self.graph.vname(v)), false, mm) else { continue };
                 for rf in [0, 1] {
                     let tag = Tag { rf, mm, clk_edge: None, is_clock: false, crpr: None, states, latency: 0, segment_start: false };
                     set_arrival(bldr, tag, 0.0);
@@ -1582,7 +1582,7 @@ impl<'g, 'a> Search<'g, 'a> {
     /// Whether the vertex's clocked path ends have a target clock: an output delay at the port or a
     /// timing check at the pin (`visitOutputDelayEnd` / `visitCheckEnd`), not a path delay alone.
     pub(crate) fn has_target_clock(&self, v: usize) -> bool {
-        let name = &self.graph.vertices[v].name;
+        let name = &self.graph.vname(v);
         (self.graph.is_port(v) && self.output_delay.get(name).is_some_and(|d| !d.is_empty())) || self.graph.in_edges[v].iter().any(|&e| self.graph.is_timed_check(e))
     }
 
@@ -1626,7 +1626,7 @@ impl<'g, 'a> Search<'g, 'a> {
     /// `PathEndLatchCheck` — neither is listed.
     pub fn check_ends(&self, v: usize) -> Vec<CheckEnd> {
         let mut out = Vec::new();
-        let name = &self.graph.vertices[v].name;
+        let name = &self.graph.vname(v);
         if self.graph.is_port(v) && self.output_delay.get(name).is_some_and(|d| !d.is_empty()) {
             return out;
         }
@@ -1673,7 +1673,7 @@ impl<'g, 'a> Search<'g, 'a> {
     /// The endpoint's path ends: an output delay end if the port has one, else a check end —
     /// setup for a max path, hold for a min path.
     fn visit_path_ends(&self, v: usize, req: &mut [f32]) {
-        let name = &self.graph.vertices[v].name;
+        let name = &self.graph.vname(v);
         let ods: &[usize] = if self.graph.is_port(v) { self.output_delay.get(name).map_or(&[], Vec::as_slice) } else { &[] };
         let checks = self.graph.in_edges[v].iter().any(|&e| self.graph.is_timed_check(e));
         let gated = self.gated.get(&v).copied();
@@ -1901,7 +1901,7 @@ impl<'g, 'a> Search<'g, 'a> {
     /// propagated), its states from the D pin and from the enable's pin or clock — then `thruTag`.
     fn latch_out_arrival(&self, from_v: usize, from: &Path, e: usize, arc: &ArcRef) -> Option<(Tag, f32, f32)> {
         let &(en_v, en_rf) = self.latch_en.get(&e)?;
-        let d_pin = &self.graph.vertices[from_v].name;
+        let d_pin = &self.graph.vname(from_v);
         let en = self.paths[en_v].iter().find(|p| p.tag.mm == MIN && p.tag.rf == en_rf && p.tag.is_clock)?;
         if self.sdc.path_delay_to(from.tag.states, d_pin, true, MAX).is_some() {
             return None;
@@ -1915,7 +1915,7 @@ impl<'g, 'a> Search<'g, 'a> {
         let delay = self.derated_delay(e, arc.index, false, MAX, MAX);
         let en_edge = en.tag.clk_edge.expect("a clock path");
         let crpr = (self.crpr_active() && self.propagated(en_edge)).then_some(CrprPath { vertex: en_v, rf: en.tag.rf, mm: en.tag.mm, clk_edge: en_edge });
-        let states = States(self.sdc.exception_from_states(&self.thru_pin(from_v, false), false, MAX).0 | self.sdc.exception_from_states(&self.thru_pin(en_v, false), true, MAX).0);
+        let states = States(self.sdc.exception_from_states(&self.thru_pin(from_v, false, &self.graph.vname(from_v)), false, MAX).0 | self.sdc.exception_from_states(&self.thru_pin(en_v, false, &self.graph.vname(en_v)), true, MAX).0);
         let states = self.mutate_states(states, e, false, MAX)?;
         let tag = Tag { rf: arc.to_rf, mm: MAX, clk_edge: en.tag.clk_edge, is_clock: false, crpr, states, latency: en.tag.latency, segment_start: false };
         Some((tag, delay, adjusted + delay))
@@ -1934,7 +1934,7 @@ impl<'g, 'a> Search<'g, 'a> {
                 if arc.to_rf != path.tag.rf {
                     continue;
                 }
-                if let Some(id) = self.sdc.path_delay_to(path.tag.states, &self.graph.vertices[v].name, false, path.tag.mm) {
+                if let Some(id) = self.sdc.path_delay_to(path.tag.states, &self.graph.vname(v), false, path.tag.mm) {
                     Self::required_set(req, i, self.path_delay_required(path, id, self.check_margin(e, k, path.tag.mm), 0.0, 0.0, 0.0), path.tag.mm);
                 }
             }
@@ -2000,7 +2000,7 @@ impl<'g, 'a> Search<'g, 'a> {
                     }
                     let tgt_time = self.accting(src_edge, tgt_edge).required[ACCT_HOLD];
                     let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MIN);
-                    let mcp = self.mcp_adjustment(path, &self.graph.vertices[v].name, src_edge, tgt_edge, MIN);
+                    let mcp = self.mcp_adjustment(path, &self.graph.vname(v), src_edge, tgt_edge, MIN);
                     let margin = -self.sdc.output_delays[d].delay[path.tag.rf][MIN];
                     let latency = self.output_tgt_latency(tgt_edge, MIN);
                     Self::required_set(req, i, (((tgt_time + (0.0 + latency)) + unc) + mcp) + margin, MIN);
@@ -2029,13 +2029,13 @@ impl<'g, 'a> Search<'g, 'a> {
                     }
                     let latency = self.tgt_clk_delay(tgt);
                     // `visitCheckEnd`: a path delay completing here overrides the check.
-                    if let Some(id) = self.sdc.path_delay_to(path.tag.states, &self.graph.vertices[v].name, true, MIN) {
+                    if let Some(id) = self.sdc.path_delay_to(path.tag.states, &self.graph.vname(v), true, MIN) {
                         let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MIN);
                         let required = self.path_delay_required(path, id, self.check_margin(e, k, MIN), latency, unc, self.check_crpr(path, tgt_v, tgt));
                         Self::required_set(req, i, required, MIN);
                         continue;
                     }
-                    Self::required_set(req, i, self.hold_check_required(path, &self.graph.vertices[v].name, src_edge, e, k, tgt_v, tgt), MIN);
+                    Self::required_set(req, i, self.hold_check_required(path, &self.graph.vname(v), src_edge, e, k, tgt_v, tgt), MIN);
                 }
             }
         }
@@ -2074,15 +2074,15 @@ impl<'g, 'a> Search<'g, 'a> {
         }
         // `findCrpr` (OpenSTA 9ef4b4f0: no levels): every pin of the source clock path, then the
         // target clock path backed up to the first pin the source path has.
-        let mut src_pins: HashMap<&str, (usize, &Path)> = HashMap::new();
+        let mut src_pins: HashMap<String, (usize, &Path)> = HashMap::new();
         let mut at = Some((c.vertex, src));
         while let Some((v, p)) = at {
-            src_pins.insert(self.graph.vertices[v].name.as_str(), (v, p));
+            src_pins.insert(self.graph.vname(v), (v, p));
             at = self.prev_path(p);
         }
         let mut at = Some((tgt_v, tgt));
         while let Some((tv, tp)) = at {
-            if let Some(&(sv, sp)) = src_pins.get(self.graph.vertices[tv].name.as_str()) {
+            if let Some(&(sv, sp)) = src_pins.get(self.graph.vname(tv).as_str()) {
                 // `sta_crpr_mode same_pin` (the default): the transitions need not agree there.
                 return self.crpr_arrival_diff(sv, sp).min(self.crpr_arrival_diff(tv, tp));
             }
@@ -2286,7 +2286,7 @@ mod tests {
         let mut s = Search::in_graph_order(&g, &sdc);
         s.find_arrivals().unwrap();
         s.find_requireds().unwrap();
-        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        let v = |n: &str| (0..g.vertices.len()).position(|x| g.vname(x) == n).unwrap();
         f(&s, &v)
     }
 
@@ -2308,7 +2308,7 @@ mod tests {
         let mut s = Search::in_graph_order(&g, &sdc);
         s.find_arrivals().unwrap();
         s.find_requireds().unwrap();
-        let v = g.vertices.iter().position(|x| x.name == "spare").unwrap();
+        let v = (0..g.vertices.len()).position(|x| g.vname(x) == "spare").unwrap();
         assert!(!s.is_endpoint(v));
         for mm in [MAX, MIN] {
             let slack = s.slack_of(v, mm, None);
@@ -2317,7 +2317,7 @@ mod tests {
         assert_eq!(required_init(MAX), INF);
         assert_eq!(required_init(MIN), -INF);
         // a connected input's required comes from its fanout, as before
-        let i = g.vertices.iter().position(|x| x.name == "in").unwrap();
+        let i = (0..g.vertices.len()).position(|x| g.vname(x) == "in").unwrap();
         let connected = s.slack_of(i, MAX, None);
         assert!(connected > 0.0 && connected < INF * 0.5, "a connected input has a finite slack, got {connected}");
     }
@@ -2376,7 +2376,7 @@ mod tests {
         let mut s = Search::in_graph_order(&g, &sdc);
         s.find_arrivals().unwrap();
         s.find_requireds().unwrap();
-        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        let v = |n: &str| (0..g.vertices.len()).position(|x| g.vname(x) == n).unwrap();
         let ns = |x: f32| (x * 1e9 * 1e4).round() / 1e4;
         for (pin, want) in [
             ("f1/CLK", [0.71, 0.79, 0.10, 0.39]),
@@ -2412,7 +2412,7 @@ mod tests {
         s.constraints_modelled().expect("a group path on a latch design is modelled");
         s.find_arrivals().unwrap();
         s.find_requireds().unwrap();
-        let ends: Vec<&str> = s.group_path_ends("r2r", MAX, usize::MAX, -1.0, 1.0).iter().map(|e| g.vertices[e.vertex].name.as_str()).collect();
+        let ends: Vec<String> = s.group_path_ends("r2r", MAX, usize::MAX, -1.0, 1.0).iter().map(|e| g.vname(e.vertex)).collect();
         assert_eq!(ends, ["f2/D"]);
         let mut sdc_false = sdc.clone();
         sdc_false.path_delays = vec![pd(None, true)];
@@ -2477,7 +2477,7 @@ mod tests {
         let mut s = Search::in_graph_order(&g, &sdc);
         s.find_arrivals().unwrap();
         s.find_requireds().unwrap();
-        let rb = g.vertices.iter().position(|x| x.name == "f1/RESET_B").unwrap();
+        let rb = (0..g.vertices.len()).position(|x| g.vname(x) == "f1/RESET_B").unwrap();
         assert!(s.is_endpoint(rb) && !s.has_fanout(rb));
         let own = s.wns_slack(rb, true);
         assert!((own - 0.79e-9).abs() < 1e-15, "recovery slack {own}");
@@ -2514,7 +2514,7 @@ mod tests {
         let mut s = Search::in_graph_order(&g, &sdc);
         s.find_arrivals().unwrap();
         s.find_requireds().unwrap();
-        let q = g.vertices.iter().position(|x| x.name == "f1/Q").unwrap();
+        let q = (0..g.vertices.len()).position(|x| g.vname(x) == "f1/Q").unwrap();
         let falls: Vec<f32> = s.paths[q].iter().filter(|p| p.tag.mm == MAX && p.tag.rf == 1).map(|p| p.arrival).collect();
         assert_eq!(falls.len(), 1, "one max fall path at Q, the clock's: {falls:?}");
         assert!((falls[0] - 0.45e-9).abs() < 1e-15, "Q fall {}", falls[0]);
@@ -2546,7 +2546,7 @@ mod tests {
         };
         let mut g = Graph::build(&libs, &netlist).unwrap();
         g.find_delays(&HashMap::new(), None).unwrap();
-        let q = g.vertices.iter().position(|x| x.name == "f1/Q").unwrap();
+        let q = (0..g.vertices.len()).position(|x| g.vname(x) == "f1/Q").unwrap();
         assert_eq!(g.slew[q][FALL][MAX], 0.1e-9, "Q fall slew is clock-to-Q's");
     }
 
@@ -2577,7 +2577,7 @@ mod tests {
         let mut s = Search::in_graph_order(&g, &sdc);
         s.find_arrivals().unwrap();
         s.find_requireds().unwrap();
-        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        let v = |n: &str| (0..g.vertices.len()).position(|x| g.vname(x) == n).unwrap();
         assert!(sdc.clocks[0].propagated, "the fixture's clock is propagated");
         assert_eq!(path(&s, v("f1/CLK"), RISE, true).tag.crpr, None);
         assert_eq!(path(&s, v("f1/Q"), RISE, false).tag.crpr, None);
@@ -2661,7 +2661,7 @@ mod tests {
         let mut s = Search::in_graph_order(&g, &sdc);
         s.find_arrivals().unwrap();
         s.find_requireds().unwrap();
-        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        let v = |n: &str| (0..g.vertices.len()).position(|x| g.vname(x) == n).unwrap();
         assert_eq!(path(&s, v("f1/Q"), RISE, false).arrival, 0.0 + 0.3f32 * 1e-9, "launched at the edge");
         let d = path(&s, v("f2/D"), RISE, false);
         assert_eq!(d.required, (0.0 + 1e-9f32) - 0.05e-9, "captured at the edge, less the setup");
@@ -2682,7 +2682,7 @@ mod tests {
         let mut s = Search::in_graph_order(&g, &sdc);
         s.find_arrivals().unwrap();
         s.find_requireds().unwrap();
-        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        let v = |n: &str| (0..g.vertices.len()).position(|x| g.vname(x) == n).unwrap();
         let q = path(&s, v("f1/Q"), RISE, false);
         assert_eq!(q.arrival, (0.0 + 0.0) + 0.2e-9f32 + 0.3f32 * 1e-9, "launched at the edge + f1's latency");
         assert_eq!(q.tag.latency, 0.2e-9f32.to_bits());
@@ -2706,7 +2706,7 @@ mod tests {
         s.constraints_modelled().unwrap();
         s.find_arrivals().unwrap();
         s.find_requireds().unwrap();
-        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        let v = |n: &str| (0..g.vertices.len()).position(|x| g.vname(x) == n).unwrap();
         let ck: Vec<&Path> = s.paths[v("f1/CLK")].iter().filter(|p| p.tag.segment_start).collect();
         assert_eq!(ck.len(), 4, "a segment start per transition and min/max");
         assert!(ck.iter().all(|p| p.arrival == 0.0 && p.tag.clk_edge.is_none()));
@@ -2917,7 +2917,7 @@ mod tests {
         let mut s = Search::in_graph_order(&g, &sdc);
         s.find_arrivals().unwrap();
         s.find_requireds().unwrap();
-        let out = g.vertices.iter().position(|x| x.name == "out").unwrap();
+        let out = (0..g.vertices.len()).position(|x| g.vname(x) == "out").unwrap();
         assert_eq!(s.slack_of(out, MAX, None), INF);
         let hold = *s.paths[out].iter().find(|p| p.tag.rf == RISE && p.tag.mm == MIN).unwrap();
         assert_eq!(hold.required, (0.0 + (0.0 + 0.0)) + -0.2e-9f32);
@@ -3030,7 +3030,7 @@ mod tests {
         assert!(s.constraints_modelled().is_ok());
         s.find_arrivals().unwrap();
         s.find_requireds().unwrap();
-        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        let v = |n: &str| (0..g.vertices.len()).position(|x| g.vname(x) == n).unwrap();
         for p in s.paths[v("b1/X")].iter().chain(&s.paths[v("f1/Q")]) {
             assert_eq!(p.tag.states, if p.tag.mm == MIN { States(1) } else { States::NONE });
         }
@@ -3082,7 +3082,7 @@ mod tests {
         s.constraints_modelled().unwrap();
         s.find_arrivals().unwrap();
         s.find_requireds().unwrap();
-        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        let v = |n: &str| (0..g.vertices.len()).position(|x| g.vname(x) == n).unwrap();
         f(&s, &v)
     }
 

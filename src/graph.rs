@@ -41,16 +41,26 @@ fn slew_blocked_by(blocked: &Option<std::sync::Arc<HashMap<usize, [bool; 2]>>>, 
 mod edit;
 pub use edit::{NotInPlace, SlotDelta};
 
-/// A vertex: one pin (a bidirect pin is refused).
-#[derive(Debug, Clone)]
+/// A vertex: one pin (a bidirect pin is two). As the reference's `Vertex` holds its `Pin*` and
+/// no name, a vertex holds its pin (`conn`); its name is the pin's ([`Graph::vname`]) and its
+/// port the pin's ([`Vertex::port`]).
+#[derive(Debug, Clone, PartialEq)]
 pub struct Vertex {
-    pub name: String,
     pub conn: Conn,
     pub is_driver: bool,
-    /// The library and cell of an instance pin.
+    /// The library and cell of an instance pin; the cell name is shared by every vertex of it.
     pub lib: Option<usize>,
-    pub cell: Option<String>,
-    pub port: Option<String>,
+    pub cell: Option<std::sync::Arc<str>>,
+}
+
+impl Vertex {
+    /// The instance pin's port, `None` for a top-level port.
+    pub fn port(&self) -> Option<&str> {
+        match &self.conn {
+            Conn::Inst(_, p) => Some(p),
+            Conn::Port(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -312,6 +322,19 @@ struct Spare {
     out_edges: Vec<Vec<usize>>,
     delay: Vec<Vec<[f32; 2]>>,
     index: Option<std::sync::Arc<HashMap<String, usize>>>,
+    /// The recycled graph's instances and ports, which its vertices' pins index: what names them.
+    insts: Vec<std::sync::Arc<(String, String)>>,
+    ports: Vec<(String, PortDir)>,
+}
+
+impl Spare {
+    /// A recycled vertex's pin name.
+    fn name(&self, v: &Vertex) -> String {
+        match &v.conn {
+            Conn::Inst(i, p) => format!("{}/{p}", self.insts[*i].0),
+            Conn::Port(i) => self.ports[*i].0.clone(),
+        }
+    }
 }
 
 /// How many recycled graphs a thread keeps.
@@ -337,9 +360,10 @@ impl<'a> Graph<'a> {
     /// edit (a repair) pays for what the edit changed, not for every pin's name. The next graph is
     /// the one a fresh build makes (`VYGES_STA_CHECK_BUILD=1` checks it).
     pub fn recycle(self) {
+        let (insts, ports) = (self.netlist.insts.clone(), self.netlist.ports.clone());
         let Graph { vertices, edges, in_edges, out_edges, delay, index_cache, .. } = self;
         let mut ic = index_cache;
-        let spare = Spare { vertices, edges, in_edges, out_edges, delay, index: ic.take() };
+        let spare = Spare { vertices, edges, in_edges, out_edges, delay, index: ic.take(), insts, ports };
         SPARES.with(|p| {
             let mut p = p.borrow_mut();
             if p.len() < MAX_SPARES {
@@ -407,11 +431,11 @@ impl<'a> Graph<'a> {
     /// The build trace: each vertex in id order, then each edge in id order.
     fn trace_build(&self) {
         for (i, v) in self.vertices.iter().enumerate() {
-            eprintln!("VYGGV|{}|{}|0", i + 1, v.name);
+            eprintln!("VYGGV|{}|{}|0", i + 1, self.netlist.pin_name(&v.conn));
         }
         for (i, e) in self.edges.iter().enumerate() {
             let wire = u8::from(matches!(e.kind, EdgeKind::Wire));
-            eprintln!("VYGGE|{}|{}|{}|{wire}|{}|{}", i + 1, e.from + 1, e.to + 1, self.vertices[e.from].name, self.vertices[e.to].name);
+            eprintln!("VYGGE|{}|{}|{}|{wire}|{}|{}", i + 1, e.from + 1, e.to + 1, self.vname(e.from), self.vname(e.to));
         }
         eprintln!("VYGGBUILT");
     }
@@ -427,7 +451,7 @@ impl<'a> Graph<'a> {
                 }
                 // a name index carried from a recycled graph must be the one a fresh build makes
                 if let Some(ix) = g.index_cache.get() {
-                    if ix.len() != g.vertices.len() || g.vertices.iter().enumerate().any(|(i, v)| ix.get(&v.name) != Some(&i)) {
+                    if ix.len() != g.vertices.len() || (0..g.vertices.len()).any(|i| ix.get(&g.vname(i)) != Some(&i)) {
                         return Err("the recycled name index differs from a fresh one".into());
                     }
                 }
@@ -455,6 +479,7 @@ impl<'a> Graph<'a> {
         /// count's source; the first vertex of each port; the gate edges `(from, to, set, arcs)`.
         struct Template<'l> {
             lib: usize,
+            cname: std::sync::Arc<str>,
             verts: Vec<(&'l str, bool)>,
             first: HashMap<&'l str, usize>,
             edges: Vec<(usize, usize, usize, usize)>,
@@ -477,7 +502,7 @@ impl<'a> Graph<'a> {
                     Some(lib) => {
                         let c = cell(libs, lib, cname);
                         let has = pins.and_then(|m| m.get(cname));
-                        let mut t = Template { lib, verts: Vec::new(), first: HashMap::new(), edges: Vec::new() };
+                        let mut t = Template { lib, cname: std::sync::Arc::from(cname.as_str()), verts: Vec::new(), first: HashMap::new(), edges: Vec::new() };
                         // The vertex an arc set goes TO and the one it comes FROM: the same for
                         // every pin but a bidirect one, which is refused here.
                         let mut at: HashMap<&str, usize> = HashMap::new();
@@ -544,12 +569,13 @@ impl<'a> Graph<'a> {
                 }
             }
         }
-        // The instance a block's vertices belong to: its first vertex's name less `/port`.
-        fn block_inst(old: &[Option<Vertex>], (start, _): (usize, usize)) -> Option<&str> {
-            let v = old[start].as_ref()?;
-            let p = v.port.as_deref()?;
-            v.name.len().checked_sub(p.len() + 1).and_then(|n| v.name.get(..n))
-        }
+        // The instance a block's vertices belong to: its first vertex's instance in the spare.
+        let block_inst = |old: &[Option<Vertex>], (start, _): (usize, usize)| -> Option<&str> {
+            match &old[start].as_ref()?.conn {
+                Conn::Inst(oi, _) => spare.as_ref().map(|s| s.insts[*oi].0.as_str()),
+                Conn::Port(_) => None,
+            }
+        };
         let mut reused_from: Vec<Option<usize>> = Vec::new();
         let mut cursor = 0usize;
         let mut by_inst: Option<HashMap<String, usize>> = None;
@@ -572,7 +598,7 @@ impl<'a> Graph<'a> {
                 let (start, len) = blocks[b];
                 len == t.verts.len()
                     && t.verts.iter().enumerate().all(|(j, &(port, is_driver))| {
-                        old[start + j].as_ref().is_some_and(|v| v.port.as_deref() == Some(port) && v.is_driver == is_driver && v.lib == Some(t.lib) && v.cell.as_deref() == Some(cname.as_str()))
+                        old[start + j].as_ref().is_some_and(|v| v.port() == Some(port) && v.is_driver == is_driver && v.lib == Some(t.lib) && v.cell.as_deref() == Some(cname.as_str()))
                     })
             });
             if let Some(b) = found {
@@ -592,7 +618,7 @@ impl<'a> Graph<'a> {
                 }
                 None => {
                     for &(port, is_driver) in &t.verts {
-                        vertices.push(Vertex { name: format!("{name}/{port}"), conn: Conn::Inst(i, port.to_string()), is_driver, lib: Some(t.lib), cell: Some(cname.clone()), port: Some(port.to_string()) });
+                        vertices.push(Vertex { conn: Conn::Inst(i, port.to_string()), is_driver, lib: Some(t.lib), cell: Some(t.cname.clone()) });
                         reused_from.push(None);
                     }
                 }
@@ -610,7 +636,7 @@ impl<'a> Graph<'a> {
                 _ => &[false],
             };
             for &is_driver in kinds {
-                let reuse = old_ports.get(pc).copied().filter(|&k| old[k].as_ref().is_some_and(|v| v.name == *name && v.is_driver == is_driver && matches!(v.conn, Conn::Port(_))));
+                let reuse = old_ports.get(pc).copied().filter(|&k| old[k].as_ref().is_some_and(|v| v.is_driver == is_driver && matches!(v.conn, Conn::Port(oi) if spare.as_ref().is_some_and(|s| s.ports[oi].0 == *name))));
                 match reuse {
                     Some(k) => {
                         let mut v = old[k].take().expect("a matching port");
@@ -620,7 +646,7 @@ impl<'a> Graph<'a> {
                         pc += 1;
                     }
                     None => {
-                        vertices.push(Vertex { name: name.clone(), conn: Conn::Port(i), is_driver, lib: None, cell: None, port: None });
+                        vertices.push(Vertex { conn: Conn::Port(i), is_driver, lib: None, cell: None });
                         reused_from.push(None);
                     }
                 }
@@ -701,19 +727,22 @@ impl<'a> Graph<'a> {
         // The spare's name index, made this graph's: a vertex left behind is removed first (a
         // remade instance's vertices carry the same names), then each moved or made one set.
         let index_cache = std::sync::OnceLock::new();
-        if let Some(mut map) = spare.and_then(|s| s.index).and_then(|a| std::sync::Arc::try_unwrap(a).ok()) {
+        if let Some((sp, mut map)) = spare.and_then(|mut s| s.index.take().and_then(|a| std::sync::Arc::try_unwrap(a).ok()).map(|m| (s, m))) {
             for v in old.iter().flatten() {
-                map.remove(v.name.as_str());
+                map.remove(sp.name(v).as_str());
             }
             for (p, (v, from)) in vertices.iter().zip(&reused_from).enumerate() {
                 match from {
                     Some(q) if *q == p => {}
-                    _ => match map.get_mut(v.name.as_str()) {
-                        Some(x) => *x = p,
-                        None => {
-                            map.insert(v.name.clone(), p);
+                    _ => {
+                        let name = netlist.pin_name(&v.conn);
+                        match map.get_mut(name.as_str()) {
+                            Some(x) => *x = p,
+                            None => {
+                                map.insert(name, p);
+                            }
                         }
-                    },
+                    }
                 }
             }
             if map.len() == n {
@@ -733,6 +762,8 @@ impl<'a> Graph<'a> {
         let mut inst_vertices: Vec<HashMap<String, usize>> = vec![HashMap::new(); netlist.insts.len()];
         let mut inst_from: Vec<HashMap<String, usize>> = vec![HashMap::new(); netlist.insts.len()];
         let mut bidirect: Vec<String> = Vec::new();
+        // each cell's name once, shared by its vertices
+        let mut cell_names: HashMap<&str, std::sync::Arc<str>> = HashMap::new();
         // The whole graph (`unlinked` given): a bidirect pin or port is its load vertex, then its
         // driver vertex (`Graph::makePinVertices`), and may sit on a net.
         let whole = unlinked.is_some();
@@ -749,7 +780,7 @@ impl<'a> Graph<'a> {
                     let vname = format!("{name}/{port}");
                     index.entry(vname.clone()).or_insert(vertices.len());
                     for &is_driver in kinds {
-                        vertices.push(Vertex { name: vname.clone(), conn: Conn::Inst(i, port.clone()), is_driver, lib: None, cell: Some(cname.clone()), port: Some(port.clone()) });
+                        vertices.push(Vertex { conn: Conn::Inst(i, port.clone()), is_driver, lib: None, cell: Some(cell_names.entry(cname.as_str()).or_insert_with(|| cname.as_str().into()).clone()) });
                     }
                 }
                 continue;
@@ -782,7 +813,7 @@ impl<'a> Graph<'a> {
                     if !is_driver || p.direction != Direction::Bidirect {
                         inst_from[i].insert(p.name.clone(), v);
                     }
-                    vertices.push(Vertex { name: vname.clone(), conn: Conn::Inst(i, p.name.clone()), is_driver, lib: Some(lib), cell: Some(cname.clone()), port: Some(p.name.clone()) });
+                    vertices.push(Vertex { conn: Conn::Inst(i, p.name.clone()), is_driver, lib: Some(lib), cell: Some(cell_names.entry(cname.as_str()).or_insert_with(|| cname.as_str().into()).clone()) });
                 }
             }
         }
@@ -795,17 +826,17 @@ impl<'a> Graph<'a> {
             if *dir == PortDir::Inout {
                 index.insert(name.clone(), vertices.len());
                 for is_driver in [false, true] {
-                    vertices.push(Vertex { name: name.clone(), conn: Conn::Port(i), is_driver, lib: None, cell: None, port: None });
+                    vertices.push(Vertex { conn: Conn::Port(i), is_driver, lib: None, cell: None });
                 }
                 continue;
             }
             let v = vertices.len();
             index.insert(name.clone(), v);
-            vertices.push(Vertex { name: name.clone(), conn: Conn::Port(i), is_driver: *dir == PortDir::Input, lib: None, cell: None, port: None });
+            vertices.push(Vertex { conn: Conn::Port(i), is_driver: *dir == PortDir::Input, lib: None, cell: None });
         }
         // A pin's vertices: its first (the load of a bidirect pin), then a bidirect pin's driver.
         let pin_vertices = |first: usize| -> std::ops::Range<usize> {
-            let two = vertices.get(first + 1).is_some_and(|w: &Vertex| w.name == vertices[first].name && w.conn == vertices[first].conn);
+            let two = vertices.get(first + 1).is_some_and(|w: &Vertex| w.conn == vertices[first].conn);
             first..first + 1 + usize::from(two)
         };
         let mut edges = Vec::new();
@@ -874,7 +905,7 @@ impl<'a> Graph<'a> {
         let mut bidirect_port_paths = std::collections::HashSet::new();
         for v in 0..vertices.len() {
             // a pin's first vertex (the load of a bidirect pin) stands for the pin
-            if v > 0 && vertices[v - 1].name == vertices[v].name && vertices[v - 1].conn == vertices[v].conn {
+            if v > 0 && vertices[v - 1].conn == vertices[v].conn {
                 continue;
             }
             let net = pin_vertices(v).find(|&d| vertices[d].is_driver).and_then(|d| vertex_net[d]);
@@ -908,7 +939,7 @@ impl<'a> Graph<'a> {
                     // net that has an active driver. (Wire edges only reach loads, so a driver's
                     // fanin is the same before and after.)
                     let passive = |d: usize| {
-                        let bidirect = d > 0 && vertices[d - 1].name == vertices[d].name && vertices[d - 1].conn == vertices[d].conn;
+                        let bidirect = d > 0 && vertices[d - 1].conn == vertices[d].conn;
                         bidirect && !matches!(vertices[d].conn, Conn::Port(_)) && !fanin(d)
                     };
                     let passives: Vec<bool> = if isolated { Vec::new() } else { drivers.iter().map(|&d| passive(d)).collect() };
@@ -1126,7 +1157,7 @@ impl<'a> Graph<'a> {
         cycle.reverse();
         cycle.iter().map(|&v| {
             let x = &self.vertices[v];
-            match &x.cell { Some(c) => format!("{} ({c})", x.name), None => x.name.clone() }
+            match &x.cell { Some(c) => format!("{} ({c})", self.netlist.pin_name(&x.conn)), None => self.netlist.pin_name(&x.conn) }
         }).collect()
     }
 
@@ -1180,7 +1211,7 @@ impl<'a> Graph<'a> {
                     for &w in wires {
                         let load = self.edges[w].to;
                         let (mut wire_delay, mut load_slew) = match (&mut dmp, &pe) {
-                            (Some(d), Some((p, names))) => match elmores.get(p, names, &self.vertices[load].name) {
+                            (Some(d), Some((p, names))) => match elmores.get(p, names, &self.vname(load)) {
                                 Some(el) => d.load_delay_slew(f64::from(el)),
                                 None => (0.0, drvr_slew),
                             },
@@ -1211,13 +1242,13 @@ impl<'a> Graph<'a> {
     fn pin_cap(&self, v: usize, rf: usize, mm: usize) -> f32 {
         // A cell swapped in the database the timer was not told about: its pins' capacitances are
         // read through the network (the new master's), its arcs stay the graph's.
-        if let (Some((l, c)), Some(p)) = (self.pin_cap_cell.get(&v), &self.vertices[v].port) {
+        if let (Some((l, c)), Some(p)) = (self.pin_cap_cell.get(&v), self.vertices[v].port()) {
             return cell(self.libs, *l, c).port(p).map_or(0.0, |p| p.capacitance(rf, mm));
         }
-        match (&self.vertices[v].lib, &self.vertices[v].cell, &self.vertices[v].port) {
+        match (&self.vertices[v].lib, &self.vertices[v].cell, self.vertices[v].port()) {
             (Some(l), Some(c), Some(p)) => cell(self.libs, *l, c).port(p).map_or(0.0, |p| p.capacitance(rf, mm)),
             _ => match self.vertices[v].conn {
-                Conn::Port(_) => self.sdc.port_pin_cap.get(&self.vertices[v].name).and_then(|c| c[rf][mm]).unwrap_or(0.0),
+                Conn::Port(_) => self.sdc.port_pin_cap.get(&self.vname(v)).and_then(|c| c[rf][mm]).unwrap_or(0.0),
                 Conn::Inst(..) => 0.0,
             },
         }
@@ -1229,7 +1260,7 @@ impl<'a> Graph<'a> {
     fn connected_cap(&self, drvr: usize, rf: usize, mm: usize, index: &HashMap<String, usize>) -> (f32, f32, bool) {
         let mut pin_cap = self.net_pin_cap(drvr, rf, mm, index);
         let mut wire_cap = 0.0f32;
-        let net_load = self.sdc.net_wire_cap.get(&self.vertices[drvr].name).and_then(|c| c[mm]);
+        let net_load = self.sdc.net_wire_cap.get(&self.vname(drvr)).and_then(|c| c[mm]);
         if let Some((cap, subtract_pin_cap)) = net_load {
             if subtract_pin_cap {
                 pin_cap = 0.0;
@@ -1246,7 +1277,7 @@ impl<'a> Graph<'a> {
     /// dropped. `(pin_cap, wire_cap, the pi model)`.
     fn parasitic_load<'p>(&self, drvr: usize, rf: usize, mm: usize, parasitics: &'p HashMap<String, NetParasitics>, index: &HashMap<String, usize>) -> ParasiticLoad<'p> {
         let (pin_cap, mut wire_cap, has_net_load) = self.connected_cap(drvr, rf, mm, index);
-        let mut parasitic = if self.sdc.net_wire_cap.contains_key(&self.vertices[drvr].name) { None } else { self.reduced(drvr, rf, mm, parasitics, index) };
+        let mut parasitic = if self.sdc.net_wire_cap.contains_key(&self.vname(drvr)) { None } else { self.reduced(drvr, rf, mm, parasitics, index) };
         if !has_net_load {
             if let Some((p, _)) = &parasitic {
                 let parasitic_cap = p.c1 + p.c2;
@@ -1279,7 +1310,7 @@ impl<'a> Graph<'a> {
     fn reduced<'p>(&self, drvr: usize, rf: usize, mm: usize, parasitics: &'p HashMap<String, NetParasitics>, index: &HashMap<String, usize>) -> Option<(crate::parasitics::PiElmore, &'p [String])> {
         let n = self.vertex_net[drvr]?;
         let np = parasitics.get(&self.netlist.nets[n].name)?;
-        let d = np.node_names.iter().position(|x| x == &self.vertices[drvr].name)?;
+        let d = np.node_names.iter().position(|x| x == &self.vname(drvr))?;
         let names = &np.node_names;
         if let Some(p) = &np.pi {
             if np.pi_rise_only && rf == FALL {
@@ -1448,12 +1479,12 @@ impl<'a> Graph<'a> {
     }
 
     pub fn is_constant(&self, v: usize) -> bool {
-        !self.sdc.constants.is_empty() && self.sdc.constants.contains_key(&self.vertices[v].name)
+        !self.sdc.constants.is_empty() && self.sdc.constants.contains_key(&self.vname(v))
     }
 
     /// Every vertex's index by name (the parasitics name their nodes by pin).
     pub fn pin_index(&self) -> std::sync::Arc<HashMap<String, usize>> {
-        self.index_cache.get_or_init(|| std::sync::Arc::new(self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect())).clone()
+        self.index_cache.get_or_init(|| std::sync::Arc::new((0..self.vertices.len()).map(|i| (self.vname(i), i)).collect())).clone()
     }
 
     /// Whether every name shared by two vertices is a bidirect top-level port's (its load and its
@@ -1468,7 +1499,7 @@ impl<'a> Graph<'a> {
     /// The vertices of `v`'s pin: `v`, and the other of a bidirect pin's two (adjacent, same name
     /// and connection).
     pub fn vertices_named(&self, v: usize) -> std::ops::RangeInclusive<usize> {
-        let same = |a: usize, b: usize| self.vertices[a].name == self.vertices[b].name && self.vertices[a].conn == self.vertices[b].conn;
+        let same = |a: usize, b: usize| self.vertices[a].conn == self.vertices[b].conn;
         let lo = if v > 0 && same(v - 1, v) { v - 1 } else { v };
         let hi = if v + 1 < self.vertices.len() && same(v, v + 1) { v + 1 } else { v };
         lo..=hi
@@ -1476,7 +1507,12 @@ impl<'a> Graph<'a> {
 
     /// [`Graph::pin_index`], built once and borrowed.
     pub fn index(&self) -> &HashMap<String, usize> {
-        self.index_cache.get_or_init(|| std::sync::Arc::new(self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect()))
+        self.index_cache.get_or_init(|| std::sync::Arc::new((0..self.vertices.len()).map(|i| (self.vname(i), i)).collect()))
+    }
+
+    /// Vertex `v`'s name: its pin's (`Network::pathName` of the vertex's pin).
+    pub fn vname(&self, v: usize) -> String {
+        self.netlist.pin_name(&self.vertices[v].conn)
     }
 
     /// One vertex of the delay calculation (`findVertexDelay`): a load takes its root slew, its
@@ -1508,7 +1544,7 @@ impl<'a> Graph<'a> {
         // `findVertexDelay`: a root, or a top-level bidirect port's driver vertex (its load's wire
         // into it aside), is seeded as an input.
         if fanin.is_empty() || self.is_port(v) {
-            if let Some(drive) = self.sdc.input_drive.get(&self.vertices[v].name).cloned() {
+            if let Some(drive) = self.sdc.input_drive.get(&self.vname(v)).cloned() {
                 self.time_input_drive(v, &wires, &drive, parasitics, index)?;
                 return Ok(());
             }
@@ -1522,7 +1558,7 @@ impl<'a> Graph<'a> {
             let annotated = self.slew_annotated.get(&v).copied();
             for rf in [RISE, FALL] {
                 for mm in [MIN, MAX] {
-                    let in_slew = self.sdc.input_slew.get(&self.vertices[v].name).and_then(|s| s[rf][mm]).unwrap_or(0.0);
+                    let in_slew = self.sdc.input_slew.get(&self.vname(v)).and_then(|s| s[rf][mm]).unwrap_or(0.0);
                     self.slew[v][rf][mm] = annotated.unwrap_or(in_slew);
                     let (_, _, pe) = self.parasitic_load(v, rf, mm, parasitics, index);
                     let elmores = LoadElmores::new(pe.as_ref());
@@ -1530,7 +1566,7 @@ impl<'a> Graph<'a> {
                         let load = self.edges[e].to;
                         let mut wire_delay = 0.0f64;
                         let mut load_slew = f64::from(in_slew);
-                        let elmore = pe.as_ref().and_then(|(p, names)| elmores.get(p, names, &self.vertices[load].name));
+                        let elmore = pe.as_ref().and_then(|(p, names)| elmores.get(p, names, &self.vname(load)));
                         let ll = self.threshold_library(load);
                         if let Some(el) = elmore {
                             let l = &self.libs[ll];
@@ -1629,7 +1665,7 @@ impl<'a> Graph<'a> {
                             crate::dcalc::Alg::ZeroC2 => "c2=0",
                         };
                         let rfc = |r: usize| if r == RISE { '^' } else { 'v' };
-                        t.push(format!("dcalc|gate|{}|{}{}|{:08x}|{:08x}|{:08x}|{:08x}|{alg}|{:016x}|{:016x}|{:016x}|{:016x}|{}|{:016x}|{:016x}", self.vertices[v].name, rfc(arc.from_rf), rfc(rf), in_slew.to_bits(), p.c2.to_bits(), p.rpi.to_bits(), p.c1.to_bits(), rd.to_bits(), t0.to_bits(), dt.to_bits(), ceff.to_bits(), i32::from(d.driver_valid()), gate_delay.to_bits(), drvr_slew.to_bits()));
+                        t.push(format!("dcalc|gate|{}|{}{}|{:08x}|{:08x}|{:08x}|{:08x}|{alg}|{:016x}|{:016x}|{:016x}|{:016x}|{}|{:016x}|{:016x}", self.vname(v), rfc(arc.from_rf), rfc(rf), in_slew.to_bits(), p.c2.to_bits(), p.rpi.to_bits(), p.c1.to_bits(), rd.to_bits(), t0.to_bits(), dt.to_bits(), ceff.to_bits(), i32::from(d.driver_valid()), gate_delay.to_bits(), drvr_slew.to_bits()));
                     }
                     let (gd32, ds32) = (gate_delay as f32, drvr_slew as f32);
                     if worse(mm, ds32, self.slew[v][rf][mm]) {
@@ -1639,14 +1675,14 @@ impl<'a> Graph<'a> {
                     for &w in &wires {
                         let load = self.edges[w].to;
                         let (mut wire_delay, mut load_slew) = match (&mut dmp, &pe) {
-                            (Some(d), Some((p, names))) => match elmores.get(p, names, &self.vertices[load].name) {
+                            (Some(d), Some((p, names))) => match elmores.get(p, names, &self.vname(load)) {
                                 Some(el) => d.load_delay_slew(f64::from(el)),
                                 None => (0.0, drvr_slew),
                             },
                             _ => (0.0, f64::from(ds32)),
                         };
                         if let (Some(t), Some(_)) = (trace.as_deref_mut(), &dmp) {
-                            t.push(format!("dcalc|load|{}|{}|{:016x}|{:016x}", self.vertices[v].name, self.vertices[load].name, wire_delay.to_bits(), load_slew.to_bits()));
+                            t.push(format!("dcalc|load|{}|{}|{:016x}|{:016x}", self.vname(v), self.vname(load), wire_delay.to_bits(), load_slew.to_bits()));
                         }
                         let ll = self.threshold_library(load);
                         threshold_adjust(ll == drvr_lib, &self.lib_thresholds(drvr_lib, rf), &self.lib_thresholds(ll, rf), rf == RISE, &mut wire_delay, &mut load_slew);
@@ -1766,14 +1802,13 @@ impl crate::levelize::LoopGraph for LevelizeView<'_, '_> {
             EdgeKind::Gate { set } => set.to_string(),
             EdgeKind::Wire => "wire".to_string(),
         };
-        format!("{} -> {} {set}", self.0.vertices[ed.from].name, self.0.vertices[ed.to].name)
+        format!("{} -> {} {set}", self.0.vname(ed.from), self.0.vname(ed.to))
     }
     /// `Network::pathNameCmp` over a flat netlist: a top port (the top instance, an empty path)
     /// before any instance pin; then the instance name, then the port name, bytewise.
     fn name_cmp(&self, a: usize, b: usize) -> std::cmp::Ordering {
-        let key = |v: usize| {
-            let name = self.0.vertices[v].name.as_str();
-            if self.0.is_port(v) {
+        fn key(port: bool, name: &str) -> (u8, &str, &str) {
+            if port {
                 (0u8, "", name)
             } else {
                 match name.rfind('/') {
@@ -1781,8 +1816,9 @@ impl crate::levelize::LoopGraph for LevelizeView<'_, '_> {
                     None => (1, "", name),
                 }
             }
-        };
-        key(a).cmp(&key(b))
+        }
+        let (name_a, name_b) = (self.0.vname(a), self.0.vname(b));
+        key(self.0.is_port(a), &name_a).cmp(&key(self.0.is_port(b), &name_b))
     }
 }
 
@@ -1847,7 +1883,8 @@ mod tests {
         };
         let unlinked: HashMap<String, Vec<(String, Direction)>> = [("blk".to_string(), vec![("A".to_string(), Direction::Input), ("Y".to_string(), Direction::Output)])].into();
         let g = Graph::build_with_unlinked(&libs, &nl, None, &unlinked).unwrap();
-        let names: Vec<&str> = g.vertices.iter().map(|v| v.name.as_str()).collect();
+        let names: Vec<String> = (0..g.vertices.len()).map(|v| g.vname(v)).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
         assert_eq!(names, ["x/A", "x/Y", "u1/A", "u1/B", "u1/Y", "a", "y"]);
         let y = 1;
         assert!(g.vertices[y].is_driver && g.in_edges[y].is_empty(), "a root driver");
@@ -1857,16 +1894,19 @@ mod tests {
         // to its net's loads in the net's pin order
         assert_eq!(edges, [("u1/A", "u1/Y", false), ("u1/B", "u1/Y", false), ("x/Y", "u1/A", true), ("u1/Y", "y", true), ("a", "x/A", true), ("a", "u1/B", true)]);
         let plain = Graph::build(&libs, &nl).unwrap();
-        assert!(plain.vertices.iter().all(|v| !v.name.starts_with("x/")));
+        assert!((0..plain.vertices.len()).all(|v| !plain.vname(v).starts_with("x/")));
         // the master's terminal order, not the liberty's — in every build given the terminals
         let pins: HashMap<String, Vec<String>> = [("and2".to_string(), vec!["Y".to_string(), "B".to_string(), "A".to_string()])].into();
         let g = Graph::build_with_unlinked(&libs, &nl, Some(&pins), &unlinked).unwrap();
-        let names: Vec<&str> = g.vertices.iter().map(|v| v.name.as_str()).collect();
+        let names: Vec<String> = (0..g.vertices.len()).map(|v| g.vname(v)).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
         assert_eq!(names, ["x/A", "x/Y", "u1/Y", "u1/B", "u1/A", "a", "y"]);
         let plain = Graph::build_with_pins(&libs, &nl, Some(&pins)).unwrap();
-        let names: Vec<&str> = plain.vertices.iter().map(|v| v.name.as_str()).collect();
+        let names: Vec<String> = (0..plain.vertices.len()).map(|v| plain.vname(v)).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
         assert_eq!(&names[..3], ["u1/Y", "u1/B", "u1/A"]);
-        assert_eq!(Graph::build(&libs, &nl).unwrap().vertices.iter().position(|v| v.name == "u1/A"), Some(0), "no terminals: the liberty's order");
+        let built = Graph::build(&libs, &nl).unwrap();
+        assert_eq!((0..built.vertices.len()).position(|v| built.vname(v) == "u1/A"), Some(0), "no terminals: the liberty's order");
     }
 
     // Rule (`Graph::makePinVertices` iterates the instance's pins — the master's terminals in the
@@ -1890,7 +1930,8 @@ mod tests {
         let by_cell = Graph::build_by_cell(&libs, &nl, keep(), Some(&pins)).expect("a template build");
         let by_name = Graph::build_by_name(&libs, &nl, keep(), Some(&pins), None).unwrap();
         for g in [&by_cell, &by_name] {
-            let names: Vec<&str> = g.vertices.iter().map(|v| v.name.as_str()).collect();
+            let names: Vec<String> = (0..g.vertices.len()).map(|v| g.vname(v)).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
             assert_eq!(&names[..6], ["u1/Y", "u1/A", "u1/B", "u2/Y", "u2/A", "u2/B"]);
         }
         let ends = |g: &Graph| g.edges.iter().map(|e| (e.from, e.to)).collect::<Vec<_>>();
@@ -1900,7 +1941,8 @@ mod tests {
         // follow the drivers, not the nets): net `y` (driven by u2) is listed after `n` (u1) and
         // `a` (a port) first, yet its edge comes second and the port's last.
         for g in [&by_cell, &by_name] {
-            let name = |v: usize| g.vertices[v].name.as_str();
+            let owned: Vec<String> = (0..g.vertices.len()).map(|v| g.vname(v)).collect();
+            let name = |v: usize| owned[v].as_str();
             let wires: Vec<(&str, &str)> = g.edges.iter().filter(|e| matches!(e.kind, EdgeKind::Wire)).map(|e| (name(e.from), name(e.to))).collect();
             assert_eq!(wires, [("u1/Y", "u2/A"), ("u2/Y", "y"), ("a", "u1/A"), ("a", "u1/B"), ("a", "u2/B")]);
         }
@@ -1948,7 +1990,8 @@ mod tests {
             ],
         };
         for g in [Graph::build(&libs, &nl).unwrap(), Graph::build_by_name(&libs, &nl, NetlistRef::Borrowed(&nl), None, None).unwrap()] {
-            let name = |v: usize| g.vertices[v].name.as_str();
+            let owned: Vec<String> = (0..g.vertices.len()).map(|v| g.vname(v)).collect();
+            let name = |v: usize| owned[v].as_str();
             let gate: Vec<(&str, &str, bool, bool)> = (0..g.edges.len())
                 .filter(|&e| matches!(g.edges[e].kind, EdgeKind::Gate { .. }))
                 .map(|e| (name(g.edges[e].from), name(g.edges[e].to), g.is_check(e), g.is_timed_check(e)))
@@ -2004,7 +2047,7 @@ mod tests {
         let ends = |g: &Graph| g.edges.iter().map(|e| (e.from, e.to)).collect::<Vec<_>>();
         let (a, b) = (Graph::build(&lib_with, &nl).unwrap(), Graph::build(&lib_without, &nl).unwrap());
         assert_eq!(ends(&a), ends(&b));
-        assert!(!a.edges.iter().any(|e| a.vertices[e.to].name == "r/SN" && matches!(e.kind, EdgeKind::Gate { .. })), "no edge into SN");
+        assert!(!a.edges.iter().any(|e| a.vname(e.to) == "r/SN" && matches!(e.kind, EdgeKind::Gate { .. })), "no edge into SN");
     }
 
     // Rule (`Graph::isPassiveBidirectDrvr` / `hasActiveDrvr`, OpenSTA fc6ed303 #525): an
@@ -2021,7 +2064,7 @@ mod tests {
         };
         let unlinked: HashMap<String, Vec<(String, Direction)>> = [("gpio".to_string(), vec![("PAD".to_string(), Direction::Bidirect)])].into();
         let g = Graph::build_with_unlinked(&libs, &nl, None, &unlinked).unwrap();
-        let label = |v: usize| format!("{}{}", g.vertices[v].name, if g.vertices[v].is_driver { "+" } else { "" });
+        let label = |v: usize| format!("{}{}", g.vname(v), if g.vertices[v].is_driver { "+" } else { "" });
         let edges: Vec<String> = g.edges.iter().map(|e| format!("{}>{}", label(e.from), label(e.to))).collect();
         assert_eq!(edges, ["b+>x/PAD", "b>b+"]);
     }
@@ -2056,7 +2099,7 @@ mod tests {
             ],
         };
         let g = Graph::build_with_unlinked(&libs, &nl, None, &HashMap::new()).unwrap();
-        let label = |v: usize| format!("{}{}", g.vertices[v].name, if g.vertices[v].is_driver { "+" } else { "" });
+        let label = |v: usize| format!("{}{}", g.vname(v), if g.vertices[v].is_driver { "+" } else { "" });
         let names: Vec<String> = (0..g.vertices.len()).map(label).collect();
         assert_eq!(names, ["u/c2p", "u/pad", "u/pad+", "u/p2c+", "w/c2p", "w/pad", "w/pad+", "w/p2c+", "p+", "b", "b+"]);
         let edges: Vec<String> = g.edges.iter().map(|e| format!("{}>{}", label(e.from), label(e.to))).collect();
@@ -2106,7 +2149,7 @@ mod tests {
         let by_cell = Graph::build_by_cell(&libs, &nl, keep(), Some(&pins)).expect("a template build");
         let by_name = Graph::build_by_name(&libs, &nl, keep(), Some(&pins), None).unwrap();
         for g in [&by_cell, &by_name] {
-            let label = |v: usize| format!("{}{}", g.vertices[v].name, if g.vertices[v].is_driver { "+" } else { "" });
+            let label = |v: usize| format!("{}{}", g.vname(v), if g.vertices[v].is_driver { "+" } else { "" });
             let names: Vec<String> = (0..g.vertices.len()).map(label).collect();
             assert_eq!(names, ["u1/Y+", "u1/A", "u1/B", "a+", "io1", "io1+", "io2", "io2+", "y"]);
             let wires: Vec<String> = g.edges.iter().filter(|e| matches!(e.kind, EdgeKind::Wire)).map(|e| format!("{}>{}", label(e.from), label(e.to))).collect();
@@ -2148,7 +2191,7 @@ mod tests {
         let nl = chain();
         let g = Graph::build(&libs, &nl).unwrap();
         let lv = g.levels().unwrap();
-        let at = |n: &str| lv[g.vertices.iter().position(|v| v.name == n).unwrap()];
+        let at = |n: &str| lv[(0..g.vertices.len()).position(|v| g.vname(v) == n).unwrap()];
         assert_eq!([at("a"), at("u1/A"), at("u1/Y"), at("u2/A"), at("u2/B"), at("u2/Y"), at("y")], [0, 1, 2, 3, 1, 4, 5]);
     }
 
@@ -2164,7 +2207,7 @@ mod tests {
         g.sdc.constants.insert("u1/A".into(), false);
         g.sdc.constants.insert("u1/B".into(), false);
         g.find_delays(&HashMap::new(), None).unwrap();
-        let at = |n: &str| g.vertices.iter().position(|v| v.name == n).unwrap();
+        let at = |n: &str| (0..g.vertices.len()).position(|v| g.vname(v) == n).unwrap();
         assert_eq!(g.slew[at("u1/Y")], [[0.0; 2]; 2], "u1 is never visited");
         assert!(g.slew[at("u2/Y")][RISE][MAX] > 0.0, "u2 is timed from port c");
     }
@@ -2186,7 +2229,7 @@ mod tests {
             ],
         };
         let g = Graph::build(&libs, &nl).unwrap();
-        let name = |e: usize| format!("{} -> {}", g.vertices[g.edges[e].from].name, g.vertices[g.edges[e].to].name);
+        let name = |e: usize| format!("{} -> {}", g.vname(g.edges[e].from), g.vname(g.edges[e].to));
         let disabled: Vec<String> = g.loops.disabled.iter().map(|&e| name(e)).collect();
         assert_eq!(disabled, ["u1/A -> u1/Y"]);
         assert!(g.topo_order().is_ok());
@@ -2201,8 +2244,8 @@ mod tests {
         let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
         let nl = chain();
         let mut g = Graph::build(&libs, &nl).unwrap();
-        let u2a = g.vertices.iter().position(|v| v.name == "u2/A").unwrap();
-        let u2b = g.vertices.iter().position(|v| v.name == "u2/B").unwrap();
+        let u2a = (0..g.vertices.len()).position(|v| g.vname(v) == "u2/A").unwrap();
+        let u2b = (0..g.vertices.len()).position(|v| g.vname(v) == "u2/B").unwrap();
         g.slew_limit.insert(u2a, 0.5e-9);
         g.slew_limit.insert(u2b, 0.5e-9);
         g.find_delays(&HashMap::new(), None).unwrap();
@@ -2224,7 +2267,7 @@ mod tests {
         for p in ["u1/A", "u1/Y", "u2/A"] {
             g.sdc.constants.insert(p.into(), false);
         }
-        let u2a = g.vertices.iter().position(|v| v.name == "u2/A").unwrap();
+        let u2a = (0..g.vertices.len()).position(|v| g.vname(v) == "u2/A").unwrap();
         g.slew_limit.insert(u2a, 0.5e-9);
         g.find_delays(&HashMap::new(), None).unwrap();
         assert_eq!(g.clamped, vec![u2a]);
@@ -2238,19 +2281,19 @@ mod tests {
         let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
         let nl = chain();
         let mut g = Graph::build(&libs, &nl).unwrap();
-        let u2a = g.vertices.iter().position(|v| v.name == "u2/A").unwrap();
+        let u2a = (0..g.vertices.len()).position(|v| g.vname(v) == "u2/A").unwrap();
         g.slew_annotated.insert(u2a, 2.0e-9);
         g.find_delays(&HashMap::new(), None).unwrap();
         assert_eq!([g.slew[u2a][RISE][MAX], g.slew[u2a][FALL][MAX]], [2.0e-9, 2.0e-9]);
         // `annotateLoadDelays` never merges into it: re-timing the DRIVER alone (as
         // `findDelays(drvr)` does, the load not visited) keeps the annotation; min is computed.
-        let u1y = g.vertices.iter().position(|v| v.name == "u1/Y").unwrap();
+        let u1y = (0..g.vertices.len()).position(|v| g.vname(v) == "u1/Y").unwrap();
         let index = g.pin_index();
         g.find_vertex_delays(u1y, &HashMap::new(), &index, None).unwrap();
         assert_eq!([g.slew[u2a][RISE][MAX], g.slew[u2a][FALL][MAX]], [2.0e-9, 2.0e-9]);
         assert_eq!(g.slew[u2a][RISE][MIN], 1.000_000_5f32 * 1e-9, "only max is annotated");
         // The same from an input port driving the load (its own path through the port's drive).
-        let (a, u1a) = (g.vertices.iter().position(|v| v.name == "a" && v.is_driver).unwrap(), g.vertices.iter().position(|v| v.name == "u1/A").unwrap());
+        let (a, u1a) = ((0..g.vertices.len()).position(|v| g.vname(v) == "a" && g.vertices[v].is_driver).unwrap(), (0..g.vertices.len()).position(|v| g.vname(v) == "u1/A").unwrap());
         g.slew_annotated.insert(u1a, 3.0e-9);
         g.find_vertex_delays(a, &HashMap::new(), &index, None).unwrap();
         assert_eq!([g.slew[u1a][RISE][MAX], g.slew[u1a][FALL][MAX]], [3.0e-9, 3.0e-9], "kept from a port driver too");
@@ -2268,8 +2311,8 @@ mod tests {
         let nl = chain();
         let mut g = Graph::build(&libs, &nl).unwrap();
         g.find_delays(&HashMap::new(), None).unwrap();
-        let u2a = g.vertices.iter().position(|v| v.name == "u2/A").unwrap();
-        let u1y = g.vertices.iter().position(|v| v.name == "u1/Y").unwrap();
+        let u2a = (0..g.vertices.len()).position(|v| g.vname(v) == "u2/A").unwrap();
+        let u1y = (0..g.vertices.len()).position(|v| g.vname(v) == "u1/Y").unwrap();
         let timed = g.slew[u2a];
         let index = g.pin_index();
         let stale = [[7.0e-12, 8.0e-12], [9.0e-12, 6.0e-12]];
@@ -2303,7 +2346,7 @@ mod tests {
         let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
         let nl = chain();
         let mut g = Graph::build(&libs, &nl).unwrap();
-        let v = |g: &Graph, n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        let v = |g: &Graph, n: &str| (0..g.vertices.len()).position(|x| g.vname(x) == n).unwrap();
         let (u1y, u2y) = (v(&g, "u1/Y"), v(&g, "u2/Y"));
         let pins = g.load_cap(u1y, &HashMap::new());
         g.sdc.net_wire_cap.insert("u1/Y".into(), [Some((0.5e-12, false)); 2]);
@@ -2323,7 +2366,7 @@ mod tests {
         let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
         let nl = chain();
         let mut g = Graph::build(&libs, &nl).unwrap();
-        let u2y = g.vertices.iter().position(|x| x.name == "u2/Y").unwrap();
+        let u2y = (0..g.vertices.len()).position(|x| g.vname(x) == "u2/Y").unwrap();
         // Port y's pin load: 0.5 pF rising, 0.1 pF falling, at both min and max ([rf][mm]).
         g.sdc.port_pin_cap.insert("y".into(), [[Some(0.5e-12); 2], [Some(0.1e-12); 2]]);
         let none = HashMap::new();
@@ -2347,7 +2390,7 @@ mod tests {
         let mut par = HashMap::new();
         let net = Network { node_caps: vec![0.0, 1e-12], resistors: vec![(0, 1, 1000.0)] };
         par.insert("y".to_string(), NetParasitics { node_names: vec!["u2/Y".into(), "y".into()], network: net, ..Default::default() });
-        let u2y = g.vertices.iter().position(|v| v.name == "u2/Y").unwrap();
+        let u2y = (0..g.vertices.len()).position(|v| g.vname(v) == "u2/Y").unwrap();
         let with_pi = g.load_cap(u2y, &par);
         assert!(with_pi > 0.9e-12);
         g.sdc.net_wire_cap.insert("u2/Y".into(), [Some((0.0, false)); 2]);
@@ -2371,7 +2414,7 @@ mod tests {
         let np = |caps| NetParasitics { node_names: vec!["u2/Y".into(), "y".into()], network: net.clone(), port_pin_caps: caps, pi: None, pi_rise_only: false };
         let mut g = Graph::build(&libs, &nl).unwrap();
         g.sdc.port_pin_cap.insert("y".into(), [[Some(2e-12); 2]; 2]);
-        let u2y = g.vertices.iter().position(|v| v.name == "u2/Y").unwrap();
+        let u2y = (0..g.vertices.len()).position(|v| g.vname(v) == "u2/Y").unwrap();
         // Estimated with no port load: the pi model is the wire alone, under the 2 pF pin cap —
         // dropped, so the load is the pin cap and no wire.
         let estimated_before: HashMap<String, NetParasitics> = [("y".to_string(), np(Some(HashMap::new())))].into();
@@ -2411,11 +2454,11 @@ mod tests {
         };
         let pins: HashMap<String, Vec<String>> = [("PADC".to_string(), vec!["DATA".into(), "EN".into(), "PAD".into(), "Y".into()])].into();
         let g = Graph::build_with_pins(&libs, &nl, Some(&pins)).unwrap();
-        assert!(!g.vertices.iter().any(|v| v.name == "p1/NDOUT"), "a liberty-only port has no vertex");
-        let pad: Vec<usize> = (0..g.vertices.len()).filter(|&v| g.vertices[v].name == "p1/PAD").collect();
+        assert!(!(0..g.vertices.len()).any(|v| g.vname(v) == "p1/NDOUT"), "a liberty-only port has no vertex");
+        let pad: Vec<usize> = (0..g.vertices.len()).filter(|&v| g.vname(v) == "p1/PAD").collect();
         assert_eq!(pad.len(), 2);
         let (drv, load) = if g.vertices[pad[0]].is_driver { (pad[0], pad[1]) } else { (pad[1], pad[0]) };
-        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        let v = |n: &str| (0..g.vertices.len()).position(|x| g.vname(x) == n).unwrap();
         let level = g.levels().unwrap();
         assert_eq!((level[v("a")], level[v("p1/DATA")], level[drv], level[load], level[v("p1/Y")]), (0, 1, 2, 0, 1));
         assert!(g.in_edges[drv].iter().any(|&e| g.edges[e].from == v("p1/EN")), "the tristate enable edge");
@@ -2436,7 +2479,7 @@ mod tests {
         let mut g = Graph::build(&libs, &nl).unwrap();
         g.sdc.input_drive.insert("a".into(), InputDrive { cell: "and2".into(), from_port: Some("A".into()), to_port: "Y".into(), from_slews: [0.1e-9, 0.1e-9] });
         g.find_delays(&HashMap::new(), None).unwrap();
-        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        let v = |n: &str| (0..g.vertices.len()).position(|x| g.vname(x) == n).unwrap();
         let (a, u1a) = (v("a"), v("u1/A"));
         let cell = &libs[0].cells["and2"];
         let arc = cell.arc_sets.iter().find(|s| s.from == "A" && s.to == "Y").unwrap().arcs.iter().find(|x| x.to_rf == RISE).unwrap();
@@ -2459,7 +2502,7 @@ mod tests {
         let mut g = Graph::build(&libs, &nl).unwrap();
         g.sdc.input_slew.insert("a".into(), [[Some(0.3e-9); 2]; 2]);
         g.find_delays(&HashMap::new(), None).unwrap();
-        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        let v = |n: &str| (0..g.vertices.len()).position(|x| g.vname(x) == n).unwrap();
         assert_eq!(g.slew[v("a")][RISE][MAX], 0.3e-9);
         assert_eq!(g.slew[v("u1/A")][FALL][MAX], 0.3e-9);
         assert_eq!(g.slew[v("u1/B")][RISE][MAX], 0.0);
@@ -2483,7 +2526,7 @@ mod tests {
         };
         let mut g = Graph::build(&libs, &netlist).unwrap();
         g.find_delays(&HashMap::new(), None).unwrap();
-        let y = g.vertices.iter().position(|v| v.name == "u1/Y").unwrap();
+        let y = (0..g.vertices.len()).position(|v| g.vname(v) == "u1/Y").unwrap();
         let b_slew = 1.000_000_5f32 * 1e-9;
         assert_ne!(b_slew, 1e-9);
         for rf in [RISE, FALL] {
@@ -2550,7 +2593,7 @@ mod tests {
         let fresh = |nl: &Netlist| {
             SPARES.with(|p| p.borrow_mut().clear());
             let g = Graph::build(&libs, nl).unwrap();
-            (g.shape(), g.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect::<HashMap<_, _>>())
+            (g.shape(), (0..g.vertices.len()).map(|i| (g.vname(i), i)).collect::<HashMap<_, _>>())
         };
         let check = |nl: &Netlist, prev: Graph<'_>| {
             let want = fresh(nl);

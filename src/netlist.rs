@@ -11,7 +11,7 @@ pub enum PortDir {
 }
 
 /// One pin on a net: an instance's terminal, or a top-level port.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Conn {
     Inst(usize, String),
     Port(usize),

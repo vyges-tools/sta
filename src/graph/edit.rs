@@ -253,7 +253,7 @@ impl<'a> Graph<'a> {
                 if std::env::var_os("VYGES_STA_INDEX_TRACE").is_some() {
                     eprintln!("VYGINDEX|built|{}", self.vertices.len());
                 }
-                self.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect()
+                (0..self.vertices.len()).map(|i| (self.vname(i), i)).collect()
             }
         };
         // A bidirect top-level port is two vertices under one name (load, then driver); a design's
@@ -466,6 +466,7 @@ impl<'a> Graph<'a> {
         let i = *moves.made_at.get(inst).ok_or_else(|| NotInPlace::Netlist(format!("instance {inst} not in the netlist")))?;
         let has = b.pins.and_then(|m| m.get(master));
         let c = cell(self.libs, lib, master);
+        let cell_name: Arc<str> = Arc::from(master);
         for p in super::instance_ports(c, has) {
             let is_driver = match p.direction {
                 Direction::Input => false,
@@ -477,7 +478,7 @@ impl<'a> Graph<'a> {
             if b.index.contains_key(&name) {
                 return Err(NotInPlace::Event(format!("inst_create|{inst}: {name} has a vertex")));
             }
-            let v = self.make_vertex(Vertex { name: name.clone(), conn: Conn::Inst(i, p.name.clone()), is_driver, lib: Some(lib), cell: Some(master.to_string()), port: Some(p.name.clone()) });
+            let v = self.make_vertex(Vertex { conn: Conn::Inst(i, p.name.clone()), is_driver, lib: Some(lib), cell: Some(cell_name.clone()) });
             b.index.insert(name, v);
             b.touched.push(v);
         }
@@ -627,9 +628,10 @@ impl<'a> Graph<'a> {
                 }
             }
         }
+        let to_name: Arc<str> = Arc::from(to);
         for &v in &vs {
             self.vertices[v].lib = Some(tl);
-            self.vertices[v].cell = Some(to.to_string());
+            self.vertices[v].cell = Some(to_name.clone());
         }
         b.swapped = vs;
         Ok(())
@@ -655,7 +657,7 @@ impl<'a> Graph<'a> {
             return Ok(());
         }
         let slots = self.named_net_slots(&b.nets, old_nets, look_for_misses);
-        let mut want: HashMap<&str, usize> = b.touched.iter().map(|&v| (self.vertices[v].name.as_str(), v)).collect();
+        let mut want: HashMap<String, usize> = b.touched.iter().map(|&v| (self.vname(v), v)).collect();
         let mut found: Vec<(usize, Option<usize>)> = Vec::with_capacity(want.len());
         for n in slots {
             let net = &self.netlist.nets[n];
@@ -719,32 +721,33 @@ impl<'a> Graph<'a> {
             return Some(format!("{} vertices, a fresh build {}", self.vertices.len(), fresh.vertices.len()));
         }
         // by name and side: a bidirect pin is two vertices of one name, its driver and its load
-        let fix: HashMap<(&str, bool), usize> = fresh.vertices.iter().enumerate().map(|(i, v)| ((v.name.as_str(), v.is_driver), i)).collect();
+        let fix: HashMap<(String, bool), usize> = fresh.vertices.iter().enumerate().map(|(i, v)| ((fresh.vname(i), v.is_driver), i)).collect();
         let pin = |g: &Graph<'_>, v: usize| -> (String, Option<String>, bool, Option<String>, Option<String>) {
             let x = &g.vertices[v];
-            (g.netlist.pin_name(&x.conn), x.port.clone(), x.is_driver, x.cell.clone(), g.vertex_net[v].map(|n| g.netlist.nets[n].name.clone()))
+            (g.netlist.pin_name(&x.conn), x.port().map(str::to_string), x.is_driver, x.cell.as_deref().map(str::to_string), g.vertex_net[v].map(|n| g.netlist.nets[n].name.clone()))
         };
         let edges = |g: &Graph<'_>, list: &[usize]| -> Vec<(String, String, String, usize)> {
             let mut l: Vec<(String, String, String, usize)> = list
                 .iter()
                 .map(|&e| {
                     let ed = &g.edges[e];
-                    (g.vertices[ed.from].name.clone(), g.vertices[ed.to].name.clone(), format!("{:?}", ed.kind), g.delay[e].len())
+                    (g.vname(ed.from), g.vname(ed.to), format!("{:?}", ed.kind), g.delay[e].len())
                 })
                 .collect();
             l.sort();
             l
         };
         for (v, x) in self.vertices.iter().enumerate() {
-            let Some(&w) = fix.get(&(x.name.as_str(), x.is_driver)) else { return Some(format!("{}: no vertex in a fresh build", x.name)) };
+            let name = self.vname(v);
+            let Some(&w) = fix.get(&(name.clone(), x.is_driver)) else { return Some(format!("{name}: no vertex in a fresh build")) };
             if pin(self, v) != pin(fresh, w) {
-                return Some(format!("{}: {:?}, a fresh build {:?}", x.name, pin(self, v), pin(fresh, w)));
+                return Some(format!("{}: {:?}, a fresh build {:?}", name, pin(self, v), pin(fresh, w)));
             }
             if edges(self, &self.in_edges[v]) != edges(fresh, &fresh.in_edges[w]) {
-                return Some(format!("{}: in edges {:?}, a fresh build {:?}", x.name, edges(self, &self.in_edges[v]), edges(fresh, &fresh.in_edges[w])));
+                return Some(format!("{}: in edges {:?}, a fresh build {:?}", name, edges(self, &self.in_edges[v]), edges(fresh, &fresh.in_edges[w])));
             }
             if edges(self, &self.out_edges[v]) != edges(fresh, &fresh.out_edges[w]) {
-                return Some(format!("{}: out edges {:?}, a fresh build {:?}", x.name, edges(self, &self.out_edges[v]), edges(fresh, &fresh.out_edges[w])));
+                return Some(format!("{}: out edges {:?}, a fresh build {:?}", name, edges(self, &self.out_edges[v]), edges(fresh, &fresh.out_edges[w])));
             }
         }
         if self.edges.len() != fresh.edges.len() {
@@ -826,7 +829,7 @@ mod tests {
     }
 
     fn edge(g: &Graph<'_>, from: &str, to: &str) -> Option<usize> {
-        (0..g.edges.len()).find(|&e| g.vertices[g.edges[e].from].name == from && g.vertices[g.edges[e].to].name == to && g.out_edges[g.edges[e].from].contains(&e))
+        (0..g.edges.len()).find(|&e| g.vname(g.edges[e].from) == from && g.vname(g.edges[e].to) == to && g.out_edges[g.edges[e].from].contains(&e))
     }
 
     /// Rule (`deleteEdge` frees its id to the object table, `makeEdge` takes the last freed first):
@@ -861,7 +864,7 @@ mod tests {
         g.apply_edits(&insertion(), Arc::new(chain(true)), Some(&pins)).unwrap();
         let fresh_nl = chain(true);
         let fresh = Graph::build_with_pins(&libs, &fresh_nl, Some(&pins)).unwrap();
-        let of_buf = |g: &Graph<'_>| g.vertices.iter().map(|v| v.name.as_str()).filter(|n| n.starts_with("buf1/")).map(String::from).collect::<Vec<_>>();
+        let of_buf = |g: &Graph<'_>| (0..g.vertices.len()).map(|v| g.vname(v)).filter(|n| n.starts_with("buf1/")).collect::<Vec<_>>();
         assert_eq!(of_buf(&g), ["buf1/Y", "buf1/A"]);
         assert_eq!(of_buf(&g), of_buf(&fresh));
         assert_eq!(g.differs_from_build(&fresh), None);
@@ -975,9 +978,9 @@ mod tests {
         }
         let nl = Arc::new(nl);
         g.apply_edits(&insertion(), nl.clone(), None).unwrap();
-        assert_eq!(g.vertices[nv].name, "buf1/A", "the buffer's vertices are appended");
+        assert_eq!(g.vname(nv), "buf1/A", "the buffer's vertices are appended");
         assert!(matches!(g.vertices[nv].conn, Conn::Inst(1, _)), "and hold its mid-order index");
-        let u2y = g.vertices.iter().position(|v| v.name == "u2/Y").unwrap();
+        let u2y = (0..g.vertices.len()).position(|v| g.vname(v) == "u2/Y").unwrap();
         assert!(matches!(g.vertices[u2y].conn, Conn::Inst(2, _)), "u2 moved up one");
         assert_eq!(g.vertex_net[u2y], Some(5), "y moved up one");
         let fresh = Graph::build_shared(&libs, nl, None).unwrap();
@@ -1094,7 +1097,7 @@ mod tests {
             nets: vec![Net { name: "a".into(), pins: vec![Conn::Inst(0, "A".into()), Conn::Port(0)] }.into()],
         };
         let (g, f) = (Graph::build(&libs, &nl).unwrap(), Graph::build(&libs, &nl).unwrap());
-        assert_eq!(g.vertices.iter().filter(|v| v.name == "p1/PAD").count(), 2, "the pad pin is two vertices");
+        assert_eq!((0..g.vertices.len()).filter(|&v| g.vname(v) == "p1/PAD").count(), 2, "the pad pin is two vertices");
         assert_eq!(g.differs_from_build(&f), None);
     }
 
