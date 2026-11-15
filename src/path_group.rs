@@ -64,7 +64,7 @@ impl Search<'_, '_> {
         // `isGatedClock`: a gated clock enable that is neither a check's end nor a port (where
         // `isCheck` / `isOutputDelay` would come first; the merged required time here cannot tell
         // those ends apart). Its end has a target clock (the gate's clock pin) for `groupPathsTo`.
-        let gated_end = self.is_gated_clk_enable(v) && !self.graph.is_port(v) && !self.graph.in_edges[v].iter().any(|&e| self.is_check(e));
+        let gated_end = self.is_gated_clk_enable(v) && !self.graph.is_port(v) && !self.graph.in_edges[v].iter().any(|&e| self.graph.is_timed_check(e));
         let clocked = p.tag.clk_edge.is_some() && (self.has_target_clock(v) || gated_end);
         let groups = self.sdc.group_paths_to(p.tag.states, &self.graph.vertices[v].name, clocked);
         if !groups.is_empty() {
@@ -142,7 +142,7 @@ pub fn register_pins(g: &crate::graph::Graph<'_>, data: bool) -> Vec<usize> {
     };
     (0..g.vertices.len())
         .filter(|&v| inst_of(v).is_some_and(|i| regs.contains(&i)))
-        .filter(|&v| if data { !g.vertices[v].is_driver && g.in_edges[v].iter().any(|&e| g.is_check(e)) && !port_timed(v) } else { reg_clk(v) })
+        .filter(|&v| if data { !g.vertices[v].is_driver && g.in_edges[v].iter().any(|&e| g.is_timed_check(e)) && !port_timed(v) } else { reg_clk(v) })
         .collect()
 }
 

@@ -968,6 +968,20 @@ pub struct ArcSet {
     pub arcs: Vec<Arc>,
 }
 
+impl ArcSet {
+    /// `TimingRole::isTimingCheckBetween`: a timing check between two pins — every check but a
+    /// pulse width or a minimum period (one-pin checks). `Graph::makePortInstanceEdges` marks the
+    /// to pin of such an edge as having checks (`hasChecks`) and makes a check to a bidirect pin
+    /// reach its load vertex.
+    pub fn is_check_between(&self) -> bool {
+        match self.role {
+            Role::Setup | Role::Hold | Role::Recovery | Role::Removal => true,
+            Role::Other => !matches!(self.timing_type.as_str(), "min_pulse_width" | "minimum_period"),
+            _ => false,
+        }
+    }
+}
+
 /// A quoted list or plain values as floats, each `× scale`.
 fn float_seq(values: &[Value], scale: f32) -> Vec<f32> {
     let mut out = Vec::new();

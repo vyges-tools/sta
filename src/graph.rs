@@ -290,6 +290,15 @@ pub struct InputDrive {
     pub from_slews: [f32; 2],
 }
 
+/// `Graph::makePinVertices` over an instance's pins: its cell's ports in the master's terminal
+/// order (`pins`, the database's) when known, else the liberty's; a port the master lacks has none.
+fn instance_ports<'c>(c: &'c Cell, has: Option<&Vec<String>>) -> Vec<&'c crate::liberty::Port> {
+    match has {
+        Some(h) => h.iter().filter_map(|n| c.port(n)).collect(),
+        None => c.ports.iter().collect(),
+    }
+}
+
 fn cell<'a>(libs: &'a [Library], lib: usize, name: &str) -> &'a Cell {
     &libs[lib].cells[name]
 }
@@ -472,7 +481,8 @@ impl<'a> Graph<'a> {
                         // The vertex an arc set goes TO and the one it comes FROM: the same for
                         // every pin but a bidirect one, which is refused here.
                         let mut at: HashMap<&str, usize> = HashMap::new();
-                        for p in &c.ports {
+                        // the master's terminal order (`pins`), not the liberty's: vertex ids follow it
+                        for p in instance_ports(c, has) {
                             if has.is_some_and(|h| !h.contains(&p.name)) {
                                 continue;
                             }
@@ -492,7 +502,10 @@ impl<'a> Graph<'a> {
                         }
                         for (k, set) in c.arc_sets.iter().enumerate() {
                             let tristate = matches!(set.role, Role::TristateEnable | Role::TristateDisable);
-                            if set.role == Role::Other || (set.arcs.is_empty() && !tristate) {
+                            // `makePortInstanceEdges`: an edge per arc set, the checks timed
+                            // nowhere here (`Other`: pulse width, period, non-sequential) included —
+                            // they take ids, and a pin's width edge is fanout of it.
+                            if set.role != Role::Other && set.arcs.is_empty() && !tristate {
                                 continue;
                             }
                             if let (Some(&f), Some(&to)) = (at.get(set.from.as_str()), at.get(set.to.as_str())) {
@@ -624,23 +637,31 @@ impl<'a> Graph<'a> {
                 delay.push(row(arcs));
             }
         }
+        // Each net's vertices in its pin order (flat, `net_at[n]..net_at[n + 1]`); one driver
+        // each, else build by name.
         let mut vertex_net = vec![None; vertices.len()];
-        let mut vs = Vec::new();
+        let mut net_vs: Vec<usize> = Vec::new();
+        let mut net_at: Vec<usize> = Vec::with_capacity(netlist.nets.len() + 1);
         for (n, net) in netlist.nets.iter().enumerate() {
-            vs.clear();
-            vs.extend(net.pins.iter().filter_map(|c| match c {
+            net_at.push(net_vs.len());
+            let first = net_vs.len();
+            net_vs.extend(net.pins.iter().filter_map(|c| match c {
                 Conn::Inst(i, p) => tpl(*i).and_then(|t| t.first.get(p.as_str())).map(|&l| base[*i] + l),
                 Conn::Port(i) => Some(port_base + i),
             }));
-            for &v in &vs {
-                vertex_net[v] = Some(n);
-            }
-            let mut drivers = vs.iter().copied().filter(|&v| vertices[v].is_driver);
-            let Some(d) = drivers.next() else { continue };
-            if drivers.next().is_some() {
+            if net_vs[first..].iter().filter(|&&v| vertices[v].is_driver).count() > 1 {
                 return None;
             }
-            for &l in vs.iter().filter(|&&v| !vertices[v].is_driver) {
+            for &v in &net_vs[first..] {
+                vertex_net[v] = Some(n);
+            }
+        }
+        net_at.push(net_vs.len());
+        // `makeWireEdges`: the drivers in pin order — each leaf instance's pins, then the top
+        // instance's (the ports) — each to its net's loads in the net's pin order.
+        for d in (0..vertices.len()).filter(|&v| vertices[v].is_driver) {
+            let Some(n) = vertex_net[d] else { continue };
+            for &l in net_vs[net_at[n]..net_at[n + 1]].iter().filter(|&&v| !vertices[v].is_driver) {
                 edges.push(Edge { from: d, to: l, kind: EdgeKind::Wire });
                 delay.push(row(2));
             }
@@ -714,13 +735,9 @@ impl<'a> Graph<'a> {
             };
             let has = pins.and_then(|m| m.get(cname));
             let c = cell(libs, lib, cname);
-            // The whole graph makes an instance's vertices in the network's pin order (the
-            // master's terminals, `makePinVertices` over the instance's pins), not the liberty's.
-            let ordered: Vec<&crate::liberty::Port> = match has.filter(|_| whole) {
-                Some(h) => h.iter().filter_map(|n| c.port(n)).collect(),
-                None => c.ports.iter().collect(),
-            };
-            for p in ordered {
+            // An instance's vertices in the network's pin order (the master's terminals,
+            // `makePinVertices` over the instance's pins), not the liberty's — when it is known.
+            for p in instance_ports(c, has) {
                 if has.is_some_and(|h| !h.contains(&p.name)) {
                     continue;
                 }
@@ -779,7 +796,7 @@ impl<'a> Graph<'a> {
             let Some(lib) = find_cell(cname) else { continue };
             for (k, set) in cell(libs, lib, cname).arc_sets.iter().enumerate() {
                 let tristate = matches!(set.role, Role::TristateEnable | Role::TristateDisable);
-                if set.role == Role::Other || (set.arcs.is_empty() && !tristate) {
+                if set.role != Role::Other && set.arcs.is_empty() && !tristate {
                     continue;
                 }
                 if !whole {
@@ -792,7 +809,7 @@ impl<'a> Graph<'a> {
                 // to a bidirect pin goes to its driver vertex, a check to its load; and a bidirect
                 // from pin's driver vertex reaches the to pin's (load) vertex too.
                 let (Some(&f), Some(&t)) = (inst_from[i].get(&set.from), inst_from[i].get(&set.to)) else { continue };
-                let check = matches!(set.role, Role::Setup | Role::Hold | Role::Recovery | Role::Removal);
+                let check = set.is_check_between();
                 let to_drvr = pin_vertices(t).nth(1);
                 match to_drvr {
                     Some(d) if !check => edges.push(Edge { from: f, to: d, kind: EdgeKind::Gate { set: k } }),
@@ -804,76 +821,97 @@ impl<'a> Graph<'a> {
                 }
             }
         }
+        // Each net's vertices in its pin order (flat, `net_at[n]..net_at[n + 1]`); a bidirect pin
+        // is both (its driver vertex drives, its load vertex loads).
         let mut vertex_net = vec![None; vertices.len()];
-        for (n, net) in netlist.nets.iter().enumerate().filter(|_| whole) {
-            // `makeWireEdgesFromPin`: every driver to every load of the net but itself; a
-            // bidirect pin is both (its driver vertex drives, its load vertex loads).
-            let mut buf = String::new();
-            let vs: Vec<usize> = net.pins.iter().filter_map(|c| index.get(netlist.pin_name_into(c, &mut buf)).copied()).flat_map(pin_vertices).collect();
-            for &v in &vs {
-                vertex_net[v] = Some(n);
-            }
-            let drivers: Vec<usize> = vs.iter().copied().filter(|&v| vertices[v].is_driver).collect();
-            let loads: Vec<usize> = vs.iter().copied().filter(|&v| !vertices[v].is_driver).collect();
-            // `isIsolatedNet`: ten or more drivers, none a port or with fanin, and loads with
-            // no fanout or check: a pad ring's tied pins, given no edge.
-            let fanin = |v: usize| edges.iter().any(|e: &Edge| e.to == v);
-            let is_check = |e: &Edge| match e.kind {
-                EdgeKind::Gate { set } => {
-                    let x = &vertices[e.to];
-                    x.lib.is_some_and(|l| matches!(cell(libs, l, x.cell.as_deref().unwrap_or("")).arc_sets[set].role, Role::Setup | Role::Hold | Role::Recovery | Role::Removal))
-                }
-                EdgeKind::Wire => false,
-            };
-            let fanout_or_check = |v: usize| edges.iter().any(|e: &Edge| e.from == v || (e.to == v && is_check(e)));
-            if drivers.len() >= 10 && drivers.iter().all(|&d| !matches!(vertices[d].conn, Conn::Port(_)) && !fanin(d)) && loads.iter().all(|&l| !fanout_or_check(l)) {
-                continue;
-            }
-            // `isPassiveBidirectDrvr` (OpenSTA fc6ed303): an instance pin's bidirect driver
-            // vertex with no fanin (a pad with no arc into it) drives nothing on a net that has
-            // an active driver.
-            let passive = |d: usize| {
-                let bidirect = d > 0 && vertices[d - 1].name == vertices[d].name && vertices[d - 1].conn == vertices[d].conn;
-                bidirect && !matches!(vertices[d].conn, Conn::Port(_)) && !fanin(d)
-            };
-            // (wire edges only reach loads, so a driver's fanin is the same before and after)
-            let passives: Vec<bool> = drivers.iter().map(|&d| passive(d)).collect();
-            let has_active_drvr = passives.iter().any(|&p| !p);
-            for (&d, &is_passive) in drivers.iter().zip(&passives) {
-                if has_active_drvr && is_passive {
-                    continue;
-                }
-                for &l in &loads {
-                    if vertices[l].conn != vertices[d].conn {
-                        edges.push(Edge { from: d, to: l, kind: EdgeKind::Wire });
+        let mut net_vs: Vec<usize> = Vec::new();
+        let mut net_at: Vec<usize> = Vec::with_capacity(netlist.nets.len() + 1);
+        let mut buf = String::new();
+        for (n, net) in netlist.nets.iter().enumerate() {
+            net_at.push(net_vs.len());
+            let first = net_vs.len();
+            for c in &net.pins {
+                if let Some(&v) = index.get(netlist.pin_name_into(c, &mut buf)) {
+                    if whole {
+                        net_vs.extend(pin_vertices(v));
+                    } else {
+                        net_vs.push(v);
                     }
                 }
             }
-        }
-        // `makeInstDrvrWireEdges` on the top instance: a bidirect port's load vertex reaches its
-        // driver vertex (a bidirect port path).
-        let mut bidirect_port_paths = std::collections::HashSet::new();
-        for (i, (name, dir)) in netlist.ports.iter().enumerate().filter(|_| whole) {
-            if *dir == PortDir::Inout {
-                let first = index[name];
-                debug_assert_eq!(vertices[first].conn, Conn::Port(i));
-                bidirect_port_paths.insert(edges.len());
-                edges.push(Edge { from: first, to: first + 1, kind: EdgeKind::Wire });
-            }
-        }
-        for (n, net) in netlist.nets.iter().enumerate().filter(|_| !whole) {
-            let mut buf = String::new();
-            let vs: Vec<usize> = net.pins.iter().filter_map(|c| index.get(netlist.pin_name_into(c, &mut buf)).copied()).collect();
-            for &v in &vs {
-                vertex_net[v] = Some(n);
-            }
-            let drivers: Vec<usize> = vs.iter().copied().filter(|&v| vertices[v].is_driver).collect();
-            if drivers.len() > 1 {
+            if !whole && net_vs[first..].iter().filter(|&&v| vertices[v].is_driver).count() > 1 {
                 return Err(format!("net {}: multiple drivers are not modelled", net.name));
             }
-            for &d in &drivers {
-                for &l in vs.iter().filter(|&&v| !vertices[v].is_driver) {
-                    edges.push(Edge { from: d, to: l, kind: EdgeKind::Wire });
+            for &v in &net_vs[first..] {
+                vertex_net[v] = Some(n);
+            }
+        }
+        net_at.push(net_vs.len());
+        // `makeWireEdges`: `makeInstDrvrWireEdges` over each leaf instance, then the top instance
+        // — a pin at a time, in pin order (vertex order): a driver not yet reached makes its whole
+        // net's wire edges (`makeWireEdgesFromPin`; the net's drivers are then reached), and a
+        // bidirect PORT then its load-to-driver path.
+        let mut net_done = vec![false; netlist.nets.len()];
+        let mut bidirect_port_paths = std::collections::HashSet::new();
+        for v in 0..vertices.len() {
+            // a pin's first vertex (the load of a bidirect pin) stands for the pin
+            if v > 0 && vertices[v - 1].name == vertices[v].name && vertices[v - 1].conn == vertices[v].conn {
+                continue;
+            }
+            let net = pin_vertices(v).find(|&d| vertices[d].is_driver).and_then(|d| vertex_net[d]);
+            if let Some(n) = net.filter(|&n| !net_done[n]) {
+                net_done[n] = true;
+                let vs = &net_vs[net_at[n]..net_at[n + 1]];
+                if !whole {
+                    for &d in vs.iter().filter(|&&x| vertices[x].is_driver) {
+                        for &l in vs.iter().filter(|&&x| !vertices[x].is_driver) {
+                            edges.push(Edge { from: d, to: l, kind: EdgeKind::Wire });
+                        }
+                    }
+                } else {
+                    let drivers: Vec<usize> = vs.iter().copied().filter(|&x| vertices[x].is_driver).collect();
+                    let loads: Vec<usize> = vs.iter().copied().filter(|&x| !vertices[x].is_driver).collect();
+                    // `isIsolatedNet`: ten or more drivers, none a port or with fanin, and loads
+                    // with no fanout or check: a pad ring's tied pins, given no edge.
+                    let fanin = |x: usize| edges.iter().any(|e: &Edge| e.to == x);
+                    let is_check = |e: &Edge| match e.kind {
+                        EdgeKind::Gate { set } => {
+                            let x = &vertices[e.to];
+                            // `hasChecks`: set by a check BETWEEN pins only (not a width or period)
+                            x.lib.is_some_and(|l| cell(libs, l, x.cell.as_deref().unwrap_or("")).arc_sets[set].is_check_between())
+                        }
+                        EdgeKind::Wire => false,
+                    };
+                    let fanout_or_check = |x: usize| edges.iter().any(|e: &Edge| e.from == x || (e.to == x && is_check(e)));
+                    let isolated = drivers.len() >= 10 && drivers.iter().all(|&d| !matches!(vertices[d].conn, Conn::Port(_)) && !fanin(d)) && loads.iter().all(|&l| !fanout_or_check(l));
+                    // `isPassiveBidirectDrvr` (OpenSTA fc6ed303): an instance pin's bidirect
+                    // driver vertex with no fanin (a pad with no arc into it) drives nothing on a
+                    // net that has an active driver. (Wire edges only reach loads, so a driver's
+                    // fanin is the same before and after.)
+                    let passive = |d: usize| {
+                        let bidirect = d > 0 && vertices[d - 1].name == vertices[d].name && vertices[d - 1].conn == vertices[d].conn;
+                        bidirect && !matches!(vertices[d].conn, Conn::Port(_)) && !fanin(d)
+                    };
+                    let passives: Vec<bool> = if isolated { Vec::new() } else { drivers.iter().map(|&d| passive(d)).collect() };
+                    let has_active_drvr = passives.iter().any(|&p| !p);
+                    for (&d, &is_passive) in drivers.iter().zip(&passives) {
+                        if has_active_drvr && is_passive {
+                            continue;
+                        }
+                        for &l in &loads {
+                            if vertices[l].conn != vertices[d].conn {
+                                edges.push(Edge { from: d, to: l, kind: EdgeKind::Wire });
+                            }
+                        }
+                    }
+                }
+            }
+            // `makeInstDrvrWireEdges` on the top instance: a bidirect port's load vertex reaches
+            // its driver vertex (a bidirect port path).
+            if let Conn::Port(i) = vertices[v].conn {
+                if whole && netlist.ports[i].1 == PortDir::Inout {
+                    bidirect_port_paths.insert(edges.len());
+                    edges.push(Edge { from: v, to: v + 1, kind: EdgeKind::Wire });
                 }
             }
         }
@@ -903,7 +941,19 @@ impl<'a> Graph<'a> {
         matches!(self.vertices[v].conn, Conn::Port(_))
     }
 
+    /// `TimingRole::isTimingCheck`: every check — the ones timed here (setup, hold, recovery,
+    /// removal) and the ones only carried (`Other`: width, period, non-sequential, …), which no
+    /// search, levelization or delay calculation passes through.
     pub fn is_check(&self, e: usize) -> bool {
+        match self.edges[e].kind {
+            EdgeKind::Gate { set } => self.arc_set(e, set).role.is_timing_check(),
+            EdgeKind::Wire => false,
+        }
+    }
+
+    /// A check timed here: setup, hold, recovery or removal — what a check END is made of
+    /// (`visitCheckEnd`); the `Other` checks carry no arcs, so end no path.
+    pub fn is_timed_check(&self, e: usize) -> bool {
         match self.edges[e].kind {
             EdgeKind::Gate { set } => matches!(self.arc_set(e, set).role, Role::Setup | Role::Hold | Role::Recovery | Role::Removal),
             EdgeKind::Wire => false,
@@ -1708,16 +1758,116 @@ mod tests {
         assert!(g.vertices[y].is_driver && g.in_edges[y].is_empty(), "a root driver");
         assert!(!g.is_port(y) && g.vertices[y].lib.is_none());
         let edges: Vec<(&str, &str, bool)> = g.edges.iter().map(|e| (names[e.from], names[e.to], matches!(e.kind, EdgeKind::Wire))).collect();
-        assert_eq!(edges, [("u1/A", "u1/Y", false), ("u1/B", "u1/Y", false), ("a", "x/A", true), ("a", "u1/B", true), ("x/Y", "u1/A", true), ("u1/Y", "y", true)]);
+        // wire edges by driver PIN order (`makeWireEdges`: leaf instances, then the ports), each
+        // to its net's loads in the net's pin order
+        assert_eq!(edges, [("u1/A", "u1/Y", false), ("u1/B", "u1/Y", false), ("x/Y", "u1/A", true), ("u1/Y", "y", true), ("a", "x/A", true), ("a", "u1/B", true)]);
         let plain = Graph::build(&libs, &nl).unwrap();
         assert!(plain.vertices.iter().all(|v| !v.name.starts_with("x/")));
-        // the master's terminal order, not the liberty's (the plain build keeps the liberty's)
+        // the master's terminal order, not the liberty's — in every build given the terminals
         let pins: HashMap<String, Vec<String>> = [("and2".to_string(), vec!["Y".to_string(), "B".to_string(), "A".to_string()])].into();
         let g = Graph::build_with_unlinked(&libs, &nl, Some(&pins), &unlinked).unwrap();
         let names: Vec<&str> = g.vertices.iter().map(|v| v.name.as_str()).collect();
         assert_eq!(names, ["x/A", "x/Y", "u1/Y", "u1/B", "u1/A", "a", "y"]);
         let plain = Graph::build_with_pins(&libs, &nl, Some(&pins)).unwrap();
-        assert_eq!(plain.vertices.iter().position(|v| v.name == "u1/A"), Some(0));
+        let names: Vec<&str> = plain.vertices.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(&names[..3], ["u1/Y", "u1/B", "u1/A"]);
+        assert_eq!(Graph::build(&libs, &nl).unwrap().vertices.iter().position(|v| v.name == "u1/A"), Some(0), "no terminals: the liberty's order");
+    }
+
+    // Rule (`Graph::makePinVertices` iterates the instance's pins — the master's terminals in the
+    // database — so vertex ids follow the LEF order, not the liberty's): the per-cell template and
+    // the by-name build lay an instance out alike when given the terminals.
+    #[test]
+    fn both_builds_take_the_terminal_order() {
+        let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
+        let pin = |i: usize, p: &str| Conn::Inst(i, p.into());
+        let nl = Netlist {
+            insts: vec![crate::netlist::inst("u1", "and2"), crate::netlist::inst("u2", "and2")],
+            ports: vec![("a".into(), PortDir::Input), ("y".into(), PortDir::Output)],
+            nets: vec![
+                Net { name: "a".into(), pins: vec![pin(0, "A"), pin(0, "B"), pin(1, "B"), Conn::Port(0)] }.into(),
+                Net { name: "n".into(), pins: vec![pin(0, "Y"), pin(1, "A")] }.into(),
+                Net { name: "y".into(), pins: vec![pin(1, "Y"), Conn::Port(1)] }.into(),
+            ],
+        };
+        let pins: HashMap<String, Vec<String>> = [("and2".to_string(), vec!["Y".to_string(), "A".to_string(), "B".to_string()])].into();
+        let keep = || NetlistRef::Borrowed(&nl);
+        let by_cell = Graph::build_by_cell(&libs, &nl, keep(), Some(&pins)).expect("a template build");
+        let by_name = Graph::build_by_name(&libs, &nl, keep(), Some(&pins), None).unwrap();
+        for g in [&by_cell, &by_name] {
+            let names: Vec<&str> = g.vertices.iter().map(|v| v.name.as_str()).collect();
+            assert_eq!(&names[..6], ["u1/Y", "u1/A", "u1/B", "u2/Y", "u2/A", "u2/B"]);
+        }
+        let ends = |g: &Graph| g.edges.iter().map(|e| (e.from, e.to)).collect::<Vec<_>>();
+        assert_eq!(ends(&by_cell), ends(&by_name));
+        // Rule (`Graph::makeWireEdges`: `makeInstDrvrWireEdges` over the leaf instances, then the
+        // top instance — each driver PIN in pin order makes its net's wire edges, so wire ids
+        // follow the drivers, not the nets): net `y` (driven by u2) is listed after `n` (u1) and
+        // `a` (a port) first, yet its edge comes second and the port's last.
+        for g in [&by_cell, &by_name] {
+            let name = |v: usize| g.vertices[v].name.as_str();
+            let wires: Vec<(&str, &str)> = g.edges.iter().filter(|e| matches!(e.kind, EdgeKind::Wire)).map(|e| (name(e.from), name(e.to))).collect();
+            assert_eq!(wires, [("u1/Y", "u2/A"), ("u2/Y", "y"), ("a", "u1/A"), ("a", "u1/B"), ("a", "u2/B")]);
+        }
+    }
+
+    const DFF_LIB: &str = r#"library (t) {
+      time_unit : "1ns"; capacitive_load_unit (1, pf);
+      cell (dffsr) {
+        ff (IQ, IQN) { clocked_on : "CLK"; next_state : "D"; clear : "!RN"; preset : "!SN"; }
+        pin (CLK) { direction : input; clock : true; capacitance : 0.001;
+          timing () { related_pin : "CLK"; timing_type : min_pulse_width;
+            rise_constraint (scalar) { values ("0.1"); } fall_constraint (scalar) { values ("0.1"); } } }
+        pin (D) { direction : input; capacitance : 0.001;
+          timing () { related_pin : "CLK"; timing_type : setup_rising;
+            rise_constraint (scalar) { values ("0.05"); } fall_constraint (scalar) { values ("0.05"); } } }
+        pin (RN) { direction : input; capacitance : 0.001;
+          timing () { related_pin : "SN"; timing_type : non_seq_setup_rising;
+            rise_constraint (scalar) { values ("0.05"); } fall_constraint (scalar) { values ("0.05"); } } }
+        pin (SN) { direction : input; capacitance : 0.001; }
+        pin (Q) { direction : output; function : "IQ";
+          timing () { related_pin : "CLK"; timing_type : rising_edge;
+            cell_rise (scalar) { values ("0.1"); } rise_transition (scalar) { values ("0.1"); }
+            cell_fall (scalar) { values ("0.1"); } fall_transition (scalar) { values ("0.1"); } } }
+      }
+    }"#;
+
+    // Rule (`Graph::makePortInstanceEdges`: an edge for EVERY arc set, whatever its role — the
+    // checks timed nowhere here, pulse width and non-sequential, included; `isTimingCheck` keeps
+    // every search off them; `setHasChecks` only for a check BETWEEN pins,
+    // `isTimingCheckBetween` = a check but not width or period): the width check is a CLK->CLK
+    // self-edge and the non-sequential one SN->RN; both take edge ids, neither is timed.
+    #[test]
+    fn untimed_checks_take_edges_but_are_not_timed() {
+        let libs = [Library::read(&crate::liberty_parse::parse(DFF_LIB).unwrap()).unwrap()];
+        let pin = |i: usize, p: &str| Conn::Inst(i, p.into());
+        let nl = Netlist {
+            insts: vec![crate::netlist::inst("r", "dffsr")],
+            ports: vec![("clk".into(), PortDir::Input), ("d".into(), PortDir::Input), ("rn".into(), PortDir::Input), ("sn".into(), PortDir::Input), ("q".into(), PortDir::Output)],
+            nets: vec![
+                Net { name: "clk".into(), pins: vec![pin(0, "CLK"), Conn::Port(0)] }.into(),
+                Net { name: "d".into(), pins: vec![pin(0, "D"), Conn::Port(1)] }.into(),
+                Net { name: "rn".into(), pins: vec![pin(0, "RN"), Conn::Port(2)] }.into(),
+                Net { name: "sn".into(), pins: vec![pin(0, "SN"), Conn::Port(3)] }.into(),
+                Net { name: "q".into(), pins: vec![pin(0, "Q"), Conn::Port(4)] }.into(),
+            ],
+        };
+        for g in [Graph::build(&libs, &nl).unwrap(), Graph::build_by_name(&libs, &nl, NetlistRef::Borrowed(&nl), None, None).unwrap()] {
+            let name = |v: usize| g.vertices[v].name.as_str();
+            let gate: Vec<(&str, &str, bool, bool)> = (0..g.edges.len())
+                .filter(|&e| matches!(g.edges[e].kind, EdgeKind::Gate { .. }))
+                .map(|e| (name(g.edges[e].from), name(g.edges[e].to), g.is_check(e), g.is_timed_check(e)))
+                .collect();
+            assert!(gate.contains(&("r/CLK", "r/CLK", true, false)), "{gate:?}");
+            assert!(gate.contains(&("r/SN", "r/RN", true, false)), "{gate:?}");
+            assert!(gate.contains(&("r/CLK", "r/D", true, true)), "{gate:?}");
+            assert!(gate.contains(&("r/CLK", "r/Q", false, false)), "{gate:?}");
+            let set_of = |e: usize| match g.edges[e].kind { EdgeKind::Gate { set } => g.arc_set(e, set), EdgeKind::Wire => unreachable!() };
+            let width = (0..g.edges.len()).find(|&e| name(g.edges[e].from) == "r/CLK" && name(g.edges[e].to) == "r/CLK").unwrap();
+            let nonseq = (0..g.edges.len()).find(|&e| name(g.edges[e].from) == "r/SN").unwrap();
+            assert!(!set_of(width).is_check_between(), "a width check is no check between pins");
+            assert!(set_of(nonseq).is_check_between());
+        }
     }
 
     // Rule (`Graph::isPassiveBidirectDrvr` / `hasActiveDrvr`, OpenSTA fc6ed303 #525): an

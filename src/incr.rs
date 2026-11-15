@@ -1124,7 +1124,6 @@ impl IncTimer {
         cell.arc_sets
             .iter()
             .enumerate()
-            .filter(|(_, a)| a.role != Role::Other)
             .map(|(k, a)| {
                 let (f, t) = (format!("{inst}/{}", a.from), format!("{inst}/{}", a.to));
                 (f.clone(), t.clone(), EdgeKey::Gate { from: f, to: t, cell: cell_name.to_string(), set: k })

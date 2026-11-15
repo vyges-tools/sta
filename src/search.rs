@@ -553,8 +553,10 @@ fn arc_edges_match(default_to: [bool; 2], cond_to: [bool; 2]) -> bool {
     (0..2).all(|rf| !default_to[rf] || cond_to[rf])
 }
 
+/// `TimingRole::isTimingCheck`: the `Other` checks (width, period, non-sequential) included —
+/// no search passes through any check edge.
 fn is_check_role(r: Role) -> bool {
-    matches!(r, Role::Setup | Role::Hold | Role::Recovery | Role::Removal)
+    r.is_timing_check()
 }
 
 impl<'g, 'a> Search<'g, 'a> {
@@ -792,7 +794,7 @@ impl<'g, 'a> Search<'g, 'a> {
     pub fn is_endpoint(&self, v: usize) -> bool {
         let vx = &self.graph.vertices[v];
         let constrained = self.graph.is_port(v) && (!vx.is_driver || self.output_delay.contains_key(&vx.name));
-        let checks = self.graph.in_edges[v].iter().any(|&e| self.is_check(e));
+        let checks = self.graph.in_edges[v].iter().any(|&e| self.graph.is_timed_check(e));
         self.has_fanin(v) && (checks || constrained || !self.has_fanout(v) || self.internal_to[v] || self.gated.contains_key(&v))
     }
 
@@ -1188,7 +1190,7 @@ impl<'g, 'a> Search<'g, 'a> {
             for pin in &pd.to_pins {
                 let Some(v) = find(pin) else { return Err(format!("{cmd} -to {pin}: no such pin")) };
                 // An unclocked path into a clocked check would read the target clock's latency.
-                let check = self.graph.in_edges[v].iter().any(|&e| self.is_check(e));
+                let check = self.graph.in_edges[v].iter().any(|&e| self.graph.is_timed_check(e));
                 if internal_from && check && !self.sdc.clocks.is_empty() {
                     return Err(format!("{cmd} -from an internal pin -to the checked pin {pin} on a clocked design: not modelled"));
                 }
@@ -1242,7 +1244,7 @@ impl<'g, 'a> Search<'g, 'a> {
             if pd.group.is_some() {
                 continue;
             }
-            if !(self.graph.is_port(v) || self.graph.in_edges[v].iter().any(|&e| self.is_check(e))) {
+            if !(self.graph.is_port(v) || self.graph.in_edges[v].iter().any(|&e| self.graph.is_timed_check(e))) {
                 return Err(format!("{cmd} -to the internal pin {pin}: not modelled"));
             }
         }
@@ -1581,7 +1583,7 @@ impl<'g, 'a> Search<'g, 'a> {
     /// timing check at the pin (`visitOutputDelayEnd` / `visitCheckEnd`), not a path delay alone.
     pub(crate) fn has_target_clock(&self, v: usize) -> bool {
         let name = &self.graph.vertices[v].name;
-        (self.graph.is_port(v) && self.output_delay.get(name).is_some_and(|d| !d.is_empty())) || self.graph.in_edges[v].iter().any(|&e| self.is_check(e))
+        (self.graph.is_port(v) && self.output_delay.get(name).is_some_and(|d| !d.is_empty())) || self.graph.in_edges[v].iter().any(|&e| self.graph.is_timed_check(e))
     }
 
     /// `PathEndCheck::requiredTime` of a max path at check edge `e`, arc `k`, against target clock
@@ -1673,7 +1675,7 @@ impl<'g, 'a> Search<'g, 'a> {
     fn visit_path_ends(&self, v: usize, req: &mut [f32]) {
         let name = &self.graph.vertices[v].name;
         let ods: &[usize] = if self.graph.is_port(v) { self.output_delay.get(name).map_or(&[], Vec::as_slice) } else { &[] };
-        let checks = self.graph.in_edges[v].iter().any(|&e| self.is_check(e));
+        let checks = self.graph.in_edges[v].iter().any(|&e| self.graph.is_timed_check(e));
         let gated = self.gated.get(&v).copied();
         for (i, path) in self.paths[v].iter().enumerate() {
             // `visitPathEnds1`: a false path `-to` the pin makes no end of the path here at all.

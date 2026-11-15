@@ -2,8 +2,9 @@
 //! building it again: one function per callback, in the order the callbacks come.
 //!
 //! Rules:
-//! - an instance made: its pin vertices in its liberty cell's port order (the pins its master has),
-//!   then its own arcs in the cell's arc-set order;
+//! - an instance made: its pin vertices in its master's terminal order (`makePinVertices` over the
+//!   instance's pins; the liberty's port order when the terminals are not given), then its own arcs
+//!   in the cell's arc-set order — every arc set, the untimed checks included;
 //! - a pin connected: a driver gets a wire edge to each load on its net, a load one from each
 //!   driver, in the net's pin order; a pin disconnected loses its wire edges, newest first;
 //! - an edge is made NEWEST in its from vertex's out list and its to vertex's in list, its delays 0;
@@ -450,10 +451,7 @@ impl<'a> Graph<'a> {
         let i = *moves.made_at.get(inst).ok_or_else(|| NotInPlace::Netlist(format!("instance {inst} not in the netlist")))?;
         let has = b.pins.and_then(|m| m.get(master));
         let c = cell(self.libs, lib, master);
-        for p in &c.ports {
-            if has.is_some_and(|h| !h.contains(&p.name)) {
-                continue;
-            }
+        for p in super::instance_ports(c, has) {
             let is_driver = match p.direction {
                 Direction::Input => false,
                 Direction::Output | Direction::Tristate => true,
@@ -483,13 +481,13 @@ impl<'a> Graph<'a> {
     }
 
     /// `Graph::makeInstanceEdges`: an edge per arc set of the cell between two of the instance's
-    /// vertices, in the cell's arc-set order (the build's rule: no `Other` role, no empty set but a
-    /// tristate one).
+    /// vertices, in the cell's arc-set order (the build's rule: every set with arcs, a tristate one,
+    /// and the untimed checks, `Other`).
     fn make_instance_edges(&mut self, inst: &str, lib: usize, master: &str, b: &mut Batch<'_>) {
         let c = cell(self.libs, lib, master);
         for (k, set) in c.arc_sets.iter().enumerate() {
             let tristate = matches!(set.role, Role::TristateEnable | Role::TristateDisable);
-            if set.role == Role::Other || (set.arcs.is_empty() && !tristate) {
+            if set.role != Role::Other && set.arcs.is_empty() && !tristate {
                 continue;
             }
             let (Some(&f), Some(&t)) = (b.index.get(&format!("{inst}/{}", set.from)), b.index.get(&format!("{inst}/{}", set.to))) else { continue };
@@ -568,10 +566,8 @@ impl<'a> Graph<'a> {
     /// master has, by name — `(port, driver)` in port order.
     fn cell_vertices(&self, lib: usize, master: &str, b: &Batch<'_>) -> Vec<(String, bool)> {
         let has = b.pins.and_then(|m| m.get(master));
-        cell(self.libs, lib, master)
-            .ports
-            .iter()
-            .filter(|p| !has.is_some_and(|h| !h.contains(&p.name)))
+        super::instance_ports(cell(self.libs, lib, master), has)
+            .into_iter()
             .filter_map(|p| match p.direction {
                 Direction::Input => Some((p.name.clone(), false)),
                 Direction::Output | Direction::Tristate => Some((p.name.clone(), true)),
@@ -835,6 +831,24 @@ mod tests {
         assert_eq!((g.vertices.len(), g.edges.len()), (nv + 2, ne + 2), "two vertices, the buffer's arc and one new wire edge");
         let fresh_nl = chain(true);
         let fresh = Graph::build(&libs, &fresh_nl).unwrap();
+        assert_eq!(g.differs_from_build(&fresh), None);
+    }
+
+    /// Rule (`Graph::makePinVertices` on `inDbInstCreate` iterates the new instance's pins — the
+    /// master's terminals): an instance made in place lays its vertices out as a fresh build given
+    /// the same terminals does (here Y before A, against the liberty's A before Y), so the template
+    /// build can take the edited graph's block as it is.
+    #[test]
+    fn an_instance_made_in_place_takes_the_terminal_order() {
+        let libs = libs();
+        let pins: HashMap<String, Vec<String>> = [("buf".to_string(), vec!["Y".to_string(), "A".to_string()]), ("and2".to_string(), vec!["Y".to_string(), "A".to_string(), "B".to_string()])].into();
+        let mut g = Graph::build_shared(&libs, Arc::new(chain(false)), Some(&pins)).unwrap();
+        g.apply_edits(&insertion(), Arc::new(chain(true)), Some(&pins)).unwrap();
+        let fresh_nl = chain(true);
+        let fresh = Graph::build_with_pins(&libs, &fresh_nl, Some(&pins)).unwrap();
+        let of_buf = |g: &Graph<'_>| g.vertices.iter().map(|v| v.name.as_str()).filter(|n| n.starts_with("buf1/")).map(String::from).collect::<Vec<_>>();
+        assert_eq!(of_buf(&g), ["buf1/Y", "buf1/A"]);
+        assert_eq!(of_buf(&g), of_buf(&fresh));
         assert_eq!(g.differs_from_build(&fresh), None);
     }
 
