@@ -1870,6 +1870,48 @@ mod tests {
         }
     }
 
+    // Rule (`LibertyBuilder::makeTimingArcs`, OpenSTA at the 4155ac3 pin): `nochange_*`,
+    // `retaining_time` and an unknown `timing_type` make NO arc set (the builder returns null;
+    // `timingTypeIsCheck` still lists nochange, but only to pick a check model for `intrinsic_*`).
+    // So `makePortInstanceEdges` makes no edge for them and no search sees them: the graph is the
+    // one the same cell without those groups makes, edge for edge.
+    #[test]
+    fn a_nochange_arc_makes_no_arc_set_and_no_edge() {
+        let with = DFF_LIB.replace(
+            "pin (SN) { direction : input; capacitance : 0.001; }",
+            "pin (SN) { direction : input; capacitance : 0.001;
+          timing () { related_pin : \"D\"; timing_type : nochange_high_high;
+            rise_constraint (scalar) { values (\"0.05\"); } fall_constraint (scalar) { values (\"0.05\"); } }
+          timing () { related_pin : \"CLK\"; timing_type : nochange_low_low;
+            rise_constraint (scalar) { values (\"0.05\"); } fall_constraint (scalar) { values (\"0.05\"); } }
+          timing () { related_pin : \"CLK\"; timing_type : retaining_time;
+            rise_constraint (scalar) { values (\"0.05\"); } fall_constraint (scalar) { values (\"0.05\"); } }
+          timing () { related_pin : \"D\"; timing_type : no_such_type;
+            rise_constraint (scalar) { values (\"0.05\"); } fall_constraint (scalar) { values (\"0.05\"); } } }",
+        );
+        assert_ne!(with, DFF_LIB, "the groups were added");
+        let lib_with = [Library::read(&crate::liberty_parse::parse(&with).unwrap()).unwrap()];
+        let lib_without = [Library::read(&crate::liberty_parse::parse(DFF_LIB).unwrap()).unwrap()];
+        let types = |l: &Library| l.cells["dffsr"].arc_sets.iter().map(|a| a.timing_type.clone()).collect::<Vec<_>>();
+        assert_eq!(types(&lib_with[0]), types(&lib_without[0]), "no arc set for nochange, retaining_time or an unknown type");
+        let pin = |i: usize, p: &str| Conn::Inst(i, p.into());
+        let nl = Netlist {
+            insts: vec![crate::netlist::inst("r", "dffsr")],
+            ports: vec![("clk".into(), PortDir::Input), ("d".into(), PortDir::Input), ("rn".into(), PortDir::Input), ("sn".into(), PortDir::Input), ("q".into(), PortDir::Output)],
+            nets: vec![
+                Net { name: "clk".into(), pins: vec![pin(0, "CLK"), Conn::Port(0)] }.into(),
+                Net { name: "d".into(), pins: vec![pin(0, "D"), Conn::Port(1)] }.into(),
+                Net { name: "rn".into(), pins: vec![pin(0, "RN"), Conn::Port(2)] }.into(),
+                Net { name: "sn".into(), pins: vec![pin(0, "SN"), Conn::Port(3)] }.into(),
+                Net { name: "q".into(), pins: vec![pin(0, "Q"), Conn::Port(4)] }.into(),
+            ],
+        };
+        let ends = |g: &Graph| g.edges.iter().map(|e| (e.from, e.to)).collect::<Vec<_>>();
+        let (a, b) = (Graph::build(&lib_with, &nl).unwrap(), Graph::build(&lib_without, &nl).unwrap());
+        assert_eq!(ends(&a), ends(&b));
+        assert!(!a.edges.iter().any(|e| a.vertices[e.to].name == "r/SN" && matches!(e.kind, EdgeKind::Gate { .. })), "no edge into SN");
+    }
+
     // Rule (`Graph::isPassiveBidirectDrvr` / `hasActiveDrvr`, OpenSTA fc6ed303 #525): an
     // instance pin's bidirect driver vertex with no fanin — a pad cell no library holds — makes no
     // wire edge on a net with an active driver, here the inout port. So the port's load vertex

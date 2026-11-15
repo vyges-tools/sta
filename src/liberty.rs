@@ -1262,7 +1262,13 @@ impl Library {
                 }
                 t if t.starts_with("three_state_enable") => ArcSet { from: from.clone(), to: to.to_string(), role: Role::TristateEnable, timing_type: timing_type.clone(), cond: cond.clone(), arcs: Vec::new() },
                 t if t.starts_with("three_state_disable") => ArcSet { from: from.clone(), to: to.to_string(), role: Role::TristateDisable, timing_type: timing_type.clone(), cond: cond.clone(), arcs: Vec::new() },
-                _ => ArcSet { from: from.clone(), to: to.to_string(), role: Role::Other, timing_type: timing_type.clone(), cond: cond.clone(), arcs: Vec::new() },
+                "min_pulse_width" | "minimum_period" | "skew_rising" | "skew_falling" | "non_seq_setup_rising" | "non_seq_setup_falling" | "non_seq_hold_rising" | "non_seq_hold_falling" | "min_clock_tree_path" | "max_clock_tree_path" => {
+                    ArcSet { from: from.clone(), to: to.to_string(), role: Role::Other, timing_type: timing_type.clone(), cond: cond.clone(), arcs: Vec::new() }
+                }
+                // `LibertyBuilder::makeTimingArcs` makes NO arc set for `nochange_*`,
+                // `retaining_time` or an unknown `timing_type` (LibertyReader warns 1244 on the
+                // last): no edge in the graph, nothing for the search to see.
+                _ => continue,
             };
             out.push(set);
         }
