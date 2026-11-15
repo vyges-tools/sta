@@ -177,6 +177,12 @@ pub struct Graph<'a> {
     /// (`isBidirectPortPath`, whole graph only): levelization skips it, so the driver is a root;
     /// the activity search crosses it.
     pub bidirect_port_paths: std::collections::HashSet<usize>,
+    /// `Levelize::disabled_loop_edges_`: the edges loop breaking disabled ([`Graph::break_loops`],
+    /// at the build) — every edge closing a combinational loop. Levelization, delay calculation
+    /// and the searches pass over them as the reference's predicates do (`isDisabledLoop`).
+    pub disabled_loops: std::collections::HashSet<usize>,
+    /// The whole loop breaking: the disabled edges in the order found, the loops, `loop_edges_`.
+    pub loops: crate::levelize::LoopBreaking,
     /// Every vertex's index by name, built on first use: the vertices never change once the graph
     /// is built, and [`Graph::load_cap`] and its kin are called per driver by a repair loop.
     /// Shared, so a caller holding it ([`Graph::pin_index`]) does not copy every name.
@@ -672,7 +678,7 @@ impl<'a> Graph<'a> {
                 let _ = index_cache.set(std::sync::Arc::new(map));
             }
         }
-        Some(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: std::collections::HashSet::new(), bidirect_port_paths: std::collections::HashSet::new(), index_cache, net_slots: None, edit_seq: None, state_seq: None })
+        Some(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: std::collections::HashSet::new(), bidirect_port_paths: std::collections::HashSet::new(), disabled_loops: std::collections::HashSet::new(), loops: Default::default(), index_cache, net_slots: None, edit_seq: None, state_seq: None }.with_loops_broken())
     }
 
     /// [`Graph::build_with_pins`] with each pin found by its name.
@@ -888,7 +894,7 @@ impl<'a> Graph<'a> {
                 EdgeKind::Wire => vec![[0.0f32; 2]; 2],
             })
             .collect();
-        Ok(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths, bidirect_port_paths, index_cache: std::sync::OnceLock::new(), net_slots: None, edit_seq: None, state_seq: None })
+        Ok(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths, bidirect_port_paths, disabled_loops: std::collections::HashSet::new(), loops: Default::default(), index_cache: std::sync::OnceLock::new(), net_slots: None, edit_seq: None, state_seq: None }.with_loops_broken())
     }
 
     /// Whether vertex `v` is a top-level port's (an instance's vertex may have no library too:
@@ -929,6 +935,26 @@ impl<'a> Graph<'a> {
         self.stale_out_arcs = cells.iter().filter_map(|(inst, name)| self.libs.iter().position(|l| l.cells.contains_key(name)).map(|lib| (inst.clone(), (lib, name.clone())))).collect();
     }
 
+    /// The build's loop breaking ([`Graph::break_loops`]), for the builders' struct literals.
+    fn with_loops_broken(mut self) -> Self {
+        self.break_loops();
+        self
+    }
+
+    /// `Levelize::ensureBackEdges` over the whole graph, from scratch: the edges closing loops
+    /// are found ([`crate::levelize::break_loops`]) and disabled. Made at the build — the
+    /// reference levelizes once and keeps the disabled edges until a loop edge is deleted.
+    pub fn break_loops(&mut self) {
+        let lb = crate::levelize::break_loops(&LevelizeView(self));
+        self.disabled_loops = lb.disabled.iter().copied().collect();
+        self.loops = lb;
+    }
+
+    /// `Levelize::isDisabledLoop`.
+    pub fn is_disabled_loop(&self, e: usize) -> bool {
+        self.disabled_loops.contains(&e)
+    }
+
     /// `Levelize::findLevels` on an acyclic graph: a root — no searched-through edge into it —
     /// is level 0; every other vertex is one more than the highest level among the vertices
     /// that reach it through a searched-through edge (`Levelize::searchThru`: every edge but
@@ -967,6 +993,12 @@ impl<'a> Graph<'a> {
     /// (a clock-gate latch whose D is fed from the clock it gates) levelizes; its Q is timed by
     /// the search's latch passes ([`crate::search::Search::find_arrivals`]).
     pub fn levelize_thru(&self, e: usize) -> bool {
+        self.levelize_thru_unlooped(e) && !self.disabled_loops.contains(&e)
+    }
+
+    /// [`Graph::levelize_thru`] without its disabled-loop term — what loop breaking itself asks
+    /// ([`crate::levelize::LoopGraph::search_thru`]).
+    pub fn levelize_thru_unlooped(&self, e: usize) -> bool {
         match self.edges[e].kind {
             EdgeKind::Gate { set } => !self.is_check(e) && !matches!(self.arc_set(e, set).role, Role::RegSetClr | Role::LatchDtoQ) && !self.bidirect_inst_paths.contains(&e),
             EdgeKind::Wire => !self.bidirect_port_paths.contains(&e),
@@ -1317,7 +1349,7 @@ impl<'a> Graph<'a> {
     /// where a timed driver would hold the init values (±1e30) no arc replaced.
     fn dcalc_reached(&self, order: &[usize]) -> Vec<bool> {
         let thru = |e: usize| match self.edges[e].kind {
-            EdgeKind::Gate { set } => !self.is_check(e) && self.arc_set(e, set).role != Role::RegSetClr && !self.bidirect_inst_paths.contains(&e),
+            EdgeKind::Gate { set } => !self.is_check(e) && self.arc_set(e, set).role != Role::RegSetClr && !self.bidirect_inst_paths.contains(&e) && !self.disabled_loops.contains(&e),
             EdgeKind::Wire => !self.bidirect_port_paths.contains(&e),
         };
         let levels = |e: usize| self.levelize_thru(e);
@@ -1466,7 +1498,8 @@ impl<'a> Graph<'a> {
             // none through a register set/clear arc (`DcalcPred::searchThru`: disabled while
             // `preset_clr_arcs_enabled` is false, its default) — so its slew never reaches the
             // driver: a dfrtp's Q takes CLK->Q's fall slew even where RESET_B->Q's is larger.
-            if self.is_constant(from) || self.arc_set(e, set).role == Role::RegSetClr {
+            // Nor through a disabled loop edge (`DcalcPred::searchThru`: `isDisabledLoop`).
+            if self.is_constant(from) || self.arc_set(e, set).role == Role::RegSetClr || self.disabled_loops.contains(&e) {
                 continue;
             }
             let ideal_clk_to_q = matches!(self.arc_set(e, set).role, Role::RegClkToQ | Role::LatchEnToQ) && self.ideal_clock.contains(&from);
@@ -1805,10 +1838,12 @@ mod tests {
         assert!(g.slew[at("u2/Y")][RISE][MAX] > 0.0, "u2 is timed from port c");
     }
 
-    /// A combinational loop (u1/Y back into u1/A) is refused, and the refusal names the loop's
-    /// pins in edge order with their cells.
+    /// A combinational loop (u1/Y back into u1/A) is broken as the reference's levelization
+    /// breaks it (`findBackEdges`): from root b the search goes u1/B -> u1/Y -> u1/A, and u1/A ->
+    /// u1/Y, closing on the path, is disabled. Levelization, delay calculation and the searches
+    /// then pass over it, and the graph orders.
     #[test]
-    fn a_loop_is_refused_naming_its_pins() {
+    fn a_loop_is_broken_at_the_edge_that_closes_it() {
         let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
         let pin = |i: usize, p: &str| Conn::Inst(i, p.into());
         let nl = Netlist {
@@ -1820,11 +1855,12 @@ mod tests {
             ],
         };
         let g = Graph::build(&libs, &nl).unwrap();
-        let err = g.topo_order().unwrap_err();
-        assert!(err.starts_with("the timing graph has a loop — not modelled: "), "{err}");
-        let cycle: Vec<&str> = err.rsplit(": ").next().unwrap().split(" -> ").collect();
-        assert_eq!(cycle.len(), 2, "{err}");
-        assert!(cycle.contains(&"u1/A (and2)") && cycle.contains(&"u1/Y (and2)"), "{err}");
+        let name = |e: usize| format!("{} -> {}", g.vertices[g.edges[e].from].name, g.vertices[g.edges[e].to].name);
+        let disabled: Vec<String> = g.loops.disabled.iter().map(|&e| name(e)).collect();
+        assert_eq!(disabled, ["u1/A -> u1/Y"]);
+        assert!(g.topo_order().is_ok());
+        let e = g.loops.disabled[0];
+        assert!(!g.levelize_thru(e) && g.levelize_thru_unlooped(e));
     }
 
     /// Rule (an annotated load slew): a load whose max slew exceeds its limit on either
@@ -2214,5 +2250,63 @@ mod tests {
         check(&nl3, Graph::build(&libs, &nl2).unwrap());
         // and back: a recycled graph larger than the next
         check(&nl1, Graph::build(&libs, &nl3).unwrap());
+    }
+}
+
+/// The graph as loop breaking reads it ([`crate::levelize::LoopGraph`]): vertex and edge ids are
+/// the indices (the reference's ids less one), a vertex's out-edges newest first.
+struct LevelizeView<'g, 'a>(&'g Graph<'a>);
+
+impl crate::levelize::LoopGraph for LevelizeView<'_, '_> {
+    fn vertex_count(&self) -> usize {
+        self.0.vertices.len()
+    }
+    fn edge_count(&self) -> usize {
+        self.0.edges.len()
+    }
+    fn out_edge(&self, v: usize, k: usize) -> Option<usize> {
+        let o = &self.0.out_edges[v];
+        (k < o.len()).then(|| o[o.len() - 1 - k])
+    }
+    fn in_edges(&self, v: usize) -> &[usize] {
+        &self.0.in_edges[v]
+    }
+    fn edge_from(&self, e: usize) -> usize {
+        self.0.edges[e].from
+    }
+    fn edge_to(&self, e: usize) -> usize {
+        self.0.edges[e].to
+    }
+    fn search_thru(&self, e: usize) -> bool {
+        self.0.levelize_thru_unlooped(e)
+    }
+    /// `bidirect_inst_paths_enabled` is off (its default; no job here sets it).
+    fn bidirect_load_fanout(&self, _v: usize) -> bool {
+        false
+    }
+    /// `from -> to` and the arc set's index on its cell, for the loop trace.
+    fn edge_label(&self, e: usize) -> String {
+        let ed = &self.0.edges[e];
+        let set = match ed.kind {
+            EdgeKind::Gate { set } => set.to_string(),
+            EdgeKind::Wire => "wire".to_string(),
+        };
+        format!("{} -> {} {set}", self.0.vertices[ed.from].name, self.0.vertices[ed.to].name)
+    }
+    /// `Network::pathNameCmp` over a flat netlist: a top port (the top instance, an empty path)
+    /// before any instance pin; then the instance name, then the port name, bytewise.
+    fn name_cmp(&self, a: usize, b: usize) -> std::cmp::Ordering {
+        let key = |v: usize| {
+            let name = self.0.vertices[v].name.as_str();
+            if self.0.is_port(v) {
+                (0u8, "", name)
+            } else {
+                match name.rfind('/') {
+                    Some(i) => (1, &name[..i], &name[i + 1..]),
+                    None => (1, "", name),
+                }
+            }
+        };
+        key(a).cmp(&key(b))
     }
 }

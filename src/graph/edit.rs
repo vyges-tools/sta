@@ -133,7 +133,7 @@ impl<'a> Graph<'a> {
         self.netlist = NetlistRef::Shared(netlist);
         self.update_vertex_nets(&b, old_nets, true)?;
         let _ = self.index_cache.set(Arc::new(b.index));
-        Ok(())
+        self.loops_kept()
     }
 
     /// [`Graph::apply_edits`] when no slot of the netlist moved since the graph's last edit and
@@ -168,6 +168,16 @@ impl<'a> Graph<'a> {
         let _ = self.index_cache.set(Arc::new(b.index));
         if std::env::var_os("VYGES_STA_CHECK_EDIT").is_some() && *self.netlist != *next {
             return Err(NotInPlace::Netlist("the patched netlist differs from the next one".into()));
+        }
+        self.loops_kept()
+    }
+
+    /// An edit that deleted a loop edge is not made in place: the reference then levelizes from
+    /// scratch (`deleteEdgeBefore` clears `levelized_`), breaking the loops again over the edited
+    /// graph — which a fresh build does.
+    fn loops_kept(&self) -> Result<(), NotInPlace> {
+        if self.loops.stale {
+            return Err(NotInPlace::Netlist("a loop edge was deleted: loops are broken again from scratch".into()));
         }
         Ok(())
     }
@@ -515,6 +525,12 @@ impl<'a> Graph<'a> {
         self.in_edges[to].retain(|&x| x != e);
         self.delay[e].clear();
         b.free.push(e);
+        // `Levelize::deleteEdgeBefore`: a loop edge deleted makes the next levelization start
+        // from scratch, loops broken again over the edited graph.
+        self.disabled_loops.remove(&e);
+        if self.loops.loop_edges.contains(&e) {
+            self.loops.stale = true;
+        }
     }
 
     /// `Sta::connectPinAfter`: `makeWireEdgesFromPin` for a driver (to each load on the net),

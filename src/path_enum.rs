@@ -173,8 +173,8 @@ impl Enum<'_, '_, '_> {
         let v = before.vertex;
         let prev_id = arc_identity(s, prev_arc.0, prev_arc.1);
         for &e in s.graph.in_edges[v].iter().rev() {
-            // `EnumPred`: no timing check, no latch D to Q (and no disabled loop edge — none here).
-            if s.is_check(e) || s.role(e) == Some(Role::LatchDtoQ) {
+            // `EnumPred`: no timing check, no latch D to Q, no disabled loop edge.
+            if s.is_check(e) || s.role(e) == Some(Role::LatchDtoQ) || s.graph.is_disabled_loop(e) {
                 continue;
             }
             let from_v = s.graph.edges[e].from;

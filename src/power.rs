@@ -640,7 +640,7 @@ impl<'x, 'g, 'a> Prop<'x, 'g, 'a> {
     fn is_root(&self, v: usize) -> bool {
         !self.g.in_edges[v].iter().any(|&e| match self.g.edges[e].kind {
             EdgeKind::Wire => !self.g.bidirect_port_paths.contains(&e),
-            EdgeKind::Gate { set } => !self.g.is_check(e) && !matches!(self.g.arc_set(e, set).role, Role::RegSetClr | Role::LatchDtoQ) && !self.g.bidirect_inst_paths.contains(&e),
+            EdgeKind::Gate { set } => !self.g.is_check(e) && !matches!(self.g.arc_set(e, set).role, Role::RegSetClr | Role::LatchDtoQ) && !self.g.bidirect_inst_paths.contains(&e) && !self.g.is_disabled_loop(e),
         })
     }
 

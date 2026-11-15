@@ -732,7 +732,7 @@ impl<'g, 'a> Search<'g, 'a> {
     /// (`preset_clr_arcs_enabled` false, which no job here changes), so no path runs from an
     /// asynchronous reset through to the register's output.
     fn search_thru(&self, e: usize) -> bool {
-        !self.is_check(e) && !self.sim.disabled_cond[e] && self.sim.sense[e] != SimSense::None && self.role(e) != Some(Role::RegSetClr)
+        !self.is_check(e) && !self.sim.disabled_cond[e] && self.sim.sense[e] != SimSense::None && self.role(e) != Some(Role::RegSetClr) && !self.graph.is_disabled_loop(e)
     }
 
     /// `searchThru(from, from_rf, edge, to, to_rf)`: `searchThruTimingSense`, then
@@ -1298,7 +1298,7 @@ impl<'g, 'a> Search<'g, 'a> {
             pending.extend(self.latch_outputs_of(v));
         }
         for &e in &self.graph.out_edges[v] {
-            if !self.is_check(e) && self.role(e) != Some(Role::LatchDtoQ) {
+            if !self.is_check(e) && self.role(e) != Some(Role::LatchDtoQ) && !self.graph.is_disabled_loop(e) {
                 queued[self.graph.edges[e].to] = true;
             }
         }
@@ -1521,7 +1521,7 @@ impl<'g, 'a> Search<'g, 'a> {
         }
         if changed {
             for &e in &self.graph.in_edges[v] {
-                let adj = !self.is_check(e) && !matches!(self.role(e), Some(Role::LatchDtoQ) | Some(Role::RegSetClr)) && !self.graph.bidirect_inst_paths.contains(&e);
+                let adj = !self.is_check(e) && !matches!(self.role(e), Some(Role::LatchDtoQ) | Some(Role::RegSetClr)) && !self.graph.bidirect_inst_paths.contains(&e) && !self.graph.is_disabled_loop(e);
                 if adj {
                     enqueued[self.graph.edges[e].from] = true;
                 }

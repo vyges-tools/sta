@@ -26,6 +26,7 @@ pub mod func_expr;
 pub mod fuzzy;
 pub mod graph;
 pub mod incr;
+pub mod levelize;
 pub mod liberty;
 pub mod liberty_parse;
 #[cfg(feature = "loom")]

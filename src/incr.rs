@@ -324,11 +324,13 @@ impl IncTimer {
     }
 
     /// `Levelize::searchThru`: every edge but timing checks, latch D->Q and set/clear arcs.
+    /// The disabled loop edges are passed over too: the visit would go round a loop for ever.
     fn search_thru(g: &Graph<'_>, e: usize) -> bool {
-        match g.edges[e].kind {
-            EdgeKind::Gate { set } => !g.is_check(e) && !matches!(g.arc_set(e, set).role, Role::RegSetClr | Role::LatchDtoQ),
-            EdgeKind::Wire => true,
-        }
+        !g.is_disabled_loop(e)
+            && match g.edges[e].kind {
+                EdgeKind::Gate { set } => !g.is_check(e) && !matches!(g.arc_set(e, set).role, Role::RegSetClr | Role::LatchDtoQ),
+                EdgeKind::Wire => true,
+            }
     }
 
     /// The full levelization (`findLevels`, levels spaced by [`LEVEL_SPACE`]) when there are no
