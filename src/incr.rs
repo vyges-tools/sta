@@ -100,6 +100,9 @@ pub struct IncTimer {
     /// The vertices whose slew or in-edge delays were stored since the last [`IncTimer::export`],
     /// in order, under `stamp`: what a graph that imported before takes ([`IncTimer::import`]).
     written: Vec<String>,
+    /// The place of `written[0]`: places stay absolute when the head is let go
+    /// ([`IncTimer::trim_written`]), so a graph's `state_seq` keeps meaning the same names.
+    written_base: usize,
     stamp: Stamp,
     /// Each edge's delays by its [`EdgeKey`], held as to-vertex → the rest of the key, so an edge of
     /// a graph is found without making its key (a graph is imported whole after every edit).
@@ -207,13 +210,35 @@ impl IncTimer {
     /// The stored slews and delays into a graph; a vertex or edge the state has never seen
     /// starts at 0. A graph that imported this state before (and edited in place since: what it
     /// made new is 0, as here) takes only the vertices written after; one built, whole.
+    /// The names written since the last export and still kept (a diagnostic counter).
+    pub fn written_len(&self) -> usize {
+        self.written.len()
+    }
+
+    /// The place a graph imported this state at (`None`: never, or another state's).
+    pub fn written_place(&self, g: &Graph<'_>) -> Option<usize> {
+        g.state_seq.filter(|&(stamp, _)| stamp == self.stamp.0).map(|(_, n)| n)
+    }
+
+    /// Lets go of the names before place `keep_from`: every graph that may still import this state
+    /// stands at or past it. The reference keeps no such log (one graph: a value written is a
+    /// value read); this keeps ours from growing with every edit of the repair. A graph behind
+    /// the trim imports whole, which is the same values (it is never given a partial list).
+    pub fn trim_written(&mut self, keep_from: usize) {
+        let keep_from = keep_from.min(self.written_base + self.written.len());
+        if keep_from > self.written_base {
+            self.written.drain(..keep_from - self.written_base);
+            self.written_base = keep_from;
+        }
+    }
+
     pub fn import(&self, g: &mut Graph<'_>) {
         match g.state_seq {
             // one name, two vertices (a bidirect pin): the index holds one of them
-            Some((stamp, n)) if stamp == self.stamp.0 && n <= self.written.len() && g.index().len() == g.vertices.len() => {
+            Some((stamp, n)) if stamp == self.stamp.0 && n >= self.written_base && n <= self.written_base + self.written.len() && g.index().len() == g.vertices.len() => {
                 let index = g.pin_index();
                 let mut seen = std::collections::HashSet::new();
-                for name in &self.written[n..] {
+                for name in &self.written[n - self.written_base..] {
                     if seen.insert(name.as_str()) {
                         if let Some(&v) = index.get(name) {
                             self.import_vertex(g, v);
@@ -230,7 +255,7 @@ impl IncTimer {
                 }
             }
         }
-        g.state_seq = Some((self.stamp.0, self.written.len()));
+        g.state_seq = Some((self.stamp.0, self.written_base + self.written.len()));
     }
 
     /// Vertex `v`'s slew and its in-edges' delays.
@@ -275,6 +300,7 @@ impl IncTimer {
         self.slews = (0..g.vertices.len()).map(|v| (g.vertices[v].name.clone(), g.slew[v])).collect();
         self.delays.clear();
         self.written.clear();
+        self.written_base = 0;
         self.stamp = Stamp::new();
         for e in 0..g.edges.len() {
             self.store_delay(g, e);
@@ -1408,6 +1434,41 @@ mod tests {
         assert_eq!(b.slew[port], [[7.0; 2]; 2], "not written since: left as it was");
         inc.clone().import(&mut b);
         assert_eq!(b.slew[port], a.slew[port], "a copy: imported whole");
+    }
+
+    // Our written log (the reference has none): trimmed to the oldest place a live graph stands
+    // at, a graph at or past the trim still takes only what was written since; one behind it is
+    // imported whole — never from a partial list — and reads the same values.
+    #[test]
+    fn a_trimmed_log_keeps_every_graph_at_or_past_the_trim_current() {
+        let libs = libs();
+        let mut inc = IncTimer::default();
+        let nl0 = chain("buf");
+        let mut g = Graph::build(&libs, &nl0).unwrap();
+        inc.find_delays(&mut g, &HashMap::new(), None).unwrap();
+        inc.export(&g);
+        let nl = chain("big");
+        let (mut a, mut b, mut behind) = (Graph::build(&libs, &nl).unwrap(), Graph::build(&libs, &nl).unwrap(), Graph::build(&libs, &nl).unwrap());
+        inc.import(&mut a);
+        inc.import(&mut behind);
+        inc.invalid_delays.insert("b1/X".into());
+        let level = inc.levels["b1/X"];
+        inc.find_delays(&mut a, &HashMap::new(), Some(level)).unwrap();
+        assert!(inc.written_len() > 0);
+        // b imports at the log's end, then the log is trimmed to there
+        inc.import(&mut b);
+        inc.trim_written(inc.written_place(&b).unwrap());
+        assert_eq!(inc.written_len(), 0, "every name before b's place let go");
+        assert!(inc.written_place(&behind).unwrap() < inc.written_place(&b).unwrap(), "behind the trim");
+        let port = behind.index()["in"];
+        behind.slew[port] = [[7.0; 2]; 2];
+        inc.import(&mut behind);
+        assert_eq!(behind.slew[port], b.slew[port], "behind the trim: imported whole, not from a partial list");
+        assert_eq!(behind.slew, b.slew);
+        assert_eq!(behind.delay, b.delay);
+        let before = b.slew.clone();
+        inc.import(&mut b);
+        assert_eq!(b.slew, before, "at the trim: nothing written since, nothing changed");
     }
 
     // Rule (relevelize): from each vertex an edit relevelized from, a fanout not above the level
