@@ -1233,3 +1233,7 @@ mod tests {
         assert_eq!(g.differs_from_build(&fresh), None);
     }
 }
+
+#[cfg(test)]
+#[path = "edit_contract.rs"]
+mod edit_contract;
