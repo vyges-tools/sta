@@ -620,15 +620,19 @@ impl<'a> Graph<'a> {
     /// `dbStaCbk::inDbInstSwapMasterBefore`: equivalent arcs → `replaceEquivCellBefore` (the arc
     /// sets correspond index for index, so every edge stands), else `replaceCellBefore` (the arcs
     /// out of the instance's inputs deleted, newest first). Either way the instance's vertices take
-    /// the new cell. A swap that changes the instance's vertices, or a cell with an arc between two
-    /// outputs (which the reference keeps across a swap and makes again after it), is not made here.
+    /// the new cell and keep their ids: `dbInst::swapMaster` matches the two masters' terminals by
+    /// NAME (both sorted by name) and remaps each pin onto the new master's terminal, so the pins,
+    /// and the vertices the graph made for them, stand; the terminals' order in either master is
+    /// not compared. A swap that changes the instance's set of (pin, side), or a cell with an arc
+    /// between two outputs (which the reference keeps across a swap and makes again after it), is
+    /// not made here.
     fn replace_cell_before(&mut self, inst: &str, from: &str, to: &str, ev: &str, b: &mut Batch<'_>) -> Result<(), NotInPlace> {
         let refuse = || NotInPlace::Event(ev.to_string());
         let (Some(fl), Some(tl)) = (self.libs.iter().position(|l| l.cells.contains_key(from)), self.libs.iter().position(|l| l.cells.contains_key(to))) else {
             return Err(refuse());
         };
         let had = self.cell_vertices(fl, from, b);
-        if self.cell_vertices(tl, to, b) != had {
+        if !same_pins(&had, self.cell_vertices(tl, to, b)) {
             return Err(refuse());
         }
         let mut vs = Vec::with_capacity(had.len());
@@ -785,6 +789,16 @@ impl<'a> Graph<'a> {
     }
 }
 
+/// Two masters' signal pins `(name, driver)` are the same set: `dbInst::swapMaster` sorts both
+/// masters' terminals by name and pairs them by name (`sortMTerm`, `idx_map`), so the order each
+/// master lists them in is not part of the comparison.
+fn same_pins(had: &[(String, bool)], mut now: Vec<(String, bool)>) -> bool {
+    let mut had = had.to_vec();
+    had.sort_unstable();
+    now.sort_unstable();
+    had == now
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,6 +934,47 @@ mod tests {
         assert_eq!(of_buf(&g), ["buf1/Y", "buf1/A"]);
         assert_eq!(of_buf(&g), of_buf(&fresh));
         assert_eq!(g.differs_from_build(&fresh), None);
+    }
+
+    /// Rule (`dbInst::swapMaster` pairs the two masters' terminals by name, both sorted by name, and
+    /// remaps each pin onto its new terminal; `Sta::replaceCellBefore`/`After` keep the pins'
+    /// vertices): a swap between masters that list the same pins in another order (asap7's
+    /// NAND3x1 `A B C Y` and NAND3x2 `B C Y A`) is made in place, the instance's vertices keep their
+    /// ids, and the graph equals a fresh build modulo ids. A pin the new master lacks is refused.
+    #[test]
+    fn a_swap_to_a_master_listing_its_pins_in_another_order_is_made_in_place() {
+        let src = format!("{}{}}}", LIB.trim_end().strip_suffix('}').unwrap(), r#"
+      cell (and2x2) {
+        pin (A) { direction : input; capacitance : 0.002; }
+        pin (B) { direction : input; capacitance : 0.002; }
+        pin (Y) { direction : output; function : "A&B";
+          timing () { related_pin : "A"; timing_sense : positive_unate;
+            cell_rise (scalar) { values ("0.05"); } rise_transition (scalar) { values ("0.5"); }
+            cell_fall (scalar) { values ("0.05"); } fall_transition (scalar) { values ("0.5"); } }
+          timing () { related_pin : "B"; timing_sense : positive_unate;
+            cell_rise (scalar) { values ("0.05"); } rise_transition (scalar) { values ("0.5"); }
+            cell_fall (scalar) { values ("0.05"); } fall_transition (scalar) { values ("0.5"); } }
+        }
+      }
+    "#);
+        let libs = [Library::read(&crate::liberty_parse::parse(&src).unwrap()).unwrap()];
+        let terms = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let pins: HashMap<String, Vec<String>> = [("and2".to_string(), terms(&["A", "B", "Y"])), ("and2x2".to_string(), terms(&["B", "Y", "A"])), ("buf".to_string(), terms(&["A", "Y"]))].into();
+        let mut swapped = chain(false);
+        swapped.insts[0] = crate::netlist::inst("u1", "and2x2");
+        let ev = ["swap_before|u1|and2|and2x2|A=a=;B=b=;Y=n1=u1/Y", "swap_after|u1|A=a=;B=b=;Y=n1=u1/Y"].map(String::from);
+        let mut g = Graph::build_shared(&libs, Arc::new(chain(false)), Some(&pins)).unwrap();
+        let of_u1 = |g: &Graph<'_>| (0..g.vertices.len()).filter_map(|v| g.vname(v).strip_prefix("u1/").map(|p| (p.to_string(), v))).collect::<Vec<_>>();
+        let before = of_u1(&g);
+        g.apply_edits(&ev, Arc::new(swapped.clone()), Some(&pins)).expect("the swap is made in place");
+        assert_eq!(of_u1(&g), before, "the instance keeps its vertices and their ids");
+        assert!((0..g.vertices.len()).filter(|&v| g.vname(v).starts_with("u1/")).all(|v| g.vertices[v].cell.as_deref() == Some("and2x2")));
+        let fresh = Graph::build_with_pins(&libs, &swapped, Some(&pins)).unwrap();
+        assert_eq!(g.differs_from_build(&fresh), None);
+        // a pin the new master lacks is still refused
+        let narrow: HashMap<String, Vec<String>> = [("and2".to_string(), terms(&["A", "B", "Y"])), ("and2x2".to_string(), terms(&["A", "Y"])), ("buf".to_string(), terms(&["A", "Y"]))].into();
+        let mut h = Graph::build_shared(&libs, Arc::new(chain(false)), Some(&narrow)).unwrap();
+        assert!(matches!(h.apply_edits(&ev, Arc::new(swapped), Some(&narrow)), Err(NotInPlace::Event(_))));
     }
 
     /// Rule (`Graph::makePinVertices`: a bidirect top-level port is two vertices, load then
