@@ -128,6 +128,12 @@ impl<'a> Graph<'a> {
     /// The netlist edits `events` (the database's callbacks, in order) made on the graph, which then
     /// takes `netlist` — the generation after them. `pins` is the build's master-pin filter.
     pub fn apply_edits(&mut self, events: &[String], netlist: Arc<Netlist>, pins: Option<&HashMap<String, Vec<String>>>) -> Result<(), NotInPlace> {
+        let done = self.apply_edits_to(events, netlist, pins);
+        self.unusable_unless(done)
+    }
+
+    /// [`Graph::apply_edits`]'s steps.
+    fn apply_edits_to(&mut self, events: &[String], netlist: Arc<Netlist>, pins: Option<&HashMap<String, Vec<String>>>) -> Result<(), NotInPlace> {
         let moves = self.check_extends(&netlist, events)?;
         let mut b = self.batch(pins)?;
         self.shift_instances(&moves.at);
@@ -146,6 +152,25 @@ impl<'a> Graph<'a> {
     /// costs what it edits; comparing two generations and copying one cost the whole design per
     /// repeater. `VYGES_STA_CHECK_EDIT` also checks the patched netlist equals `next`.
     pub fn apply_edits_held(&mut self, events: &[String], next: &Netlist, slots: &SlotDelta, pins: Option<&HashMap<String, Vec<String>>>) -> Result<(), NotInPlace> {
+        let done = self.apply_edits_held_to(events, next, slots, pins);
+        self.unusable_unless(done)
+    }
+
+    /// An edit not made in place leaves the graph part-edited: vertices made or moved for the next
+    /// netlist while the graph still holds the last one, so its pins no longer name its vertices.
+    /// The graph is unusable then (the caller builds again); its vertices and name index are let go
+    /// so that recycling it hands the next build allocations only, never a vertex its netlist
+    /// cannot name.
+    fn unusable_unless(&mut self, done: Result<(), NotInPlace>) -> Result<(), NotInPlace> {
+        if done.is_err() {
+            self.vertices.clear();
+            self.index_cache.take();
+        }
+        done
+    }
+
+    /// [`Graph::apply_edits_held`]'s steps.
+    fn apply_edits_held_to(&mut self, events: &[String], next: &Netlist, slots: &SlotDelta, pins: Option<&HashMap<String, Vec<String>>>) -> Result<(), NotInPlace> {
         let moves = self.held_moves(next, events, slots)?;
         let mut b = self.batch(pins)?;
         self.edit_events(&moves, events, &mut b)?;
@@ -853,6 +878,30 @@ mod tests {
         let fresh_nl = chain(true);
         let fresh = Graph::build(&libs, &fresh_nl).unwrap();
         assert_eq!(g.differs_from_build(&fresh), None);
+    }
+
+    /// Rule (an edit not made in place is undone by building again, as the reference never edits
+    /// its graph half way): a refused event after an instance was made leaves the graph holding
+    /// vertices its netlist cannot name. Such a graph keeps no vertex, so recycling it cannot hand
+    /// the next build a vertex named from the wrong netlist, and that build equals a fresh one.
+    #[test]
+    fn a_refused_edit_recycles_no_vertex_its_netlist_cannot_name() {
+        let libs = libs();
+        let next = Arc::new(chain(true));
+        let fresh = Graph::build(&libs, &next).unwrap();
+        let mut events = insertion();
+        events.push("swap_before|u1|and2|no_such_cell|A=a=;B=b=;Y=n1=u1/Y".to_string());
+        let mut g = Graph::build_shared(&libs, Arc::new(chain(false)), None).unwrap();
+        assert!(g.apply_edits(&events, next.clone(), None).is_err(), "the swap to an unknown cell is refused");
+        assert!(g.vertices.is_empty(), "a part-edited graph keeps no vertex");
+        g.recycle();
+        assert_eq!(Graph::build_shared(&libs, next.clone(), None).unwrap().differs_from_build(&fresh), None);
+        let mut h = Graph::build_shared(&libs, Arc::new(chain(false)), None).unwrap();
+        let slots = SlotDelta { insts: vec![2], nets: vec![2, 5] };
+        assert!(h.apply_edits_held(&events, &next, &slots, None).is_err(), "the same events held");
+        assert!(h.vertices.is_empty());
+        h.recycle();
+        assert_eq!(Graph::build_shared(&libs, next.clone(), None).unwrap().differs_from_build(&fresh), None);
     }
 
     /// Rule (`Graph::makePinVertices` on `inDbInstCreate` iterates the new instance's pins — the
