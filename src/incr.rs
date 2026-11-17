@@ -37,18 +37,51 @@ pub enum EdgeKey {
 /// An edge's delays: gate arcs `[arc][min/max]`, wire edges `[rf][min/max]`.
 type EdgeDelays = Vec<[f32; 2]>;
 
+/// A name the timer's state is kept by (a pin's, an instance's, a cell's): held once in a
+/// [`NamePool`] and shared by every map that keys by it.
+pub type Name = std::sync::Arc<str>;
+
+/// The names a timer's maps share. The reference's state hangs off the graph's objects, so a pin
+/// is named once, by the network; ours is kept by name, and a `String` per map per scene made the
+/// names most of the timer's memory on a design with long hierarchical names (each pin's name in
+/// the levels, the slews, the delays, each edge's from-pin, per scene). The scenes' timers of one
+/// design share one pool ([`IncTimer::share_names`]). Names are never let go: a deleted pin's
+/// stays, as a repair deletes few.
+#[derive(Debug, Default, Clone)]
+pub struct NamePool(std::sync::Arc<std::sync::Mutex<std::collections::HashSet<Name>>>);
+
+impl NamePool {
+    /// `s`, held once: the pool's copy when it has one, else a new one it keeps.
+    pub fn intern(&self, s: &str) -> Name {
+        // a panic elsewhere while the lock was held leaves the set itself whole (an insert or a
+        // lookup), so it is used as it is
+        let mut pool = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = pool.get(s) {
+            return n.clone();
+        }
+        let n: Name = Name::from(s);
+        pool.insert(n.clone());
+        n
+    }
+
+    /// The same pool (one set of names), not a copy of it.
+    pub fn same_as(&self, other: &NamePool) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// An [`EdgeKey`] without its to-vertex.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EdgeTail {
     /// `cell`: the to-vertex's cell name, shared with the graph's vertices.
-    Gate { from: String, cell: std::sync::Arc<str>, set: usize },
-    Wire { from: String },
+    Gate { from: Name, cell: std::sync::Arc<str>, set: usize },
+    Wire { from: Name },
 }
 
 impl EdgeTail {
-    fn of(g: &Graph<'_>, e: usize) -> EdgeTail {
+    fn of(g: &Graph<'_>, e: usize, names: &NamePool) -> EdgeTail {
         let ed = &g.edges[e];
-        let from = g.vname(ed.from);
+        let from = g.with_vname(ed.from, |n| names.intern(n));
         match ed.kind {
             EdgeKind::Gate { set } => EdgeTail::Gate { from, cell: g.vertices[ed.to].cell.clone().unwrap_or_default(), set },
             EdgeKind::Wire => EdgeTail::Wire { from },
@@ -95,19 +128,21 @@ impl Clone for Stamp {
 
 #[derive(Debug, Default, Clone)]
 pub struct IncTimer {
+    /// The names every map below keys by ([`NamePool`]).
+    names: NamePool,
     /// Each vertex's level.
-    pub levels: HashMap<String, i32>,
-    slews: HashMap<String, [[f32; 2]; 2]>,
+    pub levels: HashMap<Name, i32>,
+    slews: HashMap<Name, [[f32; 2]; 2]>,
     /// The vertices whose slew or in-edge delays were stored since the last [`IncTimer::export`],
     /// in order, under `stamp`: what a graph that imported before takes ([`IncTimer::import`]).
-    written: Vec<String>,
+    written: Vec<Name>,
     /// The place of `written[0]`: places stay absolute when the head is let go
     /// ([`IncTimer::trim_written`]), so a graph's `state_seq` keeps meaning the same names.
     written_base: usize,
     stamp: Stamp,
     /// Each edge's delays by its [`EdgeKey`], held as to-vertex → the rest of the key, so an edge of
     /// a graph is found without making its key (a graph is imported whole after every edit).
-    delays: HashMap<String, Vec<(EdgeTail, EdgeDelays)>>,
+    delays: HashMap<Name, Vec<(EdgeTail, EdgeDelays)>>,
     /// Vertices whose delays are invalid (`invalid_delays_`) and the delay queue's pending
     /// vertices (`iter_`), by name.
     pub invalid_delays: BTreeSet<String>,
@@ -146,7 +181,7 @@ pub struct IncTimer {
     /// is new) — the instrumented reference's `VYGAA` lines.
     pub arrival_values: Vec<String>,
     /// Each instance's cell and each top port's direction (input: true), kept by the events.
-    pub cells: HashMap<String, String>,
+    pub cells: HashMap<Name, Name>,
     pub port_input: HashMap<String, bool>,
     /// Each net's drivers as the last connect or disconnect on it listed them: a load moved
     /// between nets (a fanout repair moves every load of a net) reads them here, not from a pass
@@ -199,6 +234,23 @@ pub struct SPath {
 }
 
 impl IncTimer {
+    /// Keep `other`'s names ([`NamePool`]): the timers of one design's scenes name the same pins.
+    /// Before any state is kept (the maps' names would be another pool's otherwise; nothing
+    /// depends on which pool a name came from, only memory does).
+    pub fn share_names(&mut self, other: &IncTimer) {
+        self.names = other.names.clone();
+    }
+
+    /// `s` as this timer's maps hold it.
+    pub fn intern(&self, s: &str) -> Name {
+        self.names.intern(s)
+    }
+
+    /// Vertex `v`'s name as this timer's maps hold it.
+    fn name(&self, g: &Graph<'_>, v: usize) -> Name {
+        g.with_vname(v, |n| self.names.intern(n))
+    }
+
     pub fn edge_key(g: &Graph<'_>, e: usize) -> EdgeKey {
         let ed = &g.edges[e];
         let (from, to) = (g.vname(ed.from), g.vname(ed.to));
@@ -241,8 +293,8 @@ impl IncTimer {
                 let index = g.pin_index();
                 let mut seen = std::collections::HashSet::new();
                 for name in &self.written[n - self.written_base..] {
-                    if seen.insert(name.as_str()) {
-                        if let Some(&v) = index.get(name) {
+                    if seen.insert(&**name) {
+                        if let Some(&v) = index.get(&**name) {
                             for u in g.vertices_named(v) {
                                 self.import_vertex(g, u);
                             }
@@ -286,21 +338,23 @@ impl IncTimer {
     /// Store `g`'s delays of edge `e`, replacing what its key held.
     fn store_delay(&mut self, g: &Graph<'_>, e: usize) {
         let d = g.delay[e].clone();
+        let names = &self.names;
         let delays = &mut self.delays;
         match g.with_vname(g.edges[e].to, move |to| delays.get_mut(to)) {
             Some(bucket) => match bucket.iter_mut().find(|(t, _)| t.is(g, e)) {
                 Some(slot) => slot.1 = d,
-                None => bucket.push((EdgeTail::of(g, e), d)),
+                None => bucket.push((EdgeTail::of(g, e, names), d)),
             },
             None => {
-                self.delays.insert(g.vname(g.edges[e].to), vec![(EdgeTail::of(g, e), d)]);
+                let tail = EdgeTail::of(g, e, names);
+                self.delays.insert(self.name(g, g.edges[e].to), vec![(tail, d)]);
             }
         }
     }
 
     /// The graph's slews and delays back into the state.
     pub fn export(&mut self, g: &Graph<'_>) {
-        self.slews = (0..g.vertices.len()).map(|v| (g.vname(v), g.slew[v])).collect();
+        self.slews = (0..g.vertices.len()).map(|v| (self.name(g, v), g.slew[v])).collect();
         self.delays.clear();
         self.written.clear();
         self.written_base = 0;
@@ -314,7 +368,7 @@ impl IncTimer {
     /// delays, and the slews at its fanout (a driver sets its loads'). Keeps the state current
     /// after a visit without exporting the whole graph.
     pub fn export_around(&mut self, g: &Graph<'_>, v: usize) {
-        let name = g.vname(v);
+        let name = self.name(g, v);
         self.slews.insert(name.clone(), g.slew[v]);
         self.written.push(name);
         for &e in g.in_edges[v].iter().chain(g.out_edges[v].iter()) {
@@ -322,7 +376,7 @@ impl IncTimer {
         }
         for &e in &g.out_edges[v] {
             let to = g.edges[e].to;
-            let name = g.vname(to);
+            let name = self.name(g, to);
             self.slews.insert(name.clone(), g.slew[to]);
             self.written.push(name);
         }
@@ -343,7 +397,7 @@ impl IncTimer {
     pub fn relevelize(&mut self, g: &Graph<'_>) -> Result<(), String> {
         if self.levels.is_empty() {
             let l = g.levels()?;
-            self.levels = (0..g.vertices.len()).map(|v| (g.vname(v), l[v] * LEVEL_SPACE)).collect();
+            self.levels = (0..g.vertices.len()).map(|v| (self.name(g, v), l[v] * LEVEL_SPACE)).collect();
             self.relevelize_from.clear();
             self.made.clear();
             return Ok(());
@@ -413,11 +467,13 @@ impl IncTimer {
             }
         }
         for (v, l) in raised {
-            self.levels.insert(g.vname(v), l);
+            let name = self.name(g, v);
+            self.levels.insert(name, l);
         }
         for name in std::mem::take(&mut self.made) {
-            if index.contains_key(&name) {
-                self.levels.entry(name).or_insert(0);
+            if index.contains_key(&name) && !self.levels.contains_key(name.as_str()) {
+                let name = self.names.intern(&name);
+                self.levels.insert(name, 0);
             }
         }
     }
@@ -426,7 +482,7 @@ impl IncTimer {
     fn relevelize_all(&mut self, g: &Graph<'_>, index: &HashMap<String, usize>) {
         self.made.clear();
         // A new vertex starts at level 0 (`makeVertex`); a deleted one is forgotten.
-        let mut level: Vec<i32> = (0..g.vertices.len()).map(|v| self.levels.get(&g.vname(v)).copied().unwrap_or(0)).collect();
+        let mut level: Vec<i32> = (0..g.vertices.len()).map(|v| g.with_vname(v, |n| self.levels.get(n).copied()).unwrap_or(0)).collect();
         let start = level.clone();
         for name in std::mem::take(&mut self.relevelize_from) {
             let Some(&v) = index.get(&name) else { continue };
@@ -467,16 +523,14 @@ impl IncTimer {
         // vertex's level (a new one inserted, a later one of a repeated name last), then any name no
         // longer in the graph dropped.
         for (v, &l) in level.iter().enumerate() {
-            let name = &g.vname(v);
-            match self.levels.get_mut(name.as_str()) {
-                Some(x) => *x = l,
-                None => {
-                    self.levels.insert(name.clone(), l);
-                }
+            let levels = &mut self.levels;
+            if g.with_vname(v, |n| levels.get_mut(n).map(|x| *x = l)).is_none() {
+                let name = self.name(g, v);
+                self.levels.insert(name, l);
             }
         }
         if self.levels.len() != g.vertices.len() {
-            self.levels.retain(|k, _| index.contains_key(k.as_str()));
+            self.levels.retain(|k, _| index.contains_key(&**k));
         }
     }
 
@@ -605,10 +659,10 @@ impl IncTimer {
 
 /// The queue's levels: each name at its level (scene 0's levels; every scene's are alike — one
 /// netlist, one levelization).
-fn queue_by_level(levels: &HashMap<String, i32>, names: impl IntoIterator<Item = String>) -> BTreeMap<i32, BTreeSet<String>> {
+fn queue_by_level(levels: &HashMap<Name, i32>, names: impl IntoIterator<Item = String>) -> BTreeMap<i32, BTreeSet<String>> {
     let mut by_level: BTreeMap<i32, BTreeSet<String>> = BTreeMap::new();
     for n in names {
-        by_level.entry(levels.get(&n).copied().unwrap_or(0)).or_default().insert(n);
+        by_level.entry(levels.get(n.as_str()).copied().unwrap_or(0)).or_default().insert(n);
     }
     by_level
 }
@@ -873,7 +927,7 @@ fn arrival_values_on() -> bool {
 
 /// `ArrivalVisitor::visit(vertex, with_latch_edges)` over every scene: the new paths; when they
 /// changed, stored and the fanout enqueued — a latch data pin's latch outputs postponed instead.
-fn visit_arrivals(incs: &mut [IncTimer], searches: &mut [Search<'_, '_>], indexes: &[std::sync::Arc<HashMap<String, usize>>], levels: &HashMap<String, i32>, by_level: &mut BTreeMap<i32, BTreeSet<String>>, name: &str) {
+fn visit_arrivals(incs: &mut [IncTimer], searches: &mut [Search<'_, '_>], indexes: &[std::sync::Arc<HashMap<String, usize>>], levels: &HashMap<Name, i32>, by_level: &mut BTreeMap<i32, BTreeSet<String>>, name: &str) {
     let name = name.to_string();
     // Every scene's new paths, then the vertex's verdict.
     let mut news: Vec<Option<SceneArrivals>> = Vec::with_capacity(searches.len());
@@ -957,7 +1011,7 @@ fn visit_arrivals(incs: &mut [IncTimer], searches: &mut [Search<'_, '_>], indexe
         }
     }
     for n in fanout_names {
-        by_level.entry(levels.get(&n).copied().unwrap_or(0)).or_default().insert(n);
+        by_level.entry(levels.get(n.as_str()).copied().unwrap_or(0)).or_default().insert(n);
     }
 }
 
@@ -1024,7 +1078,7 @@ pub fn find_requireds_scenes(incs: &mut [IncTimer], searches: &mut [Search<'_, '
             }
             if changed {
                 for n in fanin_names {
-                    by_level.entry(levels.get(&n).copied().unwrap_or(0)).or_default().insert(n);
+                    by_level.entry(levels.get(n.as_str()).copied().unwrap_or(0)).or_default().insert(n);
                 }
             }
         }
@@ -1039,7 +1093,7 @@ pub fn find_requireds_scenes(incs: &mut [IncTimer], searches: &mut [Search<'_, '
 impl IncTimer {
     /// The instances' cells and the ports' directions as the netlist has them now.
     pub fn track_netlist(&mut self, nl: &crate::netlist::Netlist) {
-        self.cells = nl.insts.iter().map(|i| (**i).clone()).collect();
+        self.cells = nl.insts.iter().map(|i| (self.names.intern(&i.0), self.names.intern(&i.1))).collect();
         self.port_input = nl.ports.iter().map(|(n, d)| (n.clone(), *d == crate::netlist::PortDir::Input)).collect();
     }
 
@@ -1139,7 +1193,7 @@ impl IncTimer {
     /// Forget a deleted vertex (`deleteVertexBefore`).
     fn delete_vertex(&mut self, v: &str) {
         self.slews.remove(v);
-        self.written.push(v.to_string());
+        self.written.push(self.names.intern(v));
         self.paths.remove(v);
         self.path_gen.remove(v);
         self.levels.remove(v);
@@ -1163,7 +1217,7 @@ impl IncTimer {
             ["iterm_destroy", pin, _net] => self.delete_vertex(pin),
             ["inst_create", inst, master] => {
                 // `makeInstanceAfter`: new vertices (level 0) and instance edges.
-                self.cells.insert(inst.to_string(), master.to_string());
+                self.cells.insert(self.names.intern(inst), self.names.intern(master));
                 if let Some(cell) = self.cell(cx, master) {
                     for p in &cell.ports {
                         if self.tracing() {
@@ -1285,7 +1339,7 @@ impl IncTimer {
     fn swap_before(&mut self, cx: &EventCtx<'_>, inst: &str, from: &str, to: &str, terms: &str) -> Result<(), String> {
         use crate::liberty::Direction;
         let (Some(from_cell), Some(to_cell)) = (self.cell(cx, from), self.cell(cx, to)) else {
-            self.cells.insert(inst.to_string(), to.to_string());
+            self.cells.insert(self.names.intern(inst), self.names.intern(to));
             return Ok(());
         };
         let equiv = equiv_cells_arcs(from_cell, to_cell);
@@ -1331,7 +1385,7 @@ impl IncTimer {
                 self.bump_edge(key);
             }
         }
-        self.cells.insert(inst.to_string(), to.to_string());
+        self.cells.insert(self.names.intern(inst), self.names.intern(to));
         Ok(())
     }
 }
@@ -1440,6 +1494,48 @@ mod tests {
         assert_eq!(b.slew[port], [[7.0; 2]; 2], "not written since: left as it was");
         inc.clone().import(&mut b);
         assert_eq!(b.slew[port], a.slew[port], "a copy: imported whole");
+    }
+
+    // The reference's state hangs off its one graph's objects, so a pin is named once, by the
+    // network. Ours is kept by name per scene: the scenes' timers share ONE pool of names, so a
+    // pin's name is one allocation for every map of every scene (levels, slews, delays and each
+    // edge's from-pin), and what the state holds is unchanged — the same values under the same
+    // names as a timer keeping its own.
+    #[test]
+    fn the_scenes_timers_hold_each_name_once() {
+        let libs = libs();
+        let nl = chain("buf");
+        let mut g = Graph::build(&libs, &nl).unwrap();
+        let mut own = IncTimer::default();
+        own.find_delays(&mut g, &HashMap::new(), None).unwrap();
+        own.relevelize(&g).unwrap();
+        own.export(&g);
+        let (mut s0, mut s1) = (IncTimer::default(), IncTimer::default());
+        s1.share_names(&s0);
+        assert!(s0.names.same_as(&s1.names) && !s0.names.same_as(&own.names));
+        for s in [&mut s0, &mut s1] {
+            s.relevelize(&g).unwrap();
+            s.export(&g);
+        }
+        let key = |m: &HashMap<Name, i32>, n: &str| m.get_key_value(n).map(|(k, _)| k.clone()).expect("a vertex's level");
+        for v in 0..g.vertices.len() {
+            let n = g.vname(v);
+            let (a, b) = (key(&s0.levels, &n), key(&s1.levels, &n));
+            assert!(std::sync::Arc::ptr_eq(&a, &b), "{n}: one name for both scenes");
+            let (sk, _) = s0.slews.get_key_value(n.as_str()).expect("a vertex's slew");
+            assert!(std::sync::Arc::ptr_eq(&a, sk), "{n}: one name for the levels and the slews");
+            assert!(!std::sync::Arc::ptr_eq(&a, &key(&own.levels, &n)), "{n}: another pool, another name");
+        }
+        // an edge's from-pin is the pool's name too
+        for (to, tails) in &s0.delays {
+            for (t, _) in tails {
+                let (EdgeTail::Gate { from, .. } | EdgeTail::Wire { from }) = t;
+                assert!(std::sync::Arc::ptr_eq(from, &key(&s0.levels, from)), "{to}: from {from}");
+            }
+        }
+        // the same state as a timer with its own names
+        assert_eq!((&s0.levels, &s0.slews, &s0.delays), (&own.levels, &own.slews, &own.delays));
+        assert_eq!((&s1.levels, &s1.slews, &s1.delays), (&own.levels, &own.slews, &own.delays));
     }
 
     // Our written log (the reference has none): trimmed to the oldest place a live graph stands
