@@ -199,6 +199,11 @@ pub struct IncTimer {
     follower: bool,
     /// While the leader takes an event for its followers: each value-side effect, in order.
     effects: Option<Vec<Effect>>,
+    /// The graph that HOLDS this timer's slews and delays ([`IncTimer::hold_in`]), by its stamp:
+    /// the reference's one graph, whose arrays are the delay calculator's state. The name-keyed
+    /// maps (`slews`, `delays`, `written`) are then empty and not written; only that graph is
+    /// imported (a no-op), until [`IncTimer::release`] puts the values back in the maps.
+    held_by: Option<u64>,
 }
 
 /// One value-side effect of an edit event on a scene timer, as the leader made it
@@ -333,7 +338,58 @@ impl IncTimer {
         }
     }
 
+    /// Graph `g` holds this timer's slews and delays from now on: the maps are let go. `g` must
+    /// have imported the state as it stands (or be the graph that holds it already).
+    pub fn hold_in(&mut self, g: &mut Graph<'_>) -> Result<(), String> {
+        if self.holds(g) {
+            return Ok(());
+        }
+        if self.held_by.is_some() {
+            return Err("the timer's values are held by another graph".into());
+        }
+        if g.state_seq != Some((self.stamp.0, self.written_base + self.written.len())) {
+            return Err("a graph that has not imported the timer's state cannot hold it".into());
+        }
+        self.slews = HashMap::new();
+        self.delays = HashMap::new();
+        self.written = Vec::new();
+        self.written_base = 0;
+        self.stamp = Stamp::new();
+        self.held_by = Some(self.stamp.0);
+        g.state_seq = Some((self.stamp.0, 0));
+        Ok(())
+    }
+
+    /// Does `g` hold this timer's values ([`IncTimer::hold_in`])?
+    pub fn holds(&self, g: &Graph<'_>) -> bool {
+        self.held_by.is_some() && g.state_seq.map(|(s, _)| s) == self.held_by
+    }
+
+    /// Is a graph holding this timer's values?
+    pub fn is_held(&self) -> bool {
+        self.held_by.is_some()
+    }
+
+    /// The values back from the graph that holds them into the maps, by name (as
+    /// [`IncTimer::export`]): before that graph is let go, or another graph is to import them.
+    /// A graph an edit left unusable is read under the netlist its vertices name
+    /// ([`Graph::name_failed`]); its deleted edges (no delay rows) are passed over.
+    pub fn release(&mut self, g: &mut Graph<'_>) -> Result<(), String> {
+        if !self.holds(g) {
+            return Err("release: this graph does not hold the timer's values".into());
+        }
+        self.held_by = None;
+        self.export(g);
+        g.state_seq = Some((self.stamp.0, 0));
+        Ok(())
+    }
+
     pub fn import(&self, g: &mut Graph<'_>) {
+        if self.held_by.is_some() {
+            // the graph holding the values has them; any other must wait for a release
+            assert!(self.holds(g), "import: the timer's values are held by another graph (release it first)");
+            return;
+        }
         match g.state_seq {
             // one name, two vertices (a bidirect pin): the index holds one of them, so only a
             // bidirect top-level port's pair (both taken) keeps the import to what was written
@@ -385,6 +441,9 @@ impl IncTimer {
 
     /// Store `g`'s delays of edge `e`, replacing what its key held.
     fn store_delay(&mut self, g: &Graph<'_>, e: usize) {
+        if self.held_by.is_some() {
+            return;
+        }
         let d = g.delay[e].clone();
         let names = &self.names;
         let delays = &mut self.delays;
@@ -402,12 +461,17 @@ impl IncTimer {
 
     /// The graph's slews and delays back into the state.
     pub fn export(&mut self, g: &Graph<'_>) {
+        if self.held_by.is_some() {
+            assert!(self.holds(g), "export: the timer's values are held by another graph");
+            return;
+        }
         self.slews = (0..g.vertices.len()).map(|v| (self.name(g, v), g.slew[v])).collect();
         self.delays.clear();
         self.written.clear();
         self.written_base = 0;
         self.stamp = Stamp::new();
-        for e in 0..g.edges.len() {
+        // a deleted edge (an unusable graph's free id) has no rows, and no key of its own
+        for e in (0..g.edges.len()).filter(|&e| !g.delay[e].is_empty()) {
             self.store_delay(g, e);
         }
     }
@@ -416,6 +480,9 @@ impl IncTimer {
     /// delays, and the slews at its fanout (a driver sets its loads'). Keeps the state current
     /// after a visit without exporting the whole graph.
     pub fn export_around(&mut self, g: &Graph<'_>, v: usize) {
+        if self.held_by.is_some() {
+            return;
+        }
         let name = self.name(g, v);
         self.slews.insert(name.clone(), g.slew[v]);
         self.written.push(name);
@@ -1270,7 +1337,9 @@ impl IncTimer {
             fx.push(Effect::DeleteVertex(v.to_string()));
         }
         self.slews.remove(v);
-        self.written.push(self.names.intern(v));
+        if self.held_by.is_none() {
+            self.written.push(self.names.intern(v));
+        }
         self.paths.remove(v);
         self.path_gen.remove(v);
         self.levels.remove(v);
@@ -1521,6 +1590,7 @@ fn is_latch_d_to_q(g: &Graph<'_>, e: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use crate::liberty::Library;
     use crate::liberty_parse::parse;
     use crate::netlist::{Conn, Net, Netlist, PortDir};
@@ -1700,6 +1770,93 @@ mod tests {
         }
         assert!(!led[1].visited.is_empty(), "the swap re-timed something");
         assert!(led[1].apply_event(&cx, "net_create|x").is_err(), "a follower takes events only from its leader");
+    }
+
+    // Rule (the reference's delay calculator keeps its slews and arc delays in its ONE graph):
+    // a graph that HOLDS the timer's values times an in-place edit exactly as the name-keyed maps
+    // do (the same visits, slews and delays), with nothing kept by name; released, the maps hold
+    // what it held.
+    #[test]
+    fn a_graph_holding_the_values_times_as_the_maps_do() {
+        let libs = libs();
+        let (nl0, nl1) = (Arc::new(chain("buf")), Arc::new(chain("big")));
+        let cx = EventCtx { libs: &libs, ideal_clock_mode: false };
+        let terms = "A=n1=b1/X,b2/A;X=n2=b2/X,b3/A";
+        let evs = [format!("swap_before|b2|buf|big|{terms}"), format!("swap_after|b2|{terms}")];
+        let run = |hold: bool| {
+            let mut inc = IncTimer::default();
+            inc.track_netlist(&nl0);
+            let mut g = Graph::build_shared(&libs, nl0.clone(), None).unwrap();
+            inc.find_delays(&mut g, &HashMap::new(), None).unwrap();
+            inc.relevelize(&g).unwrap();
+            inc.export(&g);
+            inc.import(&mut g);
+            if hold {
+                inc.hold_in(&mut g).unwrap();
+            }
+            for ev in &evs {
+                inc.apply_event(&cx, ev).unwrap();
+            }
+            g.apply_edits(&evs, nl1.clone(), None).unwrap();
+            inc.import(&mut g);
+            inc.find_delays(&mut g, &HashMap::new(), None).unwrap();
+            (inc, g)
+        };
+        let ((maps, gm), (mut held, mut gh)) = (run(false), run(true));
+        assert!(!maps.visited.is_empty(), "the swap re-timed something");
+        assert_eq!(held.visited, maps.visited);
+        assert_eq!((&gh.slew, &gh.delay), (&gm.slew, &gm.delay));
+        assert!(held.slews.is_empty() && held.delays.is_empty() && held.written.is_empty(), "nothing kept by name");
+        held.release(&mut gh).unwrap();
+        assert!(!held.slews.is_empty() && !held.is_held());
+        let (mut fa, mut fb) = (Graph::build_shared(&libs, nl1.clone(), None).unwrap(), Graph::build_shared(&libs, nl1.clone(), None).unwrap());
+        maps.import(&mut fa);
+        held.import(&mut fb);
+        assert_eq!((&fb.slew, &fb.delay), (&fa.slew, &fa.delay), "released: a fresh graph imports the same values");
+    }
+
+    // An edit the holding graph cannot make in place (here an edge id left free) leaves it
+    // part-edited; kept (`hold_failed`) and named by the netlist its vertices then refer to, its
+    // values come back by name, and a fresh graph imports what the maps would have given it.
+    #[test]
+    fn a_failed_edit_of_the_holding_graph_gives_its_values_back_by_name() {
+        let libs = libs();
+        let mut next = chain("buf");
+        Arc::make_mut(&mut next.nets[2]).pins.pop();
+        let next = Arc::new(next);
+        let ev = ["iterm_disconnect|b3/A|n2|b2/X,b3/A".to_string()];
+        let mut inc = IncTimer::default();
+        let mut g = Graph::build_shared(&libs, Arc::new(chain("buf")), None).unwrap();
+        inc.find_delays(&mut g, &HashMap::new(), None).unwrap();
+        inc.export(&g);
+        let mut by_maps = Graph::build_shared(&libs, next.clone(), None).unwrap();
+        inc.clone().import(&mut by_maps);
+        inc.import(&mut g);
+        inc.hold_in(&mut g).unwrap();
+        g.hold_failed = true;
+        assert_eq!(g.apply_edits(&ev, next.clone(), None), Err(crate::graph::NotInPlace::Holes(1)));
+        inc.release(&mut g).unwrap();
+        let mut fresh = Graph::build_shared(&libs, next, None).unwrap();
+        inc.import(&mut fresh);
+        assert!(fresh.slew.iter().any(|s| *s != [[0.0; 2]; 2]), "values came back");
+        assert_eq!((&fresh.slew, &fresh.delay), (&by_maps.slew, &by_maps.delay));
+    }
+
+    /// Only the holding graph imports while a graph holds the values: any other would read
+    /// nothing (the maps are empty), so it is a fault, never a silent zero.
+    #[test]
+    #[should_panic(expected = "held by another graph")]
+    fn a_graph_not_holding_the_values_cannot_import_them() {
+        let libs = libs();
+        let nl = chain("buf");
+        let mut inc = IncTimer::default();
+        let mut g = Graph::build(&libs, &nl).unwrap();
+        inc.find_delays(&mut g, &HashMap::new(), None).unwrap();
+        inc.export(&g);
+        inc.import(&mut g);
+        inc.hold_in(&mut g).unwrap();
+        let mut other = Graph::build(&libs, &nl).unwrap();
+        inc.import(&mut other);
     }
 
     // Our written log (the reference has none): trimmed to the oldest place a live graph stands

@@ -128,14 +128,17 @@ impl<'a> Graph<'a> {
     /// The netlist edits `events` (the database's callbacks, in order) made on the graph, which then
     /// takes `netlist` — the generation after them. `pins` is the build's master-pin filter.
     pub fn apply_edits(&mut self, events: &[String], netlist: Arc<Netlist>, pins: Option<&HashMap<String, Vec<String>>>) -> Result<(), NotInPlace> {
-        let done = self.apply_edits_to(events, netlist, pins);
-        self.unusable_unless(done)
+        let mut shifted = false;
+        let done = self.apply_edits_to(events, netlist.clone(), pins, &mut shifted);
+        self.unusable_unless(done, || shifted.then_some(NetlistRef::Shared(netlist)))
     }
 
-    /// [`Graph::apply_edits`]'s steps.
-    fn apply_edits_to(&mut self, events: &[String], netlist: Arc<Netlist>, pins: Option<&HashMap<String, Vec<String>>>) -> Result<(), NotInPlace> {
+    /// [`Graph::apply_edits`]'s steps. `shifted`: the instances were moved to `netlist`'s places
+    /// (from then on that netlist names the vertices).
+    fn apply_edits_to(&mut self, events: &[String], netlist: Arc<Netlist>, pins: Option<&HashMap<String, Vec<String>>>, shifted: &mut bool) -> Result<(), NotInPlace> {
         let moves = self.check_extends(&netlist, events)?;
         let mut b = self.batch(pins)?;
+        *shifted = true;
         self.shift_instances(&moves.at);
         self.edit_events(&moves, events, &mut b)?;
         let old_nets = self.netlist.nets.len();
@@ -152,8 +155,11 @@ impl<'a> Graph<'a> {
     /// costs what it edits; comparing two generations and copying one cost the whole design per
     /// repeater. `VYGES_STA_CHECK_EDIT` also checks the patched netlist equals `next`.
     pub fn apply_edits_held(&mut self, events: &[String], next: &Netlist, slots: &SlotDelta, pins: Option<&HashMap<String, Vec<String>>>) -> Result<(), NotInPlace> {
-        let done = self.apply_edits_held_to(events, next, slots, pins);
-        self.unusable_unless(done)
+        let mut began = false;
+        let done = self.apply_edits_held_to(events, next, slots, pins, &mut began);
+        // once the edits began (no instance moved: checked first) `next` names every vertex, old
+        // or made (copied: rare)
+        self.unusable_unless(done, || began.then(|| NetlistRef::Shared(Arc::new(next.clone()))))
     }
 
     /// An edit not made in place leaves the graph part-edited: vertices made or moved for the next
@@ -161,18 +167,29 @@ impl<'a> Graph<'a> {
     /// The graph is unusable then (the caller builds again); its vertices and name index are let go
     /// so that recycling it hands the next build allocations only, never a vertex its netlist
     /// cannot name.
-    fn unusable_unless(&mut self, done: Result<(), NotInPlace>) -> Result<(), NotInPlace> {
+    ///
+    /// A graph that holds a timer's values ([`Graph::hold_failed`]) keeps its vertices instead,
+    /// named by `naming` (the netlist they refer to once the edit began moving them; else its
+    /// own), so the values can be read back by name; it is not recycled.
+    fn unusable_unless(&mut self, done: Result<(), NotInPlace>, naming: impl FnOnce() -> Option<NetlistRef<'a>>) -> Result<(), NotInPlace> {
         if done.is_err() {
-            self.vertices = Arc::default();
             self.index_cache.take();
+            if self.hold_failed {
+                if let Some(n) = naming() {
+                    self.netlist = n;
+                }
+            } else {
+                self.vertices = Arc::default();
+            }
         }
         done
     }
 
     /// [`Graph::apply_edits_held`]'s steps.
-    fn apply_edits_held_to(&mut self, events: &[String], next: &Netlist, slots: &SlotDelta, pins: Option<&HashMap<String, Vec<String>>>) -> Result<(), NotInPlace> {
+    fn apply_edits_held_to(&mut self, events: &[String], next: &Netlist, slots: &SlotDelta, pins: Option<&HashMap<String, Vec<String>>>, began: &mut bool) -> Result<(), NotInPlace> {
         let moves = self.held_moves(next, events, slots)?;
         let mut b = self.batch(pins)?;
+        *began = true;
         self.edit_events(&moves, events, &mut b)?;
         let old_nets = self.netlist.nets.len();
         // the vertices on a replaced net the edits named, read again by name (as `shift_nets`)

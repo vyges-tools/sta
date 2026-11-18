@@ -152,12 +152,16 @@ pub fn apply_edits<'a>(gs: &mut [Graph<'a>], link_scene: usize, mut edit: impl F
     link.array_ops = Some(Vec::new());
     let done = edit(link);
     let ops = link.array_ops.take().unwrap_or_default();
-    done?;
+    // a failed edit: the views stay let go, unless the link kept its (part-edited) structure for
+    // the values the views hold to be read back by name (`Graph::hold_failed`)
+    if done.is_err() && !(link.hold_failed && !link.vertices.is_empty()) {
+        return done;
+    }
     for g in before.iter_mut().chain(after.iter_mut()) {
         g.reattach(link);
         replay(g, &ops);
     }
-    Ok(())
+    done
 }
 
 /// `ops` made on a view's own slews and delays.
@@ -573,6 +577,31 @@ mod tests {
             assert_eq!(gs[k].differs_from_build(&fresh), None, "scene {k}");
         }
         assert_eq!(gate_edges(&gs[1]).iter().map(|e| e.2).collect::<Vec<_>>(), gate_edges(&Graph::build_shared(&fast, next, None).unwrap()).iter().map(|e| e.2).collect::<Vec<_>>());
+    }
+
+    /// A failed edit through the link view, the views holding a timer's values (`hold_failed`):
+    /// every view takes the part-edited structure back, its arrays the length of it, so each
+    /// one's values can still be read by name; without `hold_failed` they stay let go.
+    #[test]
+    fn a_failed_edit_leaves_holding_views_readable() {
+        let (slow, fast) = ([lib("slow", true, 1.0)], [lib("fast", true, 0.5)]);
+        let mut next = netlist();
+        Arc::make_mut(&mut next.nets[2]).pins = vec![Conn::Inst(0, "Y".into())];
+        let next = Arc::new(next);
+        let ev = ["bterm_disconnect|y|y|x1/Y,y".to_string()];
+        for hold in [true, false] {
+            let link = Graph::build_shared(&slow, Arc::new(netlist()), None).unwrap();
+            let mut views = scene_views(link, 0, &[&slow, &fast]).map_err(|(_, w)| w).unwrap();
+            views.iter_mut().for_each(|g| g.hold_failed = hold);
+            assert!(apply_edits(&mut views, 0, |g| g.apply_edits(&ev, next.clone(), None)).is_err());
+            if hold {
+                assert!(!views[1].vertices.is_empty() && Arc::ptr_eq(&views[0].vertices, &views[1].vertices));
+                assert_eq!((views[1].slew.len(), views[1].delay.len()), (views[1].vertices.len(), views[1].edges.len()));
+                assert_eq!(views[1].vname(0), views[0].vname(0));
+            } else {
+                assert!(views[1].vertices.is_empty(), "let go");
+            }
+        }
     }
 
     /// Rule (#581, the pin's release): ONE set of annotation bits per vertex; a max annotation in

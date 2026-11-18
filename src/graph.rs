@@ -226,6 +226,11 @@ pub struct Graph<'a> {
     /// The timer's: the state it imported, as its stamp and how far into its log of written names
     /// ([`crate::incr::IncTimer::import`] brings it on). `None` from a build.
     pub state_seq: Option<(u64, usize)>,
+    /// An edit this graph cannot make in place keeps its vertices, named by the netlist they then
+    /// refer to, so the values it holds can still be read by name
+    /// ([`crate::incr::IncTimer::release`]) before it is let go. Set by a caller whose graph holds
+    /// a timer's values; such a graph is not recycled.
+    pub hold_failed: bool,
 }
 
 /// [`Graph::parasitic_load`]: `(pin_cap, wire_cap, the pi model and its node names)`.
@@ -379,6 +384,10 @@ impl<'a> Graph<'a> {
     /// edit (a repair) pays for what the edit changed, not for every pin's name. The next graph is
     /// the one a fresh build makes (`VYGES_STA_CHECK_BUILD=1` checks it).
     pub fn recycle(self) {
+        // its vertices may be a failed edit's: never handed to a build
+        if self.hold_failed {
+            return;
+        }
         let (insts, ports) = (self.netlist.insts.clone(), self.netlist.ports.clone());
         let Graph { vertices, edges, in_edges, out_edges, delay, index_cache, .. } = self;
         // a structure another scene view still holds is that view's to recycle: nothing is taken
@@ -774,7 +783,7 @@ impl<'a> Graph<'a> {
                 let _ = index_cache.set(std::sync::Arc::new(map));
             }
         }
-        Some(Graph { libs, netlist: keep, vertices: Arc::new(vertices), edges: Arc::new(edges), in_edges: Arc::new(in_edges), out_edges: Arc::new(out_edges), vertex_net: Arc::new(vertex_net), slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: Default::default(), bidirect_port_paths: Arc::new(bidirect_port_paths), disabled_loops: Default::default(), loops: Default::default(), index_cache, net_slots: Default::default(), scene_sets: None, array_ops: None, edit_seq: None, state_seq: None }.with_loops_broken())
+        Some(Graph { libs, netlist: keep, vertices: Arc::new(vertices), edges: Arc::new(edges), in_edges: Arc::new(in_edges), out_edges: Arc::new(out_edges), vertex_net: Arc::new(vertex_net), slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: Default::default(), bidirect_port_paths: Arc::new(bidirect_port_paths), disabled_loops: Default::default(), loops: Default::default(), index_cache, net_slots: Default::default(), scene_sets: None, array_ops: None, edit_seq: None, state_seq: None, hold_failed: false }.with_loops_broken())
     }
 
     /// [`Graph::build_with_pins`] with each pin found by its name.
@@ -1007,7 +1016,7 @@ impl<'a> Graph<'a> {
                 EdgeKind::Wire => vec![[0.0f32; 2]; 2],
             })
             .collect();
-        Ok(Graph { libs, netlist: keep, vertices: Arc::new(vertices), edges: Arc::new(edges), in_edges: Arc::new(in_edges), out_edges: Arc::new(out_edges), vertex_net: Arc::new(vertex_net), slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: Arc::new(bidirect_inst_paths), bidirect_port_paths: Arc::new(bidirect_port_paths), disabled_loops: Default::default(), loops: Default::default(), index_cache: std::sync::OnceLock::new(), net_slots: Default::default(), scene_sets: None, array_ops: None, edit_seq: None, state_seq: None }.with_loops_broken())
+        Ok(Graph { libs, netlist: keep, vertices: Arc::new(vertices), edges: Arc::new(edges), in_edges: Arc::new(in_edges), out_edges: Arc::new(out_edges), vertex_net: Arc::new(vertex_net), slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: Arc::new(bidirect_inst_paths), bidirect_port_paths: Arc::new(bidirect_port_paths), disabled_loops: Default::default(), loops: Default::default(), index_cache: std::sync::OnceLock::new(), net_slots: Default::default(), scene_sets: None, array_ops: None, edit_seq: None, state_seq: None, hold_failed: false }.with_loops_broken())
     }
 
     /// Whether vertex `v` is a top-level port's (an instance's vertex may have no library too:
@@ -1102,6 +1111,7 @@ impl<'a> Graph<'a> {
             array_ops: None,
             edit_seq: None,
             state_seq: None,
+            hold_failed: false,
         }
     }
 
