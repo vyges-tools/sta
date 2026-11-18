@@ -108,6 +108,15 @@ fn a_partial_cond_arc_set_leaves_the_default_arc_timed_as_the_reference_does() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
+/// `assign` aliases (`tests/data/assign`: `mergeAssignNet`, OpenSTA cc9027d6): ports named by the
+/// nets they are assigned to, a wire naming an input port, two ports on one net, a feed-through and
+/// a port tied low, each timed as the reference times the merged net.
+#[test]
+fn assign_aliases_time_as_the_reference_merges_them() {
+    let failed = small_case("assign", &format!("{D}sky130_fd_sc_hd__tt_025C_1v80.lib"), "assign.v");
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// CRPR's common pin (`tests/data/crpr`: `CheckCrpr::findCrpr`, OpenSTA 9ef4b4f0, no levels): the
 /// capture clock path backed up to the first pin the launch path has, credited whatever the two
 /// transitions there (`same_pin`, the default) — an inverted capture is credited too.

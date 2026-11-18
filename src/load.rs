@@ -57,9 +57,6 @@ pub fn design(design: &CompactDesign, libs: &[Library]) -> Result<Design, String
     if m.has_bundle_ports() {
         return Err(format!("module {name}: a port bundle (`.X(expr)` in the header) is not modelled"));
     }
-    if let Some((a, b)) = m.aliases.first() {
-        return Err(format!("module {name}: assign {} = {} (a net with two names) is not modelled", design.str(*a), design.str(*b)));
-    }
     if m.skipped_assigns > 0 {
         return Err(format!("module {name}: {} assigns of unequal widths (reference warning 203) are not modelled", m.skipped_assigns));
     }
@@ -101,55 +98,8 @@ pub fn design(design: &CompactDesign, libs: &[Library]) -> Result<Design, String
         }
         insts.push(inst(iname, cname));
     }
-    // each net's pins in connection order, nets in first-connection order
-    let mut nets: Vec<(String, Vec<Conn>)> = Vec::new();
-    let mut net_at: HashMap<&str, usize> = HashMap::new();
-    for (w, x) in m.insts.iter().enumerate() {
-        let (iname, cname) = (design.str(x.name), design.str(x.cell));
-        let cell = find_cell(cname).expect("every instance's cell was found above");
-        for (p, n) in m.conns(x) {
-            let (pin, net) = (design.str(*p), design.str(*n));
-            if pin.is_empty() {
-                return Err(format!("instance {iname}: a positional connection loom could not name is not modelled"));
-            }
-            if cell.port(pin).is_none() {
-                return Err(format!("instance {iname}: cell {cname} has no port {pin}"));
-            }
-            let k = *net_at.entry(net).or_insert_with(|| {
-                nets.push((net.to_string(), Vec::new()));
-                nets.len() - 1
-            });
-            nets[k].1.push(Conn::Inst(index[w], pin.to_string()));
-        }
-        // a constant on a pin: the pin is on the reader's constant net of that value (loom keeps
-        // ties apart from connections, so they come after the instance's nets; the order of a net
-        // with no driver times nothing)
-        for (p, v) in m.ties(x) {
-            let pin = design.str(*p);
-            if cell.port(pin).is_none() {
-                return Err(format!("instance {iname}: cell {cname} has no port {pin}"));
-            }
-            let net = if *v { crate::sim::ONE_NET } else { crate::sim::ZERO_NET };
-            let k = *net_at.entry(net).or_insert_with(|| {
-                nets.push((net.to_string(), Vec::new()));
-                nets.len() - 1
-            });
-            nets[k].1.push(Conn::Inst(index[w], pin.to_string()));
-        }
-    }
-    // `ConcreteNet::addPin` prepends: the net lists its pins last connected first
-    for (_, pins) in &mut nets {
-        pins.reverse();
-    }
-    // a port is the term of the net of its name (`ensureNetBinding(port bit)`), visited before
-    // the pins (`ConcreteNetwork::visitConnectedPins`)
-    for (i, (pname, _)) in ports.iter().enumerate() {
-        let k = *net_at.entry(pname.as_str()).or_insert_with(|| {
-            nets.push((pname.clone(), Vec::new()));
-            nets.len() - 1
-        });
-        nets[k].1.insert(0, Conn::Port(i));
-    }
+    // each net's terms and pins as the reference links them, nets in first-connection order
+    let (mut nets, port_net) = link_nets(design, libs, &ports, &index)?;
     // nets in their driver's order (`makeWireEdges`); a net with no driver after, as connected
     let mut rank: Vec<usize> = vec![usize::MAX; nets.len()];
     let mut next = 0;
@@ -172,9 +122,9 @@ pub fn design(design: &CompactDesign, libs: &[Library]) -> Result<Design, String
             }
         }
     }
-    for (i, (pname, dir)) in ports.iter().enumerate() {
+    for (i, (_, dir)) in ports.iter().enumerate() {
         if matches!(dir, PortDir::Input | PortDir::Inout) {
-            let k = net_at[pname.as_str()];
+            let k = port_net[i];
             debug_assert!(nets[k].1.contains(&Conn::Port(i)));
             if rank[k] == usize::MAX {
                 rank[k] = next;
@@ -189,6 +139,201 @@ pub fn design(design: &CompactDesign, libs: &[Library]) -> Result<Design, String
     let supply: Vec<(String, bool)> = m.constants.iter().map(|(n, v)| (design.str(*n).to_string(), *v)).collect();
     let constant_nets = crate::sim::constant_nets(&netlist, &supply);
     Ok(Design { netlist, constant_nets })
+}
+
+/// A linked net: its name, then its terms and pins as the reference walks them.
+type LinkedNet = (String, Vec<Conn>);
+
+/// One net while the top is linked: its name, the net it was merged into, its pins and its port
+/// terms in the order each was added (the reference PREPENDS both, so the lists it walks are these
+/// reversed), and the place of its first pin among every pin connected.
+struct LinkNet<'a> {
+    name: &'a str,
+    into: Option<usize>,
+    pins: Vec<Conn>,
+    terms: Vec<usize>,
+    first: usize,
+}
+
+/// The nets as `linkNetwork` makes them.
+struct Linker<'a> {
+    ids: HashMap<&'a str, usize>,
+    nets: Vec<LinkNet<'a>>,
+    seq: usize,
+}
+
+impl<'a> Linker<'a> {
+    /// `VerilogBindingTbl::ensureNetBinding`: the net of a name, made if new, followed to the net
+    /// that survived its merges (`ConcreteBindingTbl::find`).
+    fn ensure(&mut self, name: &'a str) -> usize {
+        let k = *self.ids.entry(name).or_insert_with(|| {
+            self.nets.push(LinkNet { name, into: None, pins: Vec::new(), terms: Vec::new(), first: usize::MAX });
+            self.nets.len() - 1
+        });
+        self.find(k)
+    }
+
+    fn find(&self, mut k: usize) -> usize {
+        while let Some(t) = self.nets[k].into {
+            k = t;
+        }
+        k
+    }
+
+    /// `makeTerm(pin, net)` for a top port bit.
+    fn make_term(&mut self, port: usize, name: &'a str) {
+        let k = self.ensure(name);
+        self.nets[k].terms.push(port);
+    }
+
+    /// `ConcreteNet::addPin`.
+    fn add_pin(&mut self, name: &'a str, c: Conn) {
+        let k = self.ensure(name);
+        self.nets[k].first = self.nets[k].first.min(self.seq);
+        self.seq += 1;
+        self.nets[k].pins.push(c);
+    }
+
+    /// `mergeAssignNet` at the top, both nets one level: `mergeInto(lhs, rhs)`. The right-hand net
+    /// survives; `ConcreteNet::mergeInto` walks the left's pins, then its terms, from the head
+    /// and prepends each to the survivor's, so in the order added they follow the survivor's,
+    /// reversed. A net merged into itself is left alone.
+    fn merge_assign(&mut self, lhs: &'a str, rhs: &'a str) {
+        let (l, r) = (self.ensure(lhs), self.ensure(rhs));
+        if l == r {
+            return;
+        }
+        let pins = std::mem::take(&mut self.nets[l].pins);
+        self.nets[r].pins.extend(pins.into_iter().rev());
+        let terms = std::mem::take(&mut self.nets[l].terms);
+        self.nets[r].terms.extend(terms.into_iter().rev());
+        self.nets[r].first = self.nets[r].first.min(self.nets[l].first);
+        self.nets[l].into = Some(r);
+    }
+}
+
+/// The top's nets as the reference links them (`linkNetwork`, then `makeModuleInstBody`): each
+/// port bit's term on the net of its name, in header order; then the statements in the order
+/// written — an instance's pins as it is reached (connections, then the constant ties loom keeps
+/// apart), an `assign` merging its two nets where it stands ([`Linker::merge_assign`]). A net is
+/// named by the net that survived, and lists its terms, then its pins, each as the reference walks
+/// them. Nets in first-connection order, a net with no pin after, in port order. Returns the nets
+/// and each port's net.
+///
+/// Refused: an alias whose place among the instances loom does not know (a module not read from a
+/// file), a constant other than `1'b0` / `1'b1` assigned, a held-constant net merged away (the
+/// reference holds the net it was declared on, which the merge empties), and an alias naming a
+/// bit of a one-bit vector the connections call by its bare name.
+fn link_nets(design: &CompactDesign, libs: &[Library], ports: &[(String, PortDir)], index: &[usize]) -> Result<(Vec<LinkedNet>, Vec<usize>), String> {
+    let m = design.top();
+    let name = design.str(m.name);
+    if m.alias_at.len() != m.aliases.len() {
+        return Err(format!("module {name}: assign aliases whose place among the instances is unknown (a module not read from a file) are not modelled"));
+    }
+    let side = |s: &vyges_loom::netlist::Sym| -> Result<&str, String> {
+        match design.str(*s) {
+            "1'b0" => Ok(crate::sim::ZERO_NET),
+            "1'b1" => Ok(crate::sim::ONE_NET),
+            t if t.contains('\'') => Err(format!("module {name}: assign of the constant {t} is not modelled")),
+            t => Ok(t),
+        }
+    };
+    let aliases = m.aliases.iter().map(|(l, r)| Ok((side(l)?, side(r)?))).collect::<Result<Vec<_>, String>>()?;
+    let find_cell = |cell: &str| libs.iter().find_map(|l| l.cells.get(cell));
+    let mut written: Vec<Vec<(&str, &str)>> = Vec::with_capacity(m.insts.len());
+    for x in &m.insts {
+        let mut cs = Vec::new();
+        for (p, n) in m.conns_as_written(x) {
+            cs.push((design.str(p), design.str(n)));
+        }
+        written.push(cs);
+    }
+    if !aliases.is_empty() {
+        let known: std::collections::HashSet<&str> = ports.iter().map(|(p, _)| p.as_str()).chain(written.iter().flatten().map(|(_, n)| *n)).collect();
+        for &(l, r) in &aliases {
+            for s in [l, r] {
+                if let Some((base, _)) = s.strip_suffix(']').and_then(|t| t.rsplit_once('[')) {
+                    if !known.contains(s) && known.contains(base) {
+                        return Err(format!("module {name}: assign names {s}, a one-bit vector the connections call {base}: not modelled"));
+                    }
+                }
+            }
+        }
+    }
+    let mut lk = Linker { ids: HashMap::new(), nets: Vec::new(), seq: 0 };
+    for (i, (pname, _)) in ports.iter().enumerate() {
+        lk.make_term(i, pname.as_str());
+    }
+    let mut next_alias = 0;
+    for (w, x) in m.insts.iter().enumerate() {
+        while next_alias < aliases.len() && m.alias_at[next_alias] as usize <= w {
+            lk.merge_assign(aliases[next_alias].0, aliases[next_alias].1);
+            next_alias += 1;
+        }
+        let (iname, cname) = (design.str(x.name), design.str(x.cell));
+        let cell = find_cell(cname).expect("every instance's cell was found before the link");
+        for &(pin, net) in &written[w] {
+            if pin.is_empty() {
+                return Err(format!("instance {iname}: a positional connection loom could not name is not modelled"));
+            }
+            if cell.port(pin).is_none() {
+                return Err(format!("instance {iname}: cell {cname} has no port {pin}"));
+            }
+            lk.add_pin(net, Conn::Inst(index[w], pin.to_string()));
+        }
+        // a constant on a pin: the pin is on the reader's constant net of that value
+        for (p, v) in m.ties(x) {
+            let pin = design.str(*p);
+            if cell.port(pin).is_none() {
+                return Err(format!("instance {iname}: cell {cname} has no port {pin}"));
+            }
+            lk.add_pin(if *v { crate::sim::ONE_NET } else { crate::sim::ZERO_NET }, Conn::Inst(index[w], pin.to_string()));
+        }
+    }
+    for &(l, r) in &aliases[next_alias..] {
+        lk.merge_assign(l, r);
+    }
+    for (c, _) in &m.constants {
+        let c = design.str(*c);
+        if let Some(&k) = lk.ids.get(c) {
+            if lk.nets[k].into.is_some() {
+                return Err(format!("module {name}: net {c} is held constant and merged into {} by an assign: not modelled", lk.nets[lk.find(k)].name));
+            }
+        }
+    }
+    for c in [crate::sim::ZERO_NET, crate::sim::ONE_NET] {
+        if let Some(&k) = lk.ids.get(c) {
+            if lk.nets[k].into.is_some() {
+                return Err(format!("module {name}: the constant net {c} merged into {} by an assign: not modelled", lk.nets[lk.find(k)].name));
+            }
+        }
+    }
+    // survivors with a pin, by their first pin; then those with only terms, by their first port
+    let mut live: Vec<usize> = (0..lk.nets.len()).filter(|&k| lk.nets[k].into.is_none() && !(lk.nets[k].pins.is_empty() && lk.nets[k].terms.is_empty())).collect();
+    let key = |k: usize| {
+        let n = &lk.nets[k];
+        if n.pins.is_empty() {
+            (1, n.terms.iter().copied().min().unwrap_or(usize::MAX))
+        } else {
+            (0, n.first)
+        }
+    };
+    live.sort_by_key(|&k| key(k));
+    let mut at = vec![usize::MAX; lk.nets.len()];
+    for (j, &k) in live.iter().enumerate() {
+        at[k] = j;
+    }
+    let port_net = ports.iter().map(|(p, _)| at[lk.find(lk.ids[p.as_str()])]).collect();
+    let nets = live
+        .into_iter()
+        .map(|k| {
+            let n = &mut lk.nets[k];
+            let mut conns: Vec<Conn> = n.terms.iter().rev().map(|&i| Conn::Port(i)).collect();
+            conns.extend(std::mem::take(&mut n.pins).into_iter().rev());
+            (n.name.to_string(), conns)
+        })
+        .collect();
+    Ok((nets, port_net))
 }
 
 // ---- the constraints ---------------------------------------------------------------------------
@@ -1765,8 +1910,39 @@ mod tests {
         assert_eq!(pins(&nl, "n1"), ["la/A", "drv/X", "lm/A", "lz/A"]);
     }
 
-    /// What the timer has no place for is refused, naming it: an assign, a tie, hierarchy, a cell
-    /// no library holds, a pin the cell lacks.
+    /// Rule (`VerilogReader::mergeAssignNet` at the top, both nets one level: `mergeInto(lhs, rhs)`;
+    /// `ConcreteNet::mergeInto` prepends the left net's pins, then its terms, to the right's, which
+    /// survives and keeps its name; `makeModuleInstBody` merges where the assign is written): an
+    /// `assign` is one net named by its right-hand side, its terms then its pins as the reference
+    /// walks them. Witness: the reference's own `term_iterator` / `pin_iterator` on
+    /// `tests/data/assign/assign.v`, each list below as it printed it — n6's `u4/A u7/A` is the
+    /// merge reversing n5's two earlier loads, `w z` and `f a` the terms prepended in turn.
+    #[test]
+    fn an_assign_is_one_net_named_and_ordered_as_the_reference_merges_it() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+        let text = std::fs::read_to_string(format!("{dir}correlation/sky130_fd_sc_hd__tt_025C_1v80.lib")).unwrap();
+        let libs = [Library::read(&crate::liberty_parse::parse(&text).unwrap()).unwrap()];
+        let d = vyges_loom::netlist::load_compact(&format!("{dir}assign/assign.v")).unwrap();
+        let nl = design(&d, &libs).unwrap().netlist;
+        for (net, want) in [
+            ("n1", &["r1/D", "u0/Y"][..]),
+            ("q1", &["y", "u1/A", "r1/Q"]),
+            ("n2", &["u2/A", "u1/Y"]),
+            ("b", &["b", "u1/B"]),
+            ("n3", &["w", "z", "u3/A", "u2/X"]),
+            ("n6", &["r3/D", "r2/D", "u5/A", "u4/A", "u7/A", "u3/X"]),
+            ("a", &["f", "a", "u0/A"]),
+            (crate::sim::ZERO_NET, &["k"]),
+        ] {
+            assert_eq!(pins(&nl, net), want, "net {net}");
+        }
+        for merged in ["y", "n4", "z", "w", "n5", "f", "k"] {
+            assert!(!nl.nets.iter().any(|n| n.name == merged), "{merged} names the net it was merged into");
+        }
+    }
+
+    /// What the timer has no place for is refused, naming it: a tie, hierarchy, a cell no library
+    /// holds, a pin the cell lacks.
     #[test]
     fn what_cannot_be_represented_is_refused() {
         let refused = |src: &str, why: &str| {
@@ -1774,7 +1950,6 @@ mod tests {
             let e = netlist(&d, &[lib()]).unwrap_err();
             assert!(e.contains(why), "{e}");
         };
-        refused("module t (a, y); input a; output y; wire n; assign y = n; BUF b (.A(a), .X(n)); endmodule\n", "assign");
         refused("module t (y); output y; BUF b (.A(1'b0), .X(y)); endmodule\n", "tied to a constant");
         refused("module t (a, y); input a; output y; NAND2 b (.A(a), .B(a), .Y(y)); endmodule\n", "in no library");
         refused("module t (a, y); input a; output y; BUF b (.A(a), .Z(y)); endmodule\n", "no port Z");
