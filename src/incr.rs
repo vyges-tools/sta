@@ -191,6 +191,26 @@ pub struct IncTimer {
     /// This timer prints the graph-edit trace (`VYGES_STA_GRAPH_TRACE`): one timer per design
     /// does — the reference has ONE graph for every scene, a caller one timer per scene.
     pub trace_edits: bool,
+    /// A scene timer that FOLLOWS the first scene's ([`IncTimer::follow`]): the reference has one
+    /// graph, so one set of levels, cells and net drivers for every scene; a follower keeps only its
+    /// scene's values (slews, delays, paths) and invalid sets, takes its events through
+    /// [`apply_event_scenes`] from the leader's answers, and never relevelizes (every scene pass
+    /// reads the first timer's levels).
+    follower: bool,
+    /// While the leader takes an event for its followers: each value-side effect, in order.
+    effects: Option<Vec<Effect>>,
+}
+
+/// One value-side effect of an edit event on a scene timer, as the leader made it
+/// ([`apply_event_scenes`]): what a follower repeats on its own state.
+#[derive(Debug, Clone, PartialEq)]
+enum Effect {
+    Arrival(String),
+    Required(String),
+    Delay(String),
+    ClearPrev(String),
+    Bump(EdgeKey),
+    DeleteVertex(String),
 }
 
 /// What applying an edit event reads: the libraries and whether every clock is ideal
@@ -239,6 +259,34 @@ impl IncTimer {
     /// depends on which pool a name came from, only memory does).
     pub fn share_names(&mut self, other: &IncTimer) {
         self.names = other.names.clone();
+    }
+
+    /// This timer follows `leader`, the first scene's ([`IncTimer::follower`]): its names, and none
+    /// of the structure the leader keeps for every scene.
+    pub fn follow(&mut self, leader: &IncTimer) {
+        self.share_names(leader);
+        self.follower = true;
+        self.levels = HashMap::new();
+        self.cells = HashMap::new();
+        self.port_input = HashMap::new();
+        self.net_drivers = HashMap::new();
+        self.made.clear();
+        self.relevelize_from.clear();
+        self.trace_edits = false;
+    }
+
+    /// The leader's effects of one event repeated on this follower's values.
+    fn repeat(&mut self, fx: &[Effect]) {
+        for e in fx {
+            match e {
+                Effect::Arrival(n) => self.arrival_invalid(n.clone()),
+                Effect::Required(n) => self.required_invalid(n.clone()),
+                Effect::Delay(n) => self.delay_invalid(n.clone()),
+                Effect::ClearPrev(n) => self.clear_prev(n),
+                Effect::Bump(k) => self.bump_edge(k.clone()),
+                Effect::DeleteVertex(n) => self.delete_vertex(n),
+            }
+        }
     }
 
     /// `s` as this timer's maps hold it.
@@ -395,6 +443,9 @@ impl IncTimer {
     /// The full levelization (`findLevels`, levels spaced by [`LEVEL_SPACE`]) when there are no
     /// levels yet, else `relevelize`. A vertex whose level changes is invalid.
     pub fn relevelize(&mut self, g: &Graph<'_>) -> Result<(), String> {
+        if self.follower {
+            return Ok(());
+        }
         if self.levels.is_empty() {
             let l = g.levels()?;
             self.levels = (0..g.vertices.len()).map(|v| (self.name(g, v), l[v] * LEVEL_SPACE)).collect();
@@ -557,18 +608,27 @@ impl IncTimer {
     }
 
     pub fn arrival_invalid(&mut self, name: String) {
+        if let Some(fx) = &mut self.effects {
+            fx.push(Effect::Arrival(name.clone()));
+        }
         if self.arrivals_exist {
             self.invalid_arrivals.insert(name);
         }
     }
 
     pub fn required_invalid(&mut self, name: String) {
+        if let Some(fx) = &mut self.effects {
+            fx.push(Effect::Required(name.clone()));
+        }
         if self.requireds_exist {
             self.invalid_requireds.insert(name);
         }
     }
 
     pub fn delay_invalid(&mut self, name: String) {
+        if let Some(fx) = &mut self.effects {
+            fx.push(Effect::Delay(name.clone()));
+        }
         if self.delays_exist {
             self.invalid_delays.insert(name);
         }
@@ -1093,6 +1153,9 @@ pub fn find_requireds_scenes(incs: &mut [IncTimer], searches: &mut [Search<'_, '
 impl IncTimer {
     /// The instances' cells and the ports' directions as the netlist has them now.
     pub fn track_netlist(&mut self, nl: &crate::netlist::Netlist) {
+        if self.follower {
+            return;
+        }
         self.cells = nl.insts.iter().map(|i| (self.names.intern(&i.0), self.names.intern(&i.1))).collect();
         self.port_input = nl.ports.iter().map(|(n, d)| (n.clone(), *d == crate::netlist::PortDir::Input)).collect();
     }
@@ -1138,11 +1201,7 @@ impl IncTimer {
     fn delete_edge(&mut self, from: &str, to: &str, key: EdgeKey) {
         self.arrival_invalid(to.to_string());
         self.required_invalid(from.to_string());
-        if let Some(paths) = self.paths.get_mut(to) {
-            for p in paths.iter_mut() {
-                p.prev = None;
-            }
-        }
+        self.clear_prev(to);
         self.delay_invalid(to.to_string());
         self.relevelize_from_pin(to.to_string());
         if self.tracing() {
@@ -1164,8 +1223,23 @@ impl IncTimer {
         self.relevelize_from.insert(pin);
     }
 
+    /// `to`'s paths lose their prev paths (an edge into it is deleted).
+    fn clear_prev(&mut self, to: &str) {
+        if let Some(fx) = &mut self.effects {
+            fx.push(Effect::ClearPrev(to.to_string()));
+        }
+        if let Some(paths) = self.paths.get_mut(to) {
+            for p in paths.iter_mut() {
+                p.prev = None;
+            }
+        }
+    }
+
     /// A deleted or remade edge: the next one with this key is a different object.
     fn bump_edge(&mut self, key: EdgeKey) {
+        if let Some(fx) = &mut self.effects {
+            fx.push(Effect::Bump(key.clone()));
+        }
         self.next_gen += 1;
         self.edge_gen.insert(key, self.next_gen);
     }
@@ -1192,6 +1266,9 @@ impl IncTimer {
 
     /// Forget a deleted vertex (`deleteVertexBefore`).
     fn delete_vertex(&mut self, v: &str) {
+        if let Some(fx) = &mut self.effects {
+            fx.push(Effect::DeleteVertex(v.to_string()));
+        }
         self.slews.remove(v);
         self.written.push(self.names.intern(v));
         self.paths.remove(v);
@@ -1204,6 +1281,9 @@ impl IncTimer {
 
     /// One edit event (`Db::edit_log_take`) as the reference's timer acts on it (`dbStaCbk`).
     pub fn apply_event(&mut self, cx: &EventCtx<'_>, ev: &str) -> Result<(), String> {
+        if self.follower {
+            return Err("a following scene timer takes its events from its leader (apply_event_scenes)".into());
+        }
         let f: Vec<&str> = ev.split('|').collect();
         if self.tracing() {
             trace_callback(&f);
@@ -1390,6 +1470,29 @@ impl IncTimer {
     }
 }
 
+/// One edit event on every scene's timer: the reference's ONE graph takes it once. The first
+/// timer (the leader) acts on it; each follower ([`IncTimer::follow`]) repeats the leader's value-side
+/// effects — its invalidations, deleted vertices and remade edges are the leader's, read from the
+/// one netlist — and keeps no structure of its own. A timer that does not follow acts on the event
+/// itself, as before.
+pub fn apply_event_scenes(incs: &mut [IncTimer], cx: &EventCtx<'_>, ev: &str) -> Result<(), String> {
+    let Some((leader, rest)) = incs.split_first_mut() else { return Ok(()) };
+    if rest.iter().any(|i| i.follower) {
+        leader.effects = Some(Vec::new());
+    }
+    let done = leader.apply_event(cx, ev);
+    let fx = leader.effects.take().unwrap_or_default();
+    done?;
+    for inc in rest.iter_mut() {
+        if inc.follower {
+            inc.repeat(&fx);
+        } else {
+            inc.apply_event(cx, ev)?;
+        }
+    }
+    Ok(())
+}
+
 /// `sta::equivCellsArcs`: the same number of arc sets, each matching the other's by index — the
 /// same ports, role, condition and arcs.
 pub fn equiv_cells_arcs(a: &crate::liberty::Cell, b: &crate::liberty::Cell) -> bool {
@@ -1536,6 +1639,67 @@ mod tests {
         // the same state as a timer with its own names
         assert_eq!((&s0.levels, &s0.slews, &s0.delays), (&own.levels, &own.slews, &own.delays));
         assert_eq!((&s1.levels, &s1.slews, &s1.delays), (&own.levels, &own.slews, &own.delays));
+    }
+
+    // Rule (the reference's ONE graph takes each edit once, and every scene pass reads its one set
+    // of levels): a scene timer that follows the first takes each event as the leader's effects
+    // and keeps no levels, cells or net drivers, and the scenes then time exactly as timers that
+    // each took every event themselves — the same invalid sets and edge generations after the
+    // events, the same visits, slews and delays after the next delay pass.
+    #[test]
+    fn a_following_scene_timer_times_as_one_that_takes_every_event() {
+        let libs = libs();
+        let (nl0, nl1) = (chain("buf"), chain("big"));
+        let start = |follow: bool| {
+            let mut incs = vec![IncTimer::default(), IncTimer::default()];
+            let (a, b) = incs.split_at_mut(1);
+            if follow {
+                b[0].follow(&a[0]);
+            } else {
+                b[0].share_names(&a[0]);
+            }
+            let mut gs = vec![Graph::build(&libs, &nl0).unwrap(), Graph::build(&libs, &nl0).unwrap()];
+            for inc in incs.iter_mut() {
+                inc.track_netlist(&nl0);
+            }
+            find_delays_scenes(&mut incs, &mut gs, &[&HashMap::new(), &HashMap::new()], None).unwrap();
+            for (inc, g) in incs.iter_mut().zip(&gs) {
+                inc.relevelize(g).unwrap();
+                inc.export(g);
+                // as after a search: every invalidation is kept
+                inc.arrivals_exist = true;
+                inc.requireds_exist = true;
+            }
+            incs
+        };
+        let (mut each, mut led) = (start(false), start(true));
+        assert!(led[1].levels.is_empty() && led[1].cells.is_empty() && !led[0].levels.is_empty());
+        let cx = EventCtx { libs: &libs, ideal_clock_mode: false };
+        let terms = "A=n1=b1/X,b2/A;X=n2=b2/X,b3/A";
+        for ev in [format!("swap_before|b2|buf|big|{terms}"), format!("swap_after|b2|{terms}")] {
+            for inc in each.iter_mut() {
+                inc.apply_event(&cx, &ev).unwrap();
+            }
+            apply_event_scenes(&mut led, &cx, &ev).unwrap();
+        }
+        let sets = |i: &IncTimer| (i.invalid_delays.clone(), i.invalid_arrivals.clone(), i.invalid_requireds.clone(), i.edge_gen.clone(), i.next_gen);
+        assert_eq!(sets(&led[1]), sets(&each[1]), "the follower's invalid sets and edge generations");
+        assert_eq!(sets(&led[0]), sets(&each[0]));
+        assert!(!led[1].invalid_delays.is_empty() && !led[1].invalid_arrivals.is_empty() && !led[1].invalid_requireds.is_empty(), "the swap invalidated something");
+        let pars = [&HashMap::new(), &HashMap::new()];
+        let mut ge = vec![Graph::build(&libs, &nl1).unwrap(), Graph::build(&libs, &nl1).unwrap()];
+        let mut gl = vec![Graph::build(&libs, &nl1).unwrap(), Graph::build(&libs, &nl1).unwrap()];
+        for (inc, g) in each.iter().zip(ge.iter_mut()).chain(led.iter().zip(gl.iter_mut())) {
+            inc.import(g);
+        }
+        find_delays_scenes(&mut each, &mut ge, &pars, None).unwrap();
+        find_delays_scenes(&mut led, &mut gl, &pars, None).unwrap();
+        for k in 0..2 {
+            assert_eq!((&led[k].visited, &led[k].slews, &led[k].delays), (&each[k].visited, &each[k].slews, &each[k].delays), "scene {k}");
+            assert_eq!((&gl[k].slew, &gl[k].delay), (&ge[k].slew, &ge[k].delay), "scene {k}");
+        }
+        assert!(!led[1].visited.is_empty(), "the swap re-timed something");
+        assert!(led[1].apply_event(&cx, "net_create|x").is_err(), "a follower takes events only from its leader");
     }
 
     // Our written log (the reference has none): trimmed to the oldest place a live graph stands
