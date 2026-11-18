@@ -221,7 +221,10 @@ pub fn slew_blocked(g: &Graph<'_>, annotated: &[HashMap<String, f32>], scope: An
         }
     }
     match scope {
-        AnnotationScope::PinFold => vec![Arc::new(shared); annotated.len()],
+        AnnotationScope::PinFold => {
+            let one = Arc::new(shared);
+            annotated.iter().map(|_| one.clone()).collect()
+        }
         AnnotationScope::PerScene => own.into_iter().map(Arc::new).collect(),
     }
 }
