@@ -907,7 +907,7 @@ fn timing_exceptions_made(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc
         let thrus = e.args.iter().filter(|(f, _)| f == "-through").map(|(_, o)| thru_point(cmd, o, nl, &pins)).collect::<Result<Vec<_>, _>>()?;
         let side = |flag: &str| -> Result<(Vec<String>, bool), String> {
             let (mut names, mut clock) = (Vec::new(), false);
-            for (_, o) in e.args.iter().filter(|(f, _)| f == flag) {
+            for o in e.args.iter().filter(|(f, _)| f == flag).flat_map(|(_, o)| object_items(o)) {
                 match o.accessor.as_str() {
                     "get_ports" => {
                         for n in &o.names {
@@ -1019,8 +1019,7 @@ fn group_paths_made(xs: &[vyges_loom::sdc::ExceptionCmd], s: &vyges_loom::sdc::S
         let side = |flag: &str| -> Result<(Vec<String>, bool), String> {
             let (mut names, mut clock) = (Vec::new(), false);
             for (_, o) in x.args.iter().filter(|(f, _)| f == flag) {
-                let items = if o.accessor == "list" { o.items.iter().collect::<Vec<_>>() } else { vec![o] };
-                for o in items {
+                for o in object_items(o) {
                     match o.accessor.as_str() {
                         "get_ports" => {
                             for n in &o.names {
@@ -1077,7 +1076,7 @@ fn group_paths_made(xs: &[vyges_loom::sdc::ExceptionCmd], s: &vyges_loom::sdc::S
 fn thru_point(cmd: &str, o: &vyges_loom::sdc::Objects, nl: &Netlist, pins: &ConnectedPins<'_>) -> Result<crate::sdc::Thru, String> {
     let mut t = crate::sdc::Thru::default();
     let hit = |n: &str, x: &str| vyges_loom::sdc::object_matches(n, x);
-    for n in &o.names {
+    for (o, n) in object_items(o).into_iter().flat_map(|o| o.names.iter().map(move |n| (o, n))) {
         match o.accessor.as_str() {
             "get_pins" => t.pins.extend(pins.matching(n)),
             "get_ports" => t.pins.extend(nl.ports.iter().map(|(p, _)| p).filter(|p| hit(n, p)).cloned()),
@@ -1091,6 +1090,18 @@ fn thru_point(cmd: &str, o: &vyges_loom::sdc::Objects, nl: &Netlist, pins: &Conn
         return Err(format!("{cmd} -through [{} {}]: matches nothing: not modelled", o.accessor, o.names.join(" ")));
     }
     Ok(t)
+}
+
+/// The queries of one `-from` / `-to` / `-through` argument as the reference's `get_object_args`
+/// walks them: an element of a `[list …]` / `[concat …]` that is itself a list is walked in turn,
+/// in order, however deep; any other element is one query (`write_sdc` writes a merged exception's
+/// side as `[list [get_ports {a}] [get_ports {b}] …]`).
+fn object_items(o: &vyges_loom::sdc::Objects) -> Vec<&vyges_loom::sdc::Objects> {
+    if matches!(o.accessor.as_str(), "list" | "concat") {
+        o.items.iter().flat_map(object_items).collect()
+    } else {
+        vec![o]
+    }
 }
 
 /// A `-from` / `-to` side as `get_clocks_warn` reads it: names are clocks.
@@ -2003,6 +2014,34 @@ mod tests {
     /// and multicycle paths, still refused beside a path delay. `-weight` is read and ignored; `-default`, a second
     /// group of one name (merged by `addException`), a side matching nothing and
     /// `set_path_margin` are refused.
+    /// Rule (`get_object_args` in the reference's `CmdArgs.tcl`, which `parse_from_arg`,
+    /// `parse_to_arg` and `parse_thrus_arg` read their objects through): an element of a list that
+    /// is itself a list is walked in turn, recursively; every other element is one object query.
+    /// So `-from [list [get_ports {a}] [list [get_ports c]]]` names what `-from [get_ports {a c}]`
+    /// names, on a false path, a multicycle path, a group path and a `-through`. `write_sdc`
+    /// writes a merged exception's side in that form. A bare name in a list stays refused.
+    #[test]
+    fn a_nested_list_of_queries_names_what_its_queries_name() {
+        let d = vyges_loom::netlist::parse_compact("module t (a, c, y, z); input a, c; output y, z; BUF b (.A(a), .X(y)); BUF e (.A(c), .X(z)); endmodule\n").unwrap();
+        let nl = netlist(&d, &[lib()]).unwrap();
+        let read = |lines: &str| {
+            let s = vyges_loom::sdc::Sdc::parse(&format!("create_clock -name c -period 2\n{lines}\n")).unwrap();
+            constraints_with(&s, &nl, &[lib()], None).map(|(sdc, _, _)| sdc.path_delays)
+        };
+        for (flat, nested) in [
+            ("set_false_path -from [get_ports {a c}] -to [get_ports {y z}]", "set_false_path -from [list [get_ports {a}] [list [get_ports c]]] -to [concat [get_ports y] [list [list [get_ports z]]]]"),
+            ("set_multicycle_path 2 -setup -from [get_ports {a c}]", "set_multicycle_path 2 -setup -from [list [list [get_ports a] [get_ports {c}]]]"),
+            ("set_false_path -through [get_pins {b/A e/A}]", "set_false_path -through [list [get_pins b/A] [list [get_pins e/A]]]"),
+            ("group_path -name g -from [get_ports {a c}]", "group_path -name g -from [list [get_ports a] [list [get_ports c]]]"),
+        ] {
+            let (f, n) = (read(flat).unwrap(), read(nested).unwrap());
+            assert!(!f.is_empty());
+            assert_eq!(format!("{f:?}"), format!("{n:?}"), "{nested}");
+        }
+        let e = read("set_false_path -from [list [get_ports a] c]").unwrap_err();
+        assert!(e.contains("not modelled"), "{e}");
+    }
+
     #[test]
     fn a_group_path_is_one_exception_of_every_min_max() {
         let d = vyges_loom::netlist::parse_compact("module t (a, y); input a; output y; BUF b (.A(a), .X(y)); endmodule\n").unwrap();
