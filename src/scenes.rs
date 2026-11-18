@@ -229,6 +229,173 @@ pub fn slew_blocked(g: &Graph<'_>, annotated: &[HashMap<String, f32>], scope: An
     }
 }
 
+/// One mode's constraints over a scene set: ONE `Sdc` (the mode's, as the reference keeps it per
+/// mode) and one SDC environment per scene (its libraries' drives, loads and units).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneConstraints {
+    pub sdc: crate::sdc::Sdc,
+    pub envs: Vec<crate::graph::SdcEnv>,
+    /// What the reading noted (each note once, in the order first seen).
+    pub notes: Vec<String>,
+}
+
+/// The design a scene set's constraints are read against: a netlist, or a design with its
+/// constant nets (`load::design`).
+#[cfg(feature = "loom")]
+#[derive(Debug, Clone, Copy)]
+pub enum DesignRef<'d> {
+    Netlist(&'d crate::netlist::Netlist),
+    Design(&'d crate::load::Design),
+}
+
+/// A loom-parsed SDC read for every scene (`scenes[k]`: scene k's libraries) with
+/// [`crate::load::constraints`] / [`crate::load::design_constraints`] as they stand: the one `Sdc`
+/// and each scene's environment, or the first refusal. Refused when two scenes read the SDC into
+/// different `Sdc` (one mode is one `Sdc`).
+#[cfg(feature = "loom")]
+pub fn scene_constraints(s: &vyges_loom::sdc::Sdc, d: DesignRef<'_>, scenes: &[&[Library]]) -> Result<SceneConstraints, String> {
+    let mut sdc: Option<crate::sdc::Sdc> = None;
+    let (mut envs, mut notes) = (Vec::with_capacity(scenes.len()), Vec::new());
+    for (k, libs) in scenes.iter().enumerate() {
+        let (sk, env, n) = match d {
+            DesignRef::Netlist(nl) => crate::load::constraints(s, nl, libs),
+            DesignRef::Design(x) => crate::load::design_constraints(s, x, libs),
+        }
+        .map_err(|e| format!("scene {k}: {e}"))?;
+        match &sdc {
+            None => sdc = Some(sk),
+            Some(first) if *first != sk => return Err(format!("scene {k}: the SDC reads differently than in scene 0 (one mode is one Sdc)")),
+            Some(_) => {}
+        }
+        envs.push(env);
+        for note in n {
+            if !notes.contains(&note) {
+                notes.push(note);
+            }
+        }
+    }
+    let sdc = sdc.ok_or("no scene to read the constraints for")?;
+    Ok(SceneConstraints { sdc, envs, notes })
+}
+
+/// One incremental timer over a scene set, held across reads as the reference's one `dbSta` is:
+/// the scenes' graphs (views of one structure, [`scene_views`]; scenes that cannot share it are
+/// built on their own), their timers (the first leads, the others follow:
+/// [`crate::incr::IncTimer::follow`]) and the mode's `Sdc`. The netlist is not edited between reads.
+pub struct SceneTimers<'a> {
+    pub graphs: Vec<Graph<'a>>,
+    pub incs: Vec<crate::incr::IncTimer>,
+    pub sdc: crate::sdc::Sdc,
+}
+
+impl<'a> SceneTimers<'a> {
+    /// The timers over `netlist` for every scene (`scenes[k]`: its libraries; the structure is built
+    /// over the link scene's), each graph with its scene's SDC environment. `pins`: the build's
+    /// master-pin filter ([`Graph::build_with_pins`]).
+    pub fn for_design(scenes: &[&'a [Library]], link_scene: usize, netlist: crate::graph::NetlistRef<'a>, pins: Option<&HashMap<String, Vec<String>>>, c: SceneConstraints) -> Result<SceneTimers<'a>, String> {
+        if scenes.is_empty() || scenes.len() != c.envs.len() || link_scene >= scenes.len() {
+            return Err(format!("{} scenes, {} SDC environments, link scene {link_scene}", scenes.len(), c.envs.len()));
+        }
+        let build = |libs: &'a [Library]| match &netlist {
+            crate::graph::NetlistRef::Borrowed(nl) => Graph::build_with_pins(libs, nl, pins),
+            crate::graph::NetlistRef::Shared(nl) => Graph::build_shared(libs, nl.clone(), pins),
+        };
+        let link = build(scenes[link_scene])?;
+        let mut graphs = match scene_views(link, link_scene, scenes) {
+            Ok(views) => views,
+            Err((link, _)) => {
+                let mut link = Some(link);
+                scenes.iter().enumerate().map(|(k, libs)| if k == link_scene { Ok(link.take().expect("the link scene once")) } else { build(libs) }).collect::<Result<Vec<_>, _>>()?
+            }
+        };
+        for (g, env) in graphs.iter_mut().zip(c.envs) {
+            g.sdc = env;
+        }
+        let mut incs: Vec<crate::incr::IncTimer> = Vec::with_capacity(graphs.len());
+        for _ in 0..graphs.len() {
+            let mut t = crate::incr::IncTimer::default();
+            match incs.first() {
+                Some(first) => t.follow(first),
+                None => t.track_netlist(&graphs[0].netlist),
+            }
+            incs.push(t);
+        }
+        Ok(SceneTimers { graphs, incs, sdc: c.sdc })
+    }
+
+    /// `Sta::delaysInvalidFrom(pin)` in every scene: a pin whose net was estimated again.
+    pub fn delays_invalid_from(&mut self, pin: &str) {
+        for inc in &mut self.incs {
+            inc.delays_invalid_from(pin);
+        }
+    }
+}
+
+/// `Sta::slack(net, max)` for every net of the timers' netlist (grt's `getNetSlack`): the
+/// fuzzily least max slack over the net's LOAD pins in its pin order, a load's being the least
+/// over its path array — every scene's paths, scene by scene, each scene's in its tag order (the
+/// reference's one tag group per vertex, `Tag::matchCmp`: scene, then rise/fall, then min/max).
+/// `par[k]` is scene k's parasitics. The first call times in full; a later one updates from what
+/// was invalidated since ([`SceneTimers::delays_invalid_from`]), as the resizer's timer does.
+pub fn net_slacks(par: &[&HashMap<String, crate::graph::NetParasitics>], t: &mut SceneTimers<'_>) -> Result<HashMap<String, f32>, String> {
+    if par.len() != t.graphs.len() {
+        return Err(format!("{} scenes, {} parasitic sets", t.graphs.len(), par.len()));
+    }
+    // `Sta::slack` → `findRequireds` → `findArrivals` → `findDelays`, each from the last read's state
+    for (inc, g) in t.incs.iter().zip(t.graphs.iter_mut()) {
+        inc.import(g);
+    }
+    crate::incr::find_delays_scenes(&mut t.incs, &mut t.graphs, par, None)?;
+    for (inc, g) in t.incs.iter_mut().zip(t.graphs.iter()) {
+        inc.export(g);
+    }
+    let mut searches: Vec<crate::search::Search<'_, '_>> = t.graphs.iter().map(|g| crate::search::Search::in_graph_order(g, &t.sdc)).collect();
+    for (inc, s) in t.incs.iter().zip(searches.iter_mut()) {
+        inc.import_paths(s);
+    }
+    crate::incr::find_arrivals_scenes(&mut t.incs, &mut searches, None)?;
+    crate::incr::find_requireds_scenes(&mut t.incs, &mut searches, None)?;
+    let g = &t.graphs[0];
+    let index = g.pin_index();
+    let mut name = String::new();
+    Ok(g.netlist
+        .nets
+        .iter()
+        .map(|n| {
+            let mut slack = crate::search::INF_SLACK;
+            for c in &n.pins {
+                name.clear();
+                let Some(&v) = index.get(g.netlist.pin_name_into(c, &mut name)) else { continue };
+                if g.vertices[v].is_driver {
+                    continue;
+                }
+                let s = scene_vertex_slack(&searches, v);
+                if crate::fuzzy::less(s, slack) {
+                    slack = s;
+                }
+            }
+            (n.name.clone(), slack)
+        })
+        .collect())
+}
+
+/// `Sta::slack(vertex, max)` over every scene's paths at `v`, scene by scene (the path array's
+/// order), fuzzily least: one scene is [`crate::search::Search::vertex_slack`].
+fn scene_vertex_slack(searches: &[crate::search::Search<'_, '_>], v: usize) -> f32 {
+    let mut slack = crate::search::INF_SLACK;
+    for s in searches {
+        for p in &s.paths[v] {
+            if p.tag.mm == MAX {
+                let x = p.required - p.arrival;
+                if crate::fuzzy::less(x, slack) {
+                    slack = x;
+                }
+            }
+        }
+    }
+    slack
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +559,129 @@ mod tests {
         assert_eq!((fold[0].get(&a), fold[0].get(&b)), (Some(&[false, true]), Some(&[true, false])));
         let own = slew_blocked(&views[1], &annotated, AnnotationScope::PerScene);
         assert_eq!((own[0].get(&a), own[0].get(&b), own[1].get(&b)), (Some(&[false, true]), None, Some(&[false, true])));
+    }
+
+    /// Ports a, b into x1; x1/Y to port y; a clock port clk on no net.
+    fn clocked() -> Netlist {
+        let mut nl = netlist();
+        nl.ports.push(("clk".into(), PortDir::Input));
+        nl
+    }
+
+    /// A clock of 2 ns on clk, 0.1 ns input and output delays on a, b and y.
+    fn sdc() -> crate::sdc::Sdc {
+        use crate::sdc::{Clock, PortDelay, Sdc};
+        Sdc { clocks: vec![Clock::new("clk", 2e-9, "clk", false)], input_delays: vec![PortDelay::uniform("a", 1e-10), PortDelay::uniform("b", 1e-10)], output_delays: vec![PortDelay::uniform("y", 1e-10)], path_delays: Vec::new() }
+    }
+
+    /// Net y's wire as an RC network of `cap` at each end.
+    fn wire(cap: f32) -> HashMap<String, crate::graph::NetParasitics> {
+        let net = crate::graph::NetParasitics { node_names: vec!["x1/Y".into(), "y".into()], network: crate::parasitics::Network { node_caps: vec![cap, cap], resistors: vec![(0, 1, 100.0)] }, ..Default::default() };
+        [("y".to_string(), net)].into()
+    }
+
+    fn timers<'a>(scenes: &[&'a [Library]], nl: &'a Netlist) -> SceneTimers<'a> {
+        let c = SceneConstraints { sdc: sdc(), envs: vec![crate::graph::SdcEnv::default(); scenes.len()], notes: Vec::new() };
+        SceneTimers::for_design(scenes, 0, crate::graph::NetlistRef::Borrowed(nl), None, c).unwrap()
+    }
+
+    /// The one-scene read as the router's timer makes it today (a graph built per read, one
+    /// incremental timer imported, timed, exported): the reference for one scene.
+    fn router_read(libs: &[Library], nl: &Netlist, par: &HashMap<String, crate::graph::NetParasitics>, inc: &mut crate::incr::IncTimer) -> HashMap<String, f32> {
+        let sdc = sdc();
+        let mut g = Graph::build(libs, nl).unwrap();
+        inc.import(&mut g);
+        inc.find_delays(&mut g, par, None).unwrap();
+        inc.export(&g);
+        let mut s = crate::search::Search::in_graph_order(&g, &sdc);
+        inc.import_paths(&mut s);
+        inc.find_arrivals(&mut s, None).unwrap();
+        inc.find_requireds(&mut s, None).unwrap();
+        let index: HashMap<String, usize> = (0..g.vertices.len()).map(|v| (g.vname(v), v)).collect();
+        nl.nets.iter().map(|n| (n.name.clone(), s.net_slack(&n.pins.iter().filter_map(|c| index.get(&nl.pin_name(c)).copied()).filter(|&v| !g.vertices[v].is_driver).collect::<Vec<_>>()))).collect()
+    }
+
+    /// One scene: every read, first and incremental, is the router's own timer's bit for bit.
+    #[test]
+    fn one_scene_net_slacks_are_the_router_timers() {
+        let slow = [lib("slow", true, 1.0)];
+        let nl = clocked();
+        let mut t = timers(&[&slow], &nl);
+        let mut inc = crate::incr::IncTimer::default();
+        let first = net_slacks(&[&HashMap::new()], &mut t).unwrap();
+        assert_eq!(first, router_read(&slow, &nl, &HashMap::new(), &mut inc));
+        assert!(first["y"] < 1.0, "net y is timed: {first:?}");
+        let par = wire(0.5e-12);
+        for pin in ["x1/Y", "y"] {
+            t.delays_invalid_from(pin);
+            inc.delays_invalid_from(pin);
+        }
+        let next = net_slacks(&[&par], &mut t).unwrap();
+        let bits = |m: &HashMap<String, f32>| m.iter().map(|(k, v)| (k.clone(), v.to_bits())).collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(bits(&next), bits(&router_read(&slow, &nl, &par, &mut inc)));
+        assert_ne!(next["y"], first["y"], "the wire moved net y's slack");
+    }
+
+    /// Rule (`Sta::slack(net)`: the least over the loads, each the least over its ONE path array
+    /// holding every scene's paths): three scenes read as the least of three one-scene timers.
+    #[test]
+    fn three_scenes_read_the_least_of_their_one_scene_slacks() {
+        let libs = [[lib("ss", true, 1.5)], [lib("tt", true, 1.0)], [lib("ff", false, 0.5)]];
+        let nl = clocked();
+        let scenes: Vec<&[Library]> = libs.iter().map(|l| &l[..]).collect();
+        let mut t = timers(&scenes, &nl);
+        assert!(t.incs[1..].iter().all(|i| i.levels.is_empty()), "the scenes' timers follow the first");
+        let all = net_slacks(&[&HashMap::new(); 3], &mut t).unwrap();
+        let each: Vec<HashMap<String, f32>> = libs.iter().map(|l| net_slacks(&[&HashMap::new()], &mut timers(&[&l[..]], &nl)).unwrap()).collect();
+        for (net, s) in &all {
+            let least = each.iter().map(|m| m[net]).fold(crate::search::INF_SLACK, f32::min);
+            assert_eq!(*s, least, "{net}");
+        }
+        assert_eq!(all["y"], each[0]["y"], "the slow scene is the worst");
+        assert_ne!(each[0]["y"], each[2]["y"]);
+    }
+
+    /// An incremental read after the caller invalidated a re-estimated net's pins equals a full
+    /// timing of the same parasitics.
+    #[test]
+    fn an_incremental_read_equals_a_full_one() {
+        let libs = [[lib("ss", true, 1.5)], [lib("ff", false, 0.5)]];
+        let nl = clocked();
+        let scenes: Vec<&[Library]> = libs.iter().map(|l| &l[..]).collect();
+        let mut t = timers(&scenes, &nl);
+        net_slacks(&[&HashMap::new(); 2], &mut t).unwrap();
+        let par = wire(0.5e-12);
+        for pin in ["x1/Y", "y"] {
+            t.delays_invalid_from(pin);
+        }
+        let inc = net_slacks(&[&par, &par], &mut t).unwrap();
+        let full = net_slacks(&[&par, &par], &mut timers(&scenes, &nl)).unwrap();
+        assert_eq!(inc, full);
+        let stale = {
+            let mut u = timers(&scenes, &nl);
+            net_slacks(&[&HashMap::new(); 2], &mut u).unwrap();
+            net_slacks(&[&par, &par], &mut u).unwrap()
+        };
+        assert_ne!(stale["y"], full["y"], "without the invalidation the read is stale (the test can fail)");
+    }
+
+    /// Every scene reads the SDC as `load::constraints` reads it for that scene alone; scenes that
+    /// read it into different `Sdc` (here another time unit) are refused, not merged.
+    #[cfg(feature = "loom")]
+    #[test]
+    fn scene_constraints_read_the_sdc_per_scene_as_one_mode() {
+        let (slow, fast) = ([lib("slow", true, 1.0)], [lib("fast", true, 0.5)]);
+        let nl = clocked();
+        let text = "create_clock -name clk -period 2 [get_ports clk]\nset_input_delay 0.1 -clock clk [get_ports {a b}]\nset_output_delay 0.1 -clock clk [get_ports y]\n";
+        let s = vyges_loom::sdc::Sdc::parse_with(text, &crate::load::sdc_design(&nl, &slow)).expect("the constraints read");
+        let c = scene_constraints(&s, DesignRef::Netlist(&nl), &[&slow, &fast]).unwrap();
+        let (one, env, _) = crate::load::constraints(&s, &nl, &fast).unwrap();
+        assert_eq!((&c.sdc, c.envs.len(), &c.envs[1]), (&one, 2, &env));
+        assert_eq!(c.sdc.clocks.len(), 1);
+        let mut ps = lib("ps", true, 1.0);
+        ps.time_scale = 1e-12;
+        let ps = [ps];
+        let why = scene_constraints(&s, DesignRef::Netlist(&nl), &[&slow, &ps]).unwrap_err();
+        assert!(why.contains("scene 1") && why.contains("one mode"), "{why}");
     }
 }
