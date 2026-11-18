@@ -131,9 +131,16 @@ pub fn scene_views<'a>(link: Graph<'a>, link_scene: usize, scenes: &[&'a [Librar
 /// then holds it alone, so nothing is copied), and each other view takes the edited structure
 /// back and replays the edit's per-scene array writes. On `Err` the views are unusable (the
 /// caller builds again), as one graph is after a failed edit.
-pub fn apply_edits<'a>(gs: &mut [Graph<'a>], link_scene: usize, edit: impl FnOnce(&mut Graph<'a>) -> Result<(), NotInPlace>) -> Result<(), NotInPlace> {
+///
+/// Graphs that do not share the link view's structure (each scene built on its own, when
+/// [`scene_views`] refused) are each edited by `edit`: their vertices name their own libraries'
+/// positions, so the link's structure is not theirs to take.
+pub fn apply_edits<'a>(gs: &mut [Graph<'a>], link_scene: usize, mut edit: impl FnMut(&mut Graph<'a>) -> Result<(), NotInPlace>) -> Result<(), NotInPlace> {
     if gs.len() <= 1 {
         return edit(&mut gs[0]);
+    }
+    if gs.iter().any(|g| !Arc::ptr_eq(&g.vertices, &gs[link_scene].vertices)) {
+        return gs.iter_mut().try_for_each(edit);
     }
     for (k, g) in gs.iter_mut().enumerate() {
         if k != link_scene {
@@ -535,6 +542,37 @@ mod tests {
                 assert!(views[k].delay[e].iter().all(|d| *d == [0.0; 2]), "scene {k} edge {e}: made, so 0");
             }
         }
+    }
+
+    /// Scenes built on their own (a library at another position: [`scene_views`] refuses) are
+    /// each edited on their own; none takes the link's structure, whose vertices name the link's
+    /// library positions. Witnessed on CoralNPU's ASAP7 scene 2 (a cell one library later than
+    /// in the link): taking the link structure there read a cell from the wrong library.
+    #[test]
+    fn scenes_built_on_their_own_are_each_edited_on_their_own() {
+        let mut spare = lib("spare", true, 3.0);
+        spare.cells.remove("xor2");
+        let slow = [lib("slow", true, 1.0)];
+        let fast = [spare, lib("fast", true, 0.5)];
+        let nl = Arc::new(netlist());
+        let link = Graph::build_shared(&slow, nl.clone(), None).unwrap();
+        let mut gs = match scene_views(link, 0, &[&slow, &fast]) {
+            Ok(_) => panic!("a library at another position is refused"),
+            Err((link, _)) => vec![link, Graph::build_shared(&fast, nl, None).unwrap()],
+        };
+        let mut next = netlist();
+        next.insts.push(crate::netlist::inst("b1", "buf"));
+        Arc::make_mut(&mut next.nets[2]).pins = vec![Conn::Inst(0, "Y".into()), Conn::Inst(1, "A".into())];
+        next.nets.push(Net { name: "y2".into(), pins: vec![Conn::Inst(1, "Y".into()), Conn::Port(2)] }.into());
+        let events: Vec<String> = ["inst_create|b1|buf", "net_create|y2", "iterm_connect|b1/A|y|x1/Y,y,b1/A", "iterm_connect|b1/Y|y2|b1/Y", "bterm_disconnect|y|y|x1/Y,y,b1/A", "bterm_connect|y|y2|b1/Y,y"].map(String::from).to_vec();
+        let next = Arc::new(next);
+        apply_edits(&mut gs, 0, |g| g.apply_edits(&events, next.clone(), None)).unwrap();
+        assert!(!Arc::ptr_eq(&gs[0].vertices, &gs[1].vertices), "each keeps its own structure");
+        for (k, libs) in [(0, &slow[..]), (1, &fast[..])] {
+            let fresh = Graph::build_shared(libs, next.clone(), None).unwrap();
+            assert_eq!(gs[k].differs_from_build(&fresh), None, "scene {k}");
+        }
+        assert_eq!(gate_edges(&gs[1]).iter().map(|e| e.2).collect::<Vec<_>>(), gate_edges(&Graph::build_shared(&fast, next, None).unwrap()).iter().map(|e| e.2).collect::<Vec<_>>());
     }
 
     /// Rule (#581, the pin's release): ONE set of annotation bits per vertex; a max annotation in
