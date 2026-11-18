@@ -163,7 +163,7 @@ impl<'a> Graph<'a> {
     /// cannot name.
     fn unusable_unless(&mut self, done: Result<(), NotInPlace>) -> Result<(), NotInPlace> {
         if done.is_err() {
-            self.vertices.clear();
+            self.vertices = Arc::default();
             self.index_cache.take();
         }
         done
@@ -186,7 +186,7 @@ impl<'a> Graph<'a> {
         self.patch_netlist(next, slots);
         // the kept slot map takes the slots replaced (a rename moves a name) and appended; a name
         // it then misses is on no net
-        if let Some(map) = self.net_slots.as_mut() {
+        if let Some(map) = super::uniq(&mut self.net_slots).as_mut() {
             for &k in &slots.nets {
                 if let Some(n) = self.netlist.nets.get(k) {
                     map.insert(n.name.clone(), k);
@@ -435,7 +435,7 @@ impl<'a> Graph<'a> {
     /// ([`Moves::at`]).
     fn shift_instances(&mut self, at: &[usize]) {
         let Some(&first) = at.first().filter(|&&p| p < self.netlist.insts.len()) else { return };
-        for v in &mut self.vertices {
+        for v in super::uniq(&mut self.vertices).iter_mut() {
             if let Conn::Inst(i, _) = &mut v.conn {
                 if *i >= first {
                     *i = shifted(at, *i);
@@ -456,14 +456,14 @@ impl<'a> Graph<'a> {
             }
         }
         if moves.moved {
-            for n in &mut self.vertex_net {
+            for n in super::uniq(&mut self.vertex_net).iter_mut() {
                 if let Some(k) = *n {
                     // a net the edits named: its vertices were just listed to be read again
                     *n = moves.map[k];
                 }
             }
         }
-        if let Some(slots) = self.net_slots.as_mut() {
+        if let Some(slots) = super::uniq(&mut self.net_slots).as_mut() {
             if moves.moved {
                 slots.retain(|_, k| match moves.map.get(*k).copied().flatten() {
                     Some(j) => {
@@ -513,10 +513,10 @@ impl<'a> Graph<'a> {
 
     /// `Graph::makeVertex`: the next vertex, its slews 0, on no net.
     fn make_vertex(&mut self, v: Vertex) -> usize {
-        self.vertices.push(v);
-        self.in_edges.push(Vec::new());
-        self.out_edges.push(Vec::new());
-        self.vertex_net.push(None);
+        super::uniq(&mut self.vertices).push(v);
+        super::uniq(&mut self.in_edges).push(Vec::new());
+        super::uniq(&mut self.out_edges).push(Vec::new());
+        super::uniq(&mut self.vertex_net).push(None);
         self.slew.push([[0.0; 2]; 2]);
         self.vertices.len() - 1
     }
@@ -542,33 +542,33 @@ impl<'a> Graph<'a> {
         let edge = Edge { from, to, kind };
         let e = match b.free.pop() {
             Some(e) => {
-                self.edges[e] = edge;
+                super::uniq(&mut self.edges)[e] = edge;
                 self.delay[e] = vec![[0.0; 2]; rows];
                 e
             }
             None => {
-                self.edges.push(edge);
+                super::uniq(&mut self.edges).push(edge);
                 self.delay.push(vec![[0.0; 2]; rows]);
                 self.edges.len() - 1
             }
         };
-        self.out_edges[from].push(e);
-        self.in_edges[to].push(e);
+        super::uniq(&mut self.out_edges)[from].push(e);
+        super::uniq(&mut self.in_edges)[to].push(e);
         e
     }
 
     /// `Graph::deleteEdge`: out of both lists (the rest keep their order), its id free.
     fn delete_edge(&mut self, e: usize, b: &mut Batch<'_>) {
         let Edge { from, to, .. } = self.edges[e];
-        self.out_edges[from].retain(|&x| x != e);
-        self.in_edges[to].retain(|&x| x != e);
+        super::uniq(&mut self.out_edges)[from].retain(|&x| x != e);
+        super::uniq(&mut self.in_edges)[to].retain(|&x| x != e);
         self.delay[e].clear();
         b.free.push(e);
         // `Levelize::deleteEdgeBefore`: a loop edge deleted makes the next levelization start
         // from scratch, loops broken again over the edited graph.
-        self.disabled_loops.remove(&e);
+        super::uniq(&mut self.disabled_loops).remove(&e);
         if self.loops.loop_edges.contains(&e) {
-            self.loops.stale = true;
+            super::uniq(&mut self.loops).stale = true;
         }
     }
 
@@ -659,8 +659,9 @@ impl<'a> Graph<'a> {
         }
         let to_name: Arc<str> = Arc::from(to);
         for &v in &vs {
-            self.vertices[v].lib = Some(tl);
-            self.vertices[v].cell = Some(to_name.clone());
+            let vx = &mut super::uniq(&mut self.vertices)[v];
+            vx.lib = Some(tl);
+            vx.cell = Some(to_name.clone());
         }
         b.swapped = vs;
         Ok(())
@@ -702,7 +703,7 @@ impl<'a> Graph<'a> {
         }
         found.extend(want.into_values().map(|v| (v, None)));
         for (v, n) in found {
-            self.vertex_net[v] = n;
+            super::uniq(&mut self.vertex_net)[v] = n;
         }
         Ok(())
     }
@@ -714,14 +715,14 @@ impl<'a> Graph<'a> {
     /// the map again (on picorv32 a miss came every twentieth edit, each a whole-map rebuild).
     fn named_net_slots(&mut self, names: &std::collections::HashSet<String>, old_nets: usize, look_for_misses: bool) -> Vec<usize> {
         let nets = &self.netlist.nets;
-        let map = match self.net_slots.as_mut() {
+        let map = match super::uniq(&mut self.net_slots).as_mut() {
             Some(map) => {
                 for (k, n) in nets.iter().enumerate().skip(old_nets) {
                     map.insert(n.name.clone(), k);
                 }
                 map
             }
-            None => self.net_slots.insert(nets.iter().enumerate().map(|(k, n)| (n.name.clone(), k)).collect()),
+            None => super::uniq(&mut self.net_slots).insert(nets.iter().enumerate().map(|(k, n)| (n.name.clone(), k)).collect()),
         };
         let held = |map: &HashMap<String, usize>, name: &String| map.get(name).copied().filter(|&k| nets.get(k).is_some_and(|n| &n.name == name));
         let mut missed: Vec<&String> = if look_for_misses { names.iter().filter(|name| held(map, name).is_none()).collect() } else { Vec::new() };

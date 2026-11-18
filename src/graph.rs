@@ -23,6 +23,7 @@
 //! A merge only combines the arcs of one driver, so any topological order serves for levels.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::dcalc::{dspf_wire_delay_slew, threshold_adjust, Dmp, LibThresholds, Thresholds};
 use crate::liberty::{Cell, Direction, Library, Model, Role, FALL, MAX, MIN, RISE};
@@ -36,6 +37,13 @@ fn slew_blocked_by(blocked: &Option<std::sync::Arc<HashMap<usize, [bool; 2]>>>, 
         Some(b) => b.get(&v).is_some_and(|x| x[mm]),
         None => mm == MAX && annotated.contains_key(&v),
     }
+}
+
+/// The structure behind `a`, to edit: only where this view is its one holder. A structure shared by
+/// scene views is edited through the scene set, which holds it alone while it edits; a second
+/// holder here is a bug, not a copy to make.
+pub(crate) fn uniq<T>(a: &mut Arc<T>) -> &mut T {
+    Arc::get_mut(a).expect("a graph structure shared by scene views is edited only through its scene set")
 }
 
 mod edit;
@@ -130,12 +138,16 @@ pub const DERATE_DATA: usize = 1;
 pub struct Graph<'a> {
     pub libs: &'a [Library],
     pub netlist: NetlistRef<'a>,
-    pub vertices: Vec<Vertex>,
-    pub edges: Vec<Edge>,
-    pub in_edges: Vec<Vec<usize>>,
-    pub out_edges: Vec<Vec<usize>>,
+    /// 🔑 The STRUCTURE (vertices, edges, edge lists, nets, loop breaking, the name index) is held
+    /// by `Arc`: the scenes of one design share it, as the reference's scenes share its one
+    /// `Graph` and keep only their slews and arc delays apart (`ap_index`). Edited only where no
+    /// other view holds it ([`uniq`]: a shared structure is never copied behind the caller's back).
+    pub vertices: Arc<Vec<Vertex>>,
+    pub edges: Arc<Vec<Edge>>,
+    pub in_edges: Arc<Vec<Vec<usize>>>,
+    pub out_edges: Arc<Vec<Vec<usize>>>,
     /// The net each vertex is on, if any.
-    pub vertex_net: Vec<Option<usize>>,
+    pub vertex_net: Arc<Vec<Option<usize>>>,
     /// `slew[v][rf][min/max]`.
     pub slew: Vec<[[f32; 2]; 2]>,
     /// Per edge: gate arcs `[arc][min/max]`; wire edges `[rf][min/max]`.
@@ -182,17 +194,17 @@ pub struct Graph<'a> {
     /// The edges from a bidirect pin's driver vertex into its instance (`isBidirectInstPath`,
     /// whole graph only): levelization and the activity search skip them
     /// (`bidirect_inst_paths_enabled` is off by default); delay calculation reads them.
-    pub bidirect_inst_paths: std::collections::HashSet<usize>,
+    pub bidirect_inst_paths: Arc<std::collections::HashSet<usize>>,
     /// The wire edge from a bidirect top port's load vertex to its driver vertex
     /// (`isBidirectPortPath`, whole graph only): levelization skips it, so the driver is a root;
     /// the activity search crosses it.
-    pub bidirect_port_paths: std::collections::HashSet<usize>,
+    pub bidirect_port_paths: Arc<std::collections::HashSet<usize>>,
     /// `Levelize::disabled_loop_edges_`: the edges loop breaking disabled ([`Graph::break_loops`],
     /// at the build) — every edge closing a combinational loop. Levelization, delay calculation
     /// and the searches pass over them as the reference's predicates do (`isDisabledLoop`).
-    pub disabled_loops: std::collections::HashSet<usize>,
+    pub disabled_loops: Arc<std::collections::HashSet<usize>>,
     /// The whole loop breaking: the disabled edges in the order found, the loops, `loop_edges_`.
-    pub loops: crate::levelize::LoopBreaking,
+    pub loops: Arc<crate::levelize::LoopBreaking>,
     /// Every vertex's index by name, built on first use: the vertices never change once the graph
     /// is built, and [`Graph::load_cap`] and its kin are called per driver by a repair loop.
     /// Shared, so a caller holding it ([`Graph::pin_index`]) does not copy every name.
@@ -200,7 +212,7 @@ pub struct Graph<'a> {
     /// Each net's slot in [`Graph::netlist`] by name, kept across in-place edits (an edit replaces
     /// nets in their slots or appends them): [`Graph::apply_edits`] finds the nets its edits named
     /// without a pass over every net. Checked by name at each slot read; made again on a miss.
-    net_slots: Option<HashMap<String, usize>>,
+    net_slots: Arc<Option<HashMap<String, usize>>>,
     /// The caller's: how far into its log of netlist edits this graph is ([`Graph::apply_edits`]
     /// brings it on). `None` from a build — not known, so a caller builds again.
     pub edit_seq: Option<usize>,
@@ -362,6 +374,8 @@ impl<'a> Graph<'a> {
     pub fn recycle(self) {
         let (insts, ports) = (self.netlist.insts.clone(), self.netlist.ports.clone());
         let Graph { vertices, edges, in_edges, out_edges, delay, index_cache, .. } = self;
+        // a structure another scene view still holds is that view's to recycle: nothing is taken
+        let (Ok(vertices), Ok(edges), Ok(in_edges), Ok(out_edges)) = (Arc::try_unwrap(vertices), Arc::try_unwrap(edges), Arc::try_unwrap(in_edges), Arc::try_unwrap(out_edges)) else { return };
         let mut ic = index_cache;
         let spare = Spare { vertices, edges, in_edges, out_edges, delay, index: ic.take(), insts, ports };
         SPARES.with(|p| {
@@ -749,7 +763,7 @@ impl<'a> Graph<'a> {
                 let _ = index_cache.set(std::sync::Arc::new(map));
             }
         }
-        Some(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: std::collections::HashSet::new(), bidirect_port_paths, disabled_loops: std::collections::HashSet::new(), loops: Default::default(), index_cache, net_slots: None, edit_seq: None, state_seq: None }.with_loops_broken())
+        Some(Graph { libs, netlist: keep, vertices: Arc::new(vertices), edges: Arc::new(edges), in_edges: Arc::new(in_edges), out_edges: Arc::new(out_edges), vertex_net: Arc::new(vertex_net), slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: Default::default(), bidirect_port_paths: Arc::new(bidirect_port_paths), disabled_loops: Default::default(), loops: Default::default(), index_cache, net_slots: Default::default(), edit_seq: None, state_seq: None }.with_loops_broken())
     }
 
     /// [`Graph::build_with_pins`] with each pin found by its name.
@@ -982,7 +996,7 @@ impl<'a> Graph<'a> {
                 EdgeKind::Wire => vec![[0.0f32; 2]; 2],
             })
             .collect();
-        Ok(Graph { libs, netlist: keep, vertices, edges, in_edges, out_edges, vertex_net, slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths, bidirect_port_paths, disabled_loops: std::collections::HashSet::new(), loops: Default::default(), index_cache: std::sync::OnceLock::new(), net_slots: None, edit_seq: None, state_seq: None }.with_loops_broken())
+        Ok(Graph { libs, netlist: keep, vertices: Arc::new(vertices), edges: Arc::new(edges), in_edges: Arc::new(in_edges), out_edges: Arc::new(out_edges), vertex_net: Arc::new(vertex_net), slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: Arc::new(bidirect_inst_paths), bidirect_port_paths: Arc::new(bidirect_port_paths), disabled_loops: Default::default(), loops: Default::default(), index_cache: std::sync::OnceLock::new(), net_slots: Default::default(), edit_seq: None, state_seq: None }.with_loops_broken())
     }
 
     /// Whether vertex `v` is a top-level port's (an instance's vertex may have no library too:
@@ -1046,8 +1060,8 @@ impl<'a> Graph<'a> {
     /// reference levelizes once and keeps the disabled edges until a loop edge is deleted.
     pub fn break_loops(&mut self) {
         let lb = crate::levelize::break_loops(&LevelizeView(self));
-        self.disabled_loops = lb.disabled.iter().copied().collect();
-        self.loops = lb;
+        self.disabled_loops = Arc::new(lb.disabled.iter().copied().collect());
+        self.loops = Arc::new(lb);
     }
 
     /// `Levelize::isDisabledLoop`.
