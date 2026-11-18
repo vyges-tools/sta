@@ -518,6 +518,9 @@ impl<'a> Graph<'a> {
         super::uniq(&mut self.out_edges).push(Vec::new());
         super::uniq(&mut self.vertex_net).push(None);
         self.slew.push([[0.0; 2]; 2]);
+        if let Some(ops) = &mut self.array_ops {
+            ops.push(crate::scenes::ArrayOp::Vertex);
+        }
         self.vertices.len() - 1
     }
 
@@ -554,6 +557,9 @@ impl<'a> Graph<'a> {
         };
         super::uniq(&mut self.out_edges)[from].push(e);
         super::uniq(&mut self.in_edges)[to].push(e);
+        if let Some(ops) = &mut self.array_ops {
+            ops.push(crate::scenes::ArrayOp::Edge(e, rows));
+        }
         e
     }
 
@@ -563,6 +569,9 @@ impl<'a> Graph<'a> {
         super::uniq(&mut self.out_edges)[from].retain(|&x| x != e);
         super::uniq(&mut self.in_edges)[to].retain(|&x| x != e);
         self.delay[e].clear();
+        if let Some(ops) = &mut self.array_ops {
+            ops.push(crate::scenes::ArrayOp::DeleteEdge(e));
+        }
         b.free.push(e);
         // `Levelize::deleteEdgeBefore`: a loop edge deleted makes the next levelization start
         // from scratch, loops broken again over the edited graph.

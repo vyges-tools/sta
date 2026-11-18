@@ -489,7 +489,7 @@ fn sim_edges(graph: &Graph<'_>) -> SimEdges {
         let to = &graph.vertices[ed.to];
         let (Some(lib), Some(cell_name)) = (to.lib, to.cell.as_deref()) else { continue };
         let cell = &graph.libs[lib].cells[cell_name];
-        let arc_set = &cell.arc_sets[set];
+        let arc_set = &cell.arc_sets[graph.scene_set(lib, cell_name, set)];
         let fixed = |p: &str| constants.get(&format!("{inst}/{p}")).copied();
         let parse = |f: &str| crate::func_expr::FuncExpr::parse(f).ok();
         let sense = if graph.is_constant(ed.from) {

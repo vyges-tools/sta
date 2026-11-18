@@ -213,6 +213,13 @@ pub struct Graph<'a> {
     /// nets in their slots or appends them): [`Graph::apply_edits`] finds the nets its edits named
     /// without a pass over every net. Checked by name at each slot read; made again on a miss.
     net_slots: Arc<Option<HashMap<String, usize>>>,
+    /// A scene view's arc sets ([`crate::scenes`]): the structure's edges carry the LINK cell's
+    /// set index, and this scene times through its own cell's set of the same key
+    /// (`TimingArc::sceneArc`). `None`: the graph's sets are its own (a one-scene graph, the link view).
+    pub(crate) scene_sets: Option<Arc<crate::scenes::SceneSets>>,
+    /// While a scene set edits its structure through this view: each per-scene array write, in
+    /// order, for the other views to replay ([`crate::scenes::apply_edits`]).
+    pub(crate) array_ops: Option<Vec<crate::scenes::ArrayOp>>,
     /// The caller's: how far into its log of netlist edits this graph is ([`Graph::apply_edits`]
     /// brings it on). `None` from a build — not known, so a caller builds again.
     pub edit_seq: Option<usize>,
@@ -376,6 +383,10 @@ impl<'a> Graph<'a> {
         let Graph { vertices, edges, in_edges, out_edges, delay, index_cache, .. } = self;
         // a structure another scene view still holds is that view's to recycle: nothing is taken
         let (Ok(vertices), Ok(edges), Ok(in_edges), Ok(out_edges)) = (Arc::try_unwrap(vertices), Arc::try_unwrap(edges), Arc::try_unwrap(in_edges), Arc::try_unwrap(out_edges)) else { return };
+        // a view that let go of its structure (a failed scene-set edit) has nothing to keep
+        if vertices.is_empty() {
+            return;
+        }
         let mut ic = index_cache;
         let spare = Spare { vertices, edges, in_edges, out_edges, delay, index: ic.take(), insts, ports };
         SPARES.with(|p| {
@@ -763,7 +774,7 @@ impl<'a> Graph<'a> {
                 let _ = index_cache.set(std::sync::Arc::new(map));
             }
         }
-        Some(Graph { libs, netlist: keep, vertices: Arc::new(vertices), edges: Arc::new(edges), in_edges: Arc::new(in_edges), out_edges: Arc::new(out_edges), vertex_net: Arc::new(vertex_net), slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: Default::default(), bidirect_port_paths: Arc::new(bidirect_port_paths), disabled_loops: Default::default(), loops: Default::default(), index_cache, net_slots: Default::default(), edit_seq: None, state_seq: None }.with_loops_broken())
+        Some(Graph { libs, netlist: keep, vertices: Arc::new(vertices), edges: Arc::new(edges), in_edges: Arc::new(in_edges), out_edges: Arc::new(out_edges), vertex_net: Arc::new(vertex_net), slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: Default::default(), bidirect_port_paths: Arc::new(bidirect_port_paths), disabled_loops: Default::default(), loops: Default::default(), index_cache, net_slots: Default::default(), scene_sets: None, array_ops: None, edit_seq: None, state_seq: None }.with_loops_broken())
     }
 
     /// [`Graph::build_with_pins`] with each pin found by its name.
@@ -996,7 +1007,7 @@ impl<'a> Graph<'a> {
                 EdgeKind::Wire => vec![[0.0f32; 2]; 2],
             })
             .collect();
-        Ok(Graph { libs, netlist: keep, vertices: Arc::new(vertices), edges: Arc::new(edges), in_edges: Arc::new(in_edges), out_edges: Arc::new(out_edges), vertex_net: Arc::new(vertex_net), slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: Arc::new(bidirect_inst_paths), bidirect_port_paths: Arc::new(bidirect_port_paths), disabled_loops: Default::default(), loops: Default::default(), index_cache: std::sync::OnceLock::new(), net_slots: Default::default(), edit_seq: None, state_seq: None }.with_loops_broken())
+        Ok(Graph { libs, netlist: keep, vertices: Arc::new(vertices), edges: Arc::new(edges), in_edges: Arc::new(in_edges), out_edges: Arc::new(out_edges), vertex_net: Arc::new(vertex_net), slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: Arc::new(bidirect_inst_paths), bidirect_port_paths: Arc::new(bidirect_port_paths), disabled_loops: Default::default(), loops: Default::default(), index_cache: std::sync::OnceLock::new(), net_slots: Default::default(), scene_sets: None, array_ops: None, edit_seq: None, state_seq: None }.with_loops_broken())
     }
 
     /// Whether vertex `v` is a top-level port's (an instance's vertex may have no library too:
@@ -1035,12 +1046,100 @@ impl<'a> Graph<'a> {
             if let (Conn::Inst(fi, _), Conn::Inst(ti, _)) = (&from.conn, &v.conn) {
                 if fi == ti && from.is_driver {
                     if let Some((lib, name)) = self.stale_out_arcs.get(&self.netlist.insts[*ti].0) {
-                        return &cell(self.libs, *lib, name).arc_sets[set];
+                        return &cell(self.libs, *lib, name).arc_sets[self.scene_set(*lib, name, set)];
                     }
                 }
             }
         }
-        &cell(self.libs, v.lib.unwrap(), v.cell.as_deref().unwrap()).arc_sets[set]
+        let (lib, name) = (v.lib.unwrap(), v.cell.as_deref().unwrap());
+        &cell(self.libs, lib, name).arc_sets[self.scene_set(lib, name, set)]
+    }
+
+    /// The index in THIS graph's cell `name` (library `lib`) of the arc set an edge carries as
+    /// `set`: the same index, but in a scene view whose cell lists its sets in another order than
+    /// the link cell (`LibertyLibrary::makeSceneMap`, [`crate::scenes`]).
+    pub fn scene_set(&self, lib: usize, name: &str, set: usize) -> usize {
+        match &self.scene_sets {
+            Some(m) => m.get(lib, name, set),
+            None => set,
+        }
+    }
+
+    /// A view of this graph's structure for another scene ([`crate::scenes::scene_views`]): the
+    /// structure, netlist and name index SHARED (no copy), the scene's libraries and arc-set map, and
+    /// per-scene arrays as a fresh build leaves them (slews 0, each edge's delay row of its arcs, 0).
+    pub(crate) fn scene_view(&self, libs: &'a [Library], scene_sets: Option<Arc<crate::scenes::SceneSets>>) -> Graph<'a> {
+        let index_cache = std::sync::OnceLock::new();
+        if let Some(ix) = self.index_cache.get() {
+            let _ = index_cache.set(ix.clone());
+        }
+        Graph {
+            libs,
+            netlist: self.netlist.clone(),
+            vertices: self.vertices.clone(),
+            edges: self.edges.clone(),
+            in_edges: self.in_edges.clone(),
+            out_edges: self.out_edges.clone(),
+            vertex_net: self.vertex_net.clone(),
+            slew: vec![[[0.0; 2]; 2]; self.vertices.len()],
+            delay: self.delay.iter().map(|r| vec![[0.0; 2]; r.len()]).collect(),
+            slew_limit: HashMap::new(),
+            clamped: Vec::new(),
+            slew_annotated: HashMap::new(),
+            slew_blocked: None,
+            sdc: SdcEnv::default(),
+            pin_cap_cell: HashMap::new(),
+            ideal_clock: std::collections::HashSet::new(),
+            ideal_clock_slew: HashMap::new(),
+            stale_out_arcs: HashMap::new(),
+            bidirect_inst_paths: self.bidirect_inst_paths.clone(),
+            bidirect_port_paths: self.bidirect_port_paths.clone(),
+            disabled_loops: self.disabled_loops.clone(),
+            loops: self.loops.clone(),
+            index_cache,
+            net_slots: self.net_slots.clone(),
+            scene_sets,
+            array_ops: None,
+            edit_seq: None,
+            state_seq: None,
+        }
+    }
+
+    /// This view lets go of the shared structure, netlist and name index (a scene set edits them
+    /// through one view, which must hold them alone); [`Graph::reattach`] takes them back.
+    pub(crate) fn detach(&mut self) {
+        static NONE: std::sync::OnceLock<Netlist> = std::sync::OnceLock::new();
+        self.vertices = Arc::default();
+        self.edges = Arc::default();
+        self.in_edges = Arc::default();
+        self.out_edges = Arc::default();
+        self.vertex_net = Arc::default();
+        self.bidirect_inst_paths = Arc::default();
+        self.bidirect_port_paths = Arc::default();
+        self.disabled_loops = Arc::default();
+        self.loops = Arc::default();
+        self.net_slots = Arc::default();
+        self.index_cache = std::sync::OnceLock::new();
+        self.netlist = NetlistRef::Borrowed(NONE.get_or_init(Netlist::default));
+    }
+
+    /// The structure, netlist and name index of `from` (the view that edited them), shared again.
+    pub(crate) fn reattach(&mut self, from: &Graph<'a>) {
+        self.netlist = from.netlist.clone();
+        self.vertices = from.vertices.clone();
+        self.edges = from.edges.clone();
+        self.in_edges = from.in_edges.clone();
+        self.out_edges = from.out_edges.clone();
+        self.vertex_net = from.vertex_net.clone();
+        self.bidirect_inst_paths = from.bidirect_inst_paths.clone();
+        self.bidirect_port_paths = from.bidirect_port_paths.clone();
+        self.disabled_loops = from.disabled_loops.clone();
+        self.loops = from.loops.clone();
+        self.net_slots = from.net_slots.clone();
+        self.index_cache = std::sync::OnceLock::new();
+        if let Some(ix) = from.index_cache.get() {
+            let _ = self.index_cache.set(ix.clone());
+        }
     }
 
     /// [`Graph::stale_out_arcs`] from instance → cell name, each cell found in the graph's libraries
