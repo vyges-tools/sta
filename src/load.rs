@@ -404,16 +404,15 @@ fn constraints_with(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library], co
     clock_uncertainties(&uncertainties, &mut sdc.clocks, lib0.time_scale)?;
     clock_groups(&groups, &mut sdc.clocks)?;
     clock_transitions(&s.clock_transitions, &mut sdc.clocks, lib0.time_scale, &mut notes)?;
-    let falses = timing_exceptions(&exceptions, &s, nl)?;
+    let falses = timing_exceptions_made(&exceptions, &s, nl)?;
     if !falses.is_empty() && !sdc.path_delays.is_empty() {
         return Err("set_false_path / set_multicycle_path with set_max_delay / set_min_delay: not modelled (the ids across them are the order they were made in)".into());
     }
-    sdc.path_delays.extend(falses);
-    let groups = group_paths(&group_cmds, &s, nl)?;
+    let groups = group_paths_made(&group_cmds, &s, nl)?;
     if !groups.is_empty() && !sdc.path_delays.is_empty() {
-        return Err("group_path with set_false_path / set_multicycle_path / set_max_delay / set_min_delay: not modelled (the ids across them are the order they were made in)".into());
+        return Err("group_path with set_max_delay / set_min_delay: not modelled (the ids across them are the order they were made in)".into());
     }
-    sdc.path_delays.extend(groups);
+    sdc.path_delays.extend(in_creation_order(falses, groups)?);
     let mut env = sdc_env(&s, libs, nl)?;
     env.derates = derates;
     if let Some(constant_nets) = constant_nets {
@@ -708,6 +707,26 @@ fn pin_objects(what: &str, names: &[String], pins: Option<&ConnectedPins<'_>>) -
     Ok(out)
 }
 
+/// The false and multicycle paths and the group paths as ONE list, in the order their commands
+/// made them: the reference numbers every exception as it is made, whatever its type
+/// (`Sdc::recordException`), and that number is the exception's id here (its index in
+/// [`crate::sdc::Sdc::path_delays`]). A false path of both checks is two entries here (one per
+/// min/max) and one exception there: they stay together, at its place. Of one kind alone the
+/// list is as read. Mixed, an exception with no creation number (left by `-reset_path`, which the
+/// reference re-adds at the reset and may merge) is refused.
+fn in_creation_order(falses: Vec<(Option<usize>, crate::sdc::PathDelay)>, groups: Vec<(Option<usize>, crate::sdc::PathDelay)>) -> Result<Vec<crate::sdc::PathDelay>, String> {
+    if falses.is_empty() || groups.is_empty() {
+        return Ok(falses.into_iter().chain(groups).map(|(_, p)| p).collect());
+    }
+    if falses.iter().chain(&groups).any(|(seq, _)| seq.is_none()) {
+        return Err("group_path with an exception left by set_false_path / set_multicycle_path -reset_path: not modelled (the reference re-adds those at the reset, and may merge them)".into());
+    }
+    let mut all: Vec<(Option<usize>, crate::sdc::PathDelay)> = falses.into_iter().chain(groups).collect();
+    // stable: the two entries of one false path keep their order
+    all.sort_by_key(|(seq, _)| *seq);
+    Ok(all.into_iter().map(|(_, p)| p).collect())
+}
+
 /// Every `set_false_path` (`FalsePath`) and `set_multicycle_path` (`MultiCyclePath`) as the
 /// reference makes it, in file order: `-from` and `-to` on ports or pins (patterns matched against
 /// the netlist, as `get_ports` / `get_pins` do) or on the one clock. A false path of `-setup` alone
@@ -715,8 +734,15 @@ fn pin_objects(what: &str, names: &[String], pins: Option<&ConnectedPins<'_>>) -
 /// exception of `-setup`, `-hold` or neither (`set_multicycle_path` in `Sdc.tcl`: `-end` unless
 /// `-hold` alone or `-start`). Each `-through` is a point, in order ([`thru_point`]). The edge
 /// forms (`-rise_from`, `-rise_through`, `-rise`, …), `-reset_path`, instances on `-from` / `-to`
-/// and several clocks are refused.
+/// and several clocks are refused. (The tests read it; the loader takes [`timing_exceptions_made`].)
+#[cfg(test)]
 fn timing_exceptions(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc, nl: &Netlist) -> Result<Vec<crate::sdc::PathDelay>, String> {
+    Ok(timing_exceptions_made(es, s, nl)?.into_iter().map(|(_, p)| p).collect())
+}
+
+/// Every false and multicycle path as `timing_exceptions` reads it, each with the creation number of the command that made it
+/// (`vyges_loom::sdc::Exception::seq`).
+fn timing_exceptions_made(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc, nl: &Netlist) -> Result<Vec<(Option<usize>, crate::sdc::PathDelay)>, String> {
     use crate::liberty::{MAX, MIN};
     let pins = connected_pins(nl);
     let mut out = Vec::new();
@@ -773,7 +799,7 @@ fn timing_exceptions(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc
                 return Err("set_multicycle_path: cannot use -start with -end (446)".into());
             }
             let use_end_clk = if has("-start") { false } else if has("-end") { true } else { !(hold && !setup) };
-            out.push(crate::sdc::PathDelay {
+            out.push((e.seq, crate::sdc::PathDelay {
                 from_pins,
                 from_clock,
                 to_pins,
@@ -786,7 +812,7 @@ fn timing_exceptions(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc
                 multicycle: Some(crate::sdc::Multicycle { multiplier: n, use_end_clk, all: setup == hold }),
                 thrus,
                 group: None,
-            });
+            }));
             continue;
         }
         let mms: &[usize] = match (has("-setup"), has("-hold")) {
@@ -795,7 +821,7 @@ fn timing_exceptions(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc
             _ => &[MIN, MAX],
         };
         for &mm in mms {
-            out.push(crate::sdc::PathDelay {
+            out.push((e.seq, crate::sdc::PathDelay {
                 from_pins: from_pins.clone(),
                 from_clock,
                 to_pins: to_pins.clone(),
@@ -808,7 +834,7 @@ fn timing_exceptions(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc
                 multicycle: None,
                 thrus: thrus.clone(),
                 group: None,
-            });
+            }));
         }
     }
     Ok(out)
@@ -822,9 +848,14 @@ fn timing_exceptions(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc
 /// delay group), the edge forms and `-rise` / `-fall`, two of one name (`addException` would merge
 /// them), a side that matches nothing, and no point at all.
 fn group_paths(xs: &[vyges_loom::sdc::ExceptionCmd], s: &vyges_loom::sdc::Sdc, nl: &Netlist) -> Result<Vec<crate::sdc::PathDelay>, String> {
+    Ok(group_paths_made(xs, s, nl)?.into_iter().map(|(_, p)| p).collect())
+}
+
+/// [`group_paths`], each with the creation number of its command (`ExceptionCmd::seq`).
+fn group_paths_made(xs: &[vyges_loom::sdc::ExceptionCmd], s: &vyges_loom::sdc::Sdc, nl: &Netlist) -> Result<Vec<(Option<usize>, crate::sdc::PathDelay)>, String> {
     use crate::liberty::MAX;
     let pins = connected_pins(nl);
-    let mut out: Vec<crate::sdc::PathDelay> = Vec::new();
+    let mut out: Vec<(Option<usize>, crate::sdc::PathDelay)> = Vec::new();
     for x in xs.iter().filter(|x| x.cmd == "group_path") {
         if x.default {
             return Err("group_path -default: not modelled".into());
@@ -836,7 +867,7 @@ fn group_paths(xs: &[vyges_loom::sdc::ExceptionCmd], s: &vyges_loom::sdc::Sdc, n
         if let Some((f, _)) = x.args.iter().find(|(f, _)| f != "-from" && f != "-to" && f != "-through") {
             return Err(format!("group_path {f}: not modelled"));
         }
-        if out.iter().any(|g| g.group.as_deref() == Some(name.as_str())) {
+        if out.iter().any(|(_, g)| g.group.as_deref() == Some(name.as_str())) {
             return Err(format!("group_path -name {name} twice: not modelled (the reference merges them)"));
         }
         let thrus = x.args.iter().filter(|(f, _)| f == "-through").map(|(_, o)| thru_point("group_path", o, nl, &pins)).collect::<Result<Vec<_>, _>>()?;
@@ -877,7 +908,7 @@ fn group_paths(xs: &[vyges_loom::sdc::ExceptionCmd], s: &vyges_loom::sdc::Sdc, n
         if from_pins.is_empty() && !from_clock && to_pins.is_empty() && !to_clock && thrus.is_empty() {
             return Err(format!("group_path -name {name} with no -from / -through / -to: not modelled"));
         }
-        out.push(crate::sdc::PathDelay {
+        out.push((x.seq, crate::sdc::PathDelay {
             from_pins,
             from_clock,
             to_pins,
@@ -890,7 +921,7 @@ fn group_paths(xs: &[vyges_loom::sdc::ExceptionCmd], s: &vyges_loom::sdc::Sdc, n
             multicycle: None,
             thrus,
             group: Some(name.clone()),
-        });
+        }));
     }
     Ok(out)
 }
@@ -1663,6 +1694,39 @@ pub fn path_delays(s: &vyges_loom::sdc::Sdc, nl: Option<&Netlist>, time_scale: f
 mod tests {
     use super::*;
 
+    /// Upstream rule (`Sdc::recordException`: `setId(++exception_id_)` whatever the type; a
+    /// trace of the reference on `group_false_path.sdc` numbers group, false, group, false,
+    /// multicycle, group, false, group, false 1..9 in file order): false / multicycle paths and
+    /// group paths are ONE list in the order their commands made them. A false path of both
+    /// checks (two entries here, one exception there) stays together at its place.
+    #[test]
+    fn false_and_group_paths_are_one_list_in_creation_order() {
+        let pd = |tag: &str, mm: usize, group: bool| crate::sdc::PathDelay {
+            from_pins: vec![tag.to_string()],
+            from_clock: false,
+            to_pins: Vec::new(),
+            to_clock: false,
+            min_max: mm,
+            ignore_clk_latency: false,
+            break_path: false,
+            delay: 0.0,
+            false_path: !group,
+            multicycle: None,
+            thrus: Vec::new(),
+            group: group.then(|| tag.to_string()),
+        };
+        let falses = vec![(Some(2), pd("f2", 0, false)), (Some(2), pd("f2", 1, false)), (Some(5), pd("f5", 1, false))];
+        let groups = vec![(Some(1), pd("g1", 1, true)), (Some(3), pd("g3", 1, true)), (Some(6), pd("g6", 1, true))];
+        let order: Vec<(String, usize)> = in_creation_order(falses, groups).expect("all made by commands").into_iter().map(|p| (p.from_pins[0].clone(), p.min_max)).collect();
+        let want = [("g1", 1), ("f2", 0), ("f2", 1), ("g3", 1), ("f5", 1), ("g6", 1)];
+        assert_eq!(order, want.map(|(t, m)| (t.to_string(), m)), "creation order, a two-check false path's entries together");
+        // one kind alone: as read, numbers or not
+        let alone = in_creation_order(vec![(None, pd("f", 1, false)), (Some(1), pd("f1", 1, false))], Vec::new()).expect("one kind");
+        assert_eq!(alone.iter().map(|p| p.from_pins[0].as_str()).collect::<Vec<_>>(), ["f", "f1"]);
+        // mixed with what a -reset_path left (re-added at the reset there): refused
+        assert!(in_creation_order(vec![(None, pd("f", 1, false))], vec![(Some(1), pd("g", 1, true))]).is_err());
+    }
+
     fn lib() -> Library {
         let text = "library (t) { time_unit : \"1ns\"; capacitive_load_unit (1, pf);\n\
             cell (BUF) { pin (A) { direction : input; capacitance : 0.001; }\n\
@@ -1760,8 +1824,8 @@ mod tests {
 
     /// Rules (`Sdc::makeGroupPath`, `group_path` in the reference's `sdc/Sdc.tcl`): a named group
     /// path is one exception of every min/max, its sides ports, pins or `[list …]` of them; the
-    /// ids across it and the other exceptions are the order they were made in, which the file may
-    /// not keep, so it is refused beside them. `-weight` is read and ignored; `-default`, a second
+    /// ids across it and the other exceptions are the order they were made in — kept beside false
+    /// and multicycle paths, still refused beside a path delay. `-weight` is read and ignored; `-default`, a second
     /// group of one name (merged by `addException`), a side matching nothing and
     /// `set_path_margin` are refused.
     #[test]
@@ -1781,7 +1845,7 @@ mod tests {
             ("group_path -name g -to [get_ports y]\ngroup_path -name g -from [get_ports a]", "twice"),
             ("group_path -name g -to [get_ports nope]", "matches nothing"),
             ("set_path_margin 0.1 -to [get_ports y]", "set_path_margin"),
-            ("set_false_path -from [get_ports a]\ngroup_path -name g -to [get_ports y]", "the ids across them"),
+            ("set_max_delay 1 -from [get_pins b/A] -to [get_pins b/X]\ngroup_path -name g -to [get_ports y]", "the ids across them"),
         ] {
             let e = read(lines).unwrap_err();
             assert!(e.contains(why), "{lines}: {e}");
