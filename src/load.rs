@@ -549,11 +549,13 @@ fn constraints_with(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library], co
     clock_uncertainties(&uncertainties, &mut sdc.clocks, lib0.time_scale)?;
     clock_groups(&groups, &mut sdc.clocks)?;
     clock_transitions(&s.clock_transitions, &mut sdc.clocks, lib0.time_scale, &mut notes)?;
-    let falses = timing_exceptions_made(&exceptions, &s, nl)?;
+    // what `get_pins` patterns match: built once, and only when a pattern needs it
+    let pins = std::cell::OnceCell::new();
+    let falses = timing_exceptions_made(&exceptions, &s, nl, &pins)?;
     if !falses.is_empty() && !sdc.path_delays.is_empty() {
         return Err("set_false_path / set_multicycle_path with set_max_delay / set_min_delay: not modelled (the ids across them are the order they were made in)".into());
     }
-    let groups = group_paths_made(&group_cmds, &s, nl)?;
+    let groups = group_paths_made(&group_cmds, &s, nl, &pins)?;
     if !groups.is_empty() && !sdc.path_delays.is_empty() {
         return Err("group_path with set_max_delay / set_min_delay: not modelled (the ids across them are the order they were made in)".into());
     }
@@ -801,8 +803,16 @@ fn clock_uncertainties(us: &[vyges_loom::sdc::ClockUncertainty], clocks: &mut [c
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times [`connected_pins`] was built on this thread (tests of the lazy build).
+    static CONNECTED_PINS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Every connected instance pin, `inst/port`, in net order: what `get_pins` patterns match.
 fn connected_pins(nl: &Netlist) -> ConnectedPins<'_> {
+    #[cfg(test)]
+    CONNECTED_PINS_BUILT.with(|c| c.set(c.get() + 1));
     let mut pins = ConnectedPins { insts: nl.insts.iter().map(|i| i.0.as_str()).collect(), at: Vec::new(), names: Vec::new() };
     for net in &nl.nets {
         for c in &net.pins {
@@ -882,14 +892,13 @@ fn in_creation_order(falses: Vec<(Option<usize>, crate::sdc::PathDelay)>, groups
 /// and several clocks are refused. (The tests read it; the loader takes [`timing_exceptions_made`].)
 #[cfg(test)]
 fn timing_exceptions(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc, nl: &Netlist) -> Result<Vec<crate::sdc::PathDelay>, String> {
-    Ok(timing_exceptions_made(es, s, nl)?.into_iter().map(|(_, p)| p).collect())
+    Ok(timing_exceptions_made(es, s, nl, &std::cell::OnceCell::new())?.into_iter().map(|(_, p)| p).collect())
 }
 
 /// Every false and multicycle path as `timing_exceptions` reads it, each with the creation number of the command that made it
 /// (`vyges_loom::sdc::Exception::seq`).
-fn timing_exceptions_made(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc, nl: &Netlist) -> Result<Vec<(Option<usize>, crate::sdc::PathDelay)>, String> {
+fn timing_exceptions_made<'n>(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc::Sdc, nl: &'n Netlist, pins: &std::cell::OnceCell<ConnectedPins<'n>>) -> Result<Vec<(Option<usize>, crate::sdc::PathDelay)>, String> {
     use crate::liberty::{MAX, MIN};
-    let pins = connected_pins(nl);
     let mut out = Vec::new();
     for e in es {
         let multiplier = match e.kind {
@@ -904,7 +913,7 @@ fn timing_exceptions_made(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc
         if let Some((f, _)) = e.args.iter().find(|(f, _)| f != "-from" && f != "-to" && f != "-through") {
             return Err(format!("{cmd} {f}: not modelled"));
         }
-        let thrus = e.args.iter().filter(|(f, _)| f == "-through").map(|(_, o)| thru_point(cmd, o, nl, &pins)).collect::<Result<Vec<_>, _>>()?;
+        let thrus = e.args.iter().filter(|(f, _)| f == "-through").map(|(_, o)| thru_point(cmd, o, nl, pins.get_or_init(|| connected_pins(nl)))).collect::<Result<Vec<_>, _>>()?;
         let side = |flag: &str| -> Result<(Vec<String>, bool), String> {
             let (mut names, mut clock) = (Vec::new(), false);
             for o in e.args.iter().filter(|(f, _)| f == flag).flat_map(|(_, o)| object_items(o)) {
@@ -916,7 +925,7 @@ fn timing_exceptions_made(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc
                     }
                     "get_pins" => {
                         for n in &o.names {
-                            names.extend(pins.matching(n));
+                            names.extend(pins.get_or_init(|| connected_pins(nl)).matching(n));
                         }
                     }
                     "get_clocks" if s.clocks.len() == 1 && o.names.iter().all(|n| vyges_loom::sdc::object_matches(n, &s.clocks[0].name)) => clock = true,
@@ -993,13 +1002,12 @@ fn timing_exceptions_made(es: &[vyges_loom::sdc::Exception], s: &vyges_loom::sdc
 /// delay group), the edge forms and `-rise` / `-fall`, two of one name (`addException` would merge
 /// them), a side that matches nothing, and no point at all.
 fn group_paths(xs: &[vyges_loom::sdc::ExceptionCmd], s: &vyges_loom::sdc::Sdc, nl: &Netlist) -> Result<Vec<crate::sdc::PathDelay>, String> {
-    Ok(group_paths_made(xs, s, nl)?.into_iter().map(|(_, p)| p).collect())
+    Ok(group_paths_made(xs, s, nl, &std::cell::OnceCell::new())?.into_iter().map(|(_, p)| p).collect())
 }
 
 /// [`group_paths`], each with the creation number of its command (`ExceptionCmd::seq`).
-fn group_paths_made(xs: &[vyges_loom::sdc::ExceptionCmd], s: &vyges_loom::sdc::Sdc, nl: &Netlist) -> Result<Vec<(Option<usize>, crate::sdc::PathDelay)>, String> {
+fn group_paths_made<'n>(xs: &[vyges_loom::sdc::ExceptionCmd], s: &vyges_loom::sdc::Sdc, nl: &'n Netlist, pins: &std::cell::OnceCell<ConnectedPins<'n>>) -> Result<Vec<(Option<usize>, crate::sdc::PathDelay)>, String> {
     use crate::liberty::MAX;
-    let pins = connected_pins(nl);
     let mut out: Vec<(Option<usize>, crate::sdc::PathDelay)> = Vec::new();
     for x in xs.iter().filter(|x| x.cmd == "group_path") {
         if x.default {
@@ -1015,7 +1023,7 @@ fn group_paths_made(xs: &[vyges_loom::sdc::ExceptionCmd], s: &vyges_loom::sdc::S
         if out.iter().any(|(_, g)| g.group.as_deref() == Some(name.as_str())) {
             return Err(format!("group_path -name {name} twice: not modelled (the reference merges them)"));
         }
-        let thrus = x.args.iter().filter(|(f, _)| f == "-through").map(|(_, o)| thru_point("group_path", o, nl, &pins)).collect::<Result<Vec<_>, _>>()?;
+        let thrus = x.args.iter().filter(|(f, _)| f == "-through").map(|(_, o)| thru_point("group_path", o, nl, pins.get_or_init(|| connected_pins(nl)))).collect::<Result<Vec<_>, _>>()?;
         let side = |flag: &str| -> Result<(Vec<String>, bool), String> {
             let (mut names, mut clock) = (Vec::new(), false);
             for (_, o) in x.args.iter().filter(|(f, _)| f == flag) {
@@ -1028,7 +1036,7 @@ fn group_paths_made(xs: &[vyges_loom::sdc::ExceptionCmd], s: &vyges_loom::sdc::S
                         }
                         "get_pins" => {
                             for n in &o.names {
-                                names.extend(pins.matching(n));
+                                names.extend(pins.get_or_init(|| connected_pins(nl)).matching(n));
                             }
                         }
                         "all_inputs" | "all_outputs" => {
@@ -2134,6 +2142,26 @@ mod tests {
         assert!(read("set_false_path -through n1\n").unwrap_err().contains("not modelled"), "a bare name: refused");
         assert!(read("set_false_path -through [get_nets -quiet nope]\n").unwrap_err().contains("matches nothing"));
         assert!(read("set_false_path -rise_through [get_nets n1]\n").unwrap_err().contains("not modelled"));
+    }
+
+    /// What `get_pins` patterns match (every connected pin's `inst/port`) is built only when an
+    /// exception's pin pattern needs it, and once for the false paths and the group paths
+    /// together: an SDC without one never pays for it (a large design spent seconds on it, twice,
+    /// for nothing).
+    #[test]
+    fn the_exception_pin_list_is_built_once_and_only_when_needed() {
+        let src = "module ord3 (a, y);\n input a; output y; wire n1;\n BUF drv (.A(a), .X(n1));\n BUF lz (.A(n1), .X(y));\nendmodule\n";
+        let nl = netlist(&vyges_loom::netlist::parse_compact(src).unwrap(), &[lib()]).unwrap();
+        let built = |text: &str| {
+            let s = vyges_loom::sdc::Sdc::parse(text).unwrap();
+            let before = CONNECTED_PINS_BUILT.with(|c| c.get());
+            let pins = std::cell::OnceCell::new();
+            timing_exceptions_made(&s.exceptions, &s, &nl, &pins).unwrap();
+            group_paths_made(&s.other_exceptions, &s, &nl, &pins).unwrap();
+            CONNECTED_PINS_BUILT.with(|c| c.get()) - before
+        };
+        assert_eq!(built("set_false_path -from [get_ports a] -to [get_ports y]\ngroup_path -name g -from [get_ports a]\n"), 0, "no pin pattern: never built");
+        assert_eq!(built("set_false_path -through [get_pins lz/A]\ngroup_path -name g -through [get_pins drv/X]\n"), 1, "two commands with pin patterns: built once");
     }
 
     /// Rules (`Sdc::makeClkGroupExclusions`, `get_clocks_warn`; witnessed by the `clock_groups`
