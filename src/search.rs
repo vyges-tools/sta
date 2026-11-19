@@ -1132,6 +1132,14 @@ impl<'g, 'a> Search<'g, 'a> {
         crate::sdc::ThruPin { pin: name, net, inst, wire, output_or_latch_data: vx.is_driver && inst.is_some() }
     }
 
+    /// The first vertex named `pin` (a bidirect pin's two share the name; the first is its load),
+    /// as a scan in vertex order finds it, from the graph's name index: a lookup, not a scan per
+    /// name, which on a design of millions of pins and an exception naming hundreds would be
+    /// billions of names made.
+    fn vertex_named(&self, pin: &str) -> Option<usize> {
+        self.graph.index().get(pin).map(|&v| *self.graph.vertices_named(v).start())
+    }
+
     /// Whether every path delay is of the form this search models, else what is not: `-from` pins
     /// or the clock, `-to` pins or the clock, never an output delay; a max delay without
     /// `-ignore_clock_latency` only with no clock; an internal `-from` to a checked pin only with no
@@ -1149,7 +1157,7 @@ impl<'g, 'a> Search<'g, 'a> {
         if inserted && self.latch_data.iter().any(|&l| l) {
             return Err("set_clock_latency -source on a design with latches: not modelled".into());
         }
-        let find = |pin: &str| (0..self.graph.vertices.len()).position(|x| self.graph.vname(x) == pin);
+        let find = |pin: &str| self.vertex_named(pin);
         for pd in &self.sdc.path_delays {
             for t in &pd.thrus {
                 if let Some(p) = t.pins.iter().find(|p| find(p).is_none()) {
@@ -1220,7 +1228,7 @@ impl<'g, 'a> Search<'g, 'a> {
         if pd.multicycle.is_some() && !self.gated.is_empty() {
             return Err("set_multicycle_path on a design with gated clock checks: not modelled".into());
         }
-        let find = |pin: &str| (0..self.graph.vertices.len()).position(|x| self.graph.vname(x) == pin);
+        let find = |pin: &str| self.vertex_named(pin);
         for pin in &pd.from_pins {
             let Some(v) = find(pin) else { return Err(format!("{cmd} -from {pin}: no such pin")) };
             let top_input = self.graph.is_port(v) && self.graph.vertices[v].is_driver;
@@ -2415,6 +2423,27 @@ mod tests {
         sdc_false.path_delays = vec![pd(None, true)];
         let s = Search::in_graph_order(&g, &sdc_false);
         assert!(s.constraints_modelled().is_err_and(|e| e.contains("on a design with latches")));
+    }
+
+    /// The name lookup the constraint check makes equals a scan in vertex order for every name,
+    /// a bidirect port's included (its two vertices share the name; the scan finds the first).
+    #[test]
+    fn a_pin_is_found_by_name_as_a_scan_finds_it() {
+        let libs = vec![Library::read(&crate::liberty_parse::parse(LIB_LATCH).unwrap()).unwrap()];
+        let netlist = Netlist {
+            insts: vec![crate::netlist::inst("f1", "dff")],
+            ports: vec![("clk".into(), PortDir::Input), ("io".into(), PortDir::Inout)],
+            nets: vec![Net { name: "clk".into(), pins: vec![Conn::Port(0), Conn::Inst(0, "CLK".into())] }.into(), Net { name: "io".into(), pins: vec![Conn::Port(1), Conn::Inst(0, "D".into())] }.into(), Net { name: "q".into(), pins: vec![Conn::Inst(0, "Q".into())] }.into()],
+        };
+        let g = Graph::build(&libs, &netlist).unwrap();
+        let sdc = Sdc { clocks: Vec::new(), input_delays: Vec::new(), output_delays: Vec::new(), path_delays: Vec::new() };
+        let s = Search::in_graph_order(&g, &sdc);
+        assert!((0..g.vertices.len()).any(|v| g.vertices_named(v).count() == 2), "the fixture has a bidirect pin");
+        for v in 0..g.vertices.len() {
+            let name = g.vname(v);
+            assert_eq!(s.vertex_named(&name), (0..g.vertices.len()).position(|x| g.vname(x) == name), "{name}");
+        }
+        assert_eq!(s.vertex_named("nope"), None);
     }
 
     /// Rule (`Latches::latchRequired` / `latchBorrowInfo`): a latch's enable arrives at (the
