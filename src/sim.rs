@@ -275,14 +275,33 @@ pub fn constant_nets(nl: &Netlist, supply: &[(String, bool)]) -> Vec<(String, bo
 /// reference looks the case value up first).
 pub fn simulate(libs: &[Library], nl: &Netlist, constant_nets: &[(String, bool)], logic_values: &HashMap<String, Option<Logic>>, case_values: &HashMap<String, Option<Logic>>) -> Result<SimValues, String> {
     let mut sim = Sim::new(libs, nl)?;
-    let mut by_name: HashMap<String, Pin> = HashMap::new();
-    for (i, c) in sim.cells.iter().enumerate() {
-        for (k, q) in c.ports.iter().enumerate() {
-            by_name.insert(format!("{}/{}", nl.insts[i].0, q.name), Pin::Inst(i, k));
+    // Only the pins the constraints name are looked up, never a name for every pin: a top-level
+    // port first, else `instance/port` split at the last `/` (a port name has none). Where names
+    // repeat, the later one counts, as a later insert into one name map would.
+    let names = logic_values.keys().chain(case_values.keys());
+    let mut by_name: HashMap<&str, Pin> = HashMap::new();
+    if logic_values.len() + case_values.len() > 0 {
+        let mut ports: HashMap<&str, usize> = HashMap::new();
+        for (i, (p, _)) in nl.ports.iter().enumerate() {
+            ports.insert(p.as_str(), i);
         }
-    }
-    for (i, (p, _)) in nl.ports.iter().enumerate() {
-        by_name.insert(p.clone(), Pin::Port(i));
+        let mut insts: HashMap<&str, usize> = HashMap::new();
+        for (i, inst) in nl.insts.iter().enumerate() {
+            insts.insert(inst.0.as_str(), i);
+        }
+        for n in names {
+            let found = match ports.get(n.as_str()) {
+                Some(&i) => Some(Pin::Port(i)),
+                None => n.rsplit_once('/').and_then(|(inst, port)| {
+                    let &i = insts.get(inst)?;
+                    let k = sim.cells.get(i)?.ports.iter().rposition(|q| q.name == port)?;
+                    Some(Pin::Inst(i, k))
+                }),
+            };
+            if let Some(p) = found {
+                by_name.insert(n.as_str(), p);
+            }
+        }
     }
     let pin = |n: &str| by_name.get(n).copied().ok_or_else(|| format!("set_case_analysis / set_logic_*: no pin or port {n}"));
     // `Sdc::caseLogicValue` is looked up first, then `Sdc::logicValue`
@@ -303,7 +322,7 @@ pub fn simulate(libs: &[Library], nl: &Netlist, constant_nets: &[(String, bool)]
     }
     // `setConstraintConstPins(logicValues)`, then `(caseLogicValues)`, each pin at its own value
     for map in [logic_values, case_values] {
-        let mut pins: Vec<(Pin, Option<Logic>)> = map.iter().map(|(n, v)| (by_name[n], *v)).collect();
+        let mut pins: Vec<(Pin, Option<Logic>)> = map.iter().map(|(n, v)| (by_name[n.as_str()], *v)).collect();
         pins.sort_by_key(|(p, _)| sim.name(*p));
         for (p, v) in pins {
             sim.set_pin_value(p, v);
@@ -454,6 +473,28 @@ mod tests {
         assert_eq!(v.transitions.get("n/A"), Some(&crate::liberty::RISE));
         assert_eq!(v.constants.get("n/Y"), None, "a transition is unknown to the function");
         assert_eq!(v.transitions.get("n/Y"), None);
+    }
+
+    /// A constrained pin is found by its name alone: a top-level port, else `instance/port` split
+    /// at the LAST `/` (a flattened instance name holds `/` itself; a port name never does). An
+    /// unknown name is refused, naming it.
+    #[test]
+    fn a_constrained_pin_is_found_by_its_name_alone() {
+        let nl = Netlist {
+            insts: vec![inst("u/a", "AND2"), inst("u", "INV")],
+            ports: vec![("en".to_string(), crate::netlist::PortDir::Input)],
+            nets: vec![net("en", vec![Conn::Port(0), ip(0, "A")]), net("w", vec![ip(1, "A"), ip(0, "Y")])],
+        };
+        let cn = constant_nets(&nl, &[]);
+        let case = HashMap::from([("u/a/B".to_string(), Some(Logic::Zero)), ("en".to_string(), Some(Logic::One))]);
+        let (c, _) = constants(&lib(), &nl, &cn, &HashMap::new(), &case).unwrap();
+        assert_eq!(c.get("u/a/B"), Some(&false), "the pin of instance u/a, not a port of u");
+        assert_eq!(c.get("u/a/Y"), Some(&false));
+        assert_eq!(c.get("u/Y"), Some(&true));
+        assert_eq!(c.get("en"), Some(&true));
+        let bad = HashMap::from([("u/a/Q".to_string(), Some(Logic::One))]);
+        let e = constants(&lib(), &nl, &cn, &HashMap::new(), &bad).unwrap_err();
+        assert!(e.contains("no pin or port u/a/Q"), "{e}");
     }
 
     /// A `supply1` net is constant 1 at every pin, and a net only named like the reader's constant
