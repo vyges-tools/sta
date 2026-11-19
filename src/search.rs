@@ -1417,7 +1417,11 @@ impl<'g, 'a> Search<'g, 'a> {
         }
         let vid = &self.vertex_id;
         bldr.paths.sort_by_key(|p| p.tag.key(vid));
-        bldr.paths
+        // Stored as is: no spare capacity from the builder's pushes (about 40% of a large design's
+        // path store was unused capacity).
+        let mut paths = bldr.paths;
+        paths.shrink_to_fit();
+        paths
     }
 
     /// In-edges newest first (edges are prepended), each fanin path in tag order, each arc from its
@@ -2634,6 +2638,22 @@ mod tests {
     /// requireds on 2, 4 or 16 threads store the same bits as on 1 — every slew, delay, trace line
     /// and `clamped` entry in the serial order, every path's tag, arrival, required and
     /// predecessor. Latches (postponed passes) and DMP gates on RC loads included.
+    /// Every stored path list is exactly as long as its paths: no spare capacity (memory, not
+    /// values; the reference stores a vertex's paths in an array of exactly its tag group's size).
+    #[test]
+    fn stored_path_lists_hold_no_spare_capacity() {
+        let (libs, netlist, sdc, par) = wide_design(7, 24, 8);
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        g.find_delays(&par, None).unwrap();
+        let mut s = Search::in_graph_order(&g, &sdc);
+        s.find_arrivals().unwrap();
+        let stored: usize = s.paths.iter().map(Vec::len).sum();
+        assert!(stored > 1000, "a design with paths to check: {stored}");
+        for (v, paths) in s.paths.iter().enumerate() {
+            assert_eq!(paths.capacity(), paths.len(), "spare capacity at {}", g.vname(v));
+        }
+    }
+
     #[test]
     fn every_thread_count_times_a_multi_level_design_bit_for_bit() {
         let serial = timing_bits(1, 64, 14, 1);
