@@ -614,6 +614,16 @@ impl Sdc {
         self.exception_to(states, pin, clocked, mm, false, &|pd| pd.is_path_delay())
     }
 
+    /// `Latches::exceptionTo` → `Search::exceptionTo(any, data path, D pin, rf, enable clock edge,
+    /// max)` as `latchOutArrival` reads it: the exception ruling the data at a latch's D — of the
+    /// path's states complete there, or whose first point is a `-to` at D or (`clocked`) the enable
+    /// clock — when it is a false path or a path delay (`isFalse() || isPathDelay()`), which disable
+    /// D->Q. Both outrank a multicycle or group path, so the highest of all is one of them exactly
+    /// when one of them matches.
+    pub fn latch_dq_disabled_to(&self, states: States, pin: &str, clocked: bool, mm: usize) -> Option<usize> {
+        self.exception_to(states, pin, clocked, mm, false, &|pd| pd.false_path || pd.is_path_delay())
+    }
+
     /// `Search::exceptionTo(multi_cycle, …, match_min_max_exactly)`: the multicycle path ruling a
     /// check of min/max `mm` at `pin` — at a check, below any path delay (2000 against 3000).
     pub fn multicycle_to(&self, states: States, pin: &str, clocked: bool, mm: usize, exactly: bool) -> Option<usize> {

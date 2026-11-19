@@ -1222,7 +1222,9 @@ impl<'g, 'a> Search<'g, 'a> {
         // disables D -> Q for it, and a transparent latch's Q takes its states from the D pin and the
         // enable pin and clock (`exceptionFromStates`) as `latch_out_arrival` does: a group `-from`
         // a latch enable starts there.
-        if pd.group.is_none() && self.latch_data.iter().any(|&l| l) {
+        // A false path at a latch's D disables D->Q (`latch_out_arrival`); a multicycle path there
+        // would set the latch check's cycle, which `latch_required` does not take.
+        if pd.multicycle.is_some() && self.latch_data.iter().any(|&l| l) {
             return Err(format!("{cmd} on a design with latches: not modelled"));
         }
         if pd.multicycle.is_some() && !self.gated.is_empty() {
@@ -1908,7 +1910,9 @@ impl<'g, 'a> Search<'g, 'a> {
         let &(en_v, en_rf) = self.latch_en.get(&e)?;
         let d_pin = &self.graph.vname(from_v);
         let en = self.paths[en_v].iter().find(|p| p.tag.mm == MIN && p.tag.rf == en_rf && p.tag.is_clock)?;
-        if self.sdc.path_delay_to(from.tag.states, d_pin, true, MAX).is_some() {
+        // `exceptionTo(data_path, en_clk_edge)`: a false path or path delay -to D (or the enable
+        // clock) disables D->Q.
+        if self.sdc.latch_dq_disabled_to(from.tag.states, d_pin, true, MAX).is_some() {
             return None;
         }
         let disable = self.latch_other_path(en_v, en);
@@ -2403,7 +2407,8 @@ mod tests {
     /// false nor a path delay, so it never disables a latch's D -> Q, and a transparent latch's Q
     /// takes its states from the D pin and the enable's pin and clock: a group `-from` the latch
     /// enable (`all_registers -clock_pins` names it, as rsz's reg2reg does) is modelled on a design
-    /// with latches and reaches the capture at f2/D; a false path there is still refused.
+    /// with latches and reaches the capture at f2/D; a multicycle path there is still refused
+    /// (`latch_required` takes no multicycle).
     /// Witness: repair_timing_path_group2's in2reg and reg2reg counts and its latch D end, equal to
     /// the reference.
     #[test]
@@ -2419,10 +2424,54 @@ mod tests {
         s.find_requireds().unwrap();
         let ends: Vec<String> = s.group_path_ends("r2r", MAX, usize::MAX, -1.0, 1.0).iter().map(|e| g.vname(e.vertex)).collect();
         assert_eq!(ends, ["f2/D"]);
-        let mut sdc_false = sdc.clone();
-        sdc_false.path_delays = vec![pd(None, true)];
-        let s = Search::in_graph_order(&g, &sdc_false);
-        assert!(s.constraints_modelled().is_err_and(|e| e.contains("on a design with latches")));
+        let mut sdc_mcp = sdc.clone();
+        sdc_mcp.path_delays = vec![crate::sdc::PathDelay { multicycle: Some(crate::sdc::Multicycle { multiplier: 2, use_end_clk: true, all: true }), group: None, ..pd(None, false) }];
+        let s = Search::in_graph_order(&g, &sdc_mcp);
+        assert!(s.constraints_modelled().is_err_and(|e| e.contains("set_multicycle_path on a design with latches")));
+    }
+
+    /// Rules (`Latches::latchOutArrival` → `exceptionTo(any, data path, D, enable clock edge)`;
+    /// `exceptionFromStates`; `thruTag`): a false path -to the latch's D disables D->Q, so Q keeps
+    /// only its enable clock->Q arrival; Q's states start fresh from the D pin and the enable pin
+    /// and clock, so a false path from the launch register to the next one THROUGH the latch does
+    /// not survive it, and one -from the enable reaches the next register (both its max and its
+    /// min ends). Every value is the reference's (pinned OpenSTA, `instruments/sta/latch-uncertainty`
+    /// `false-path.tcl`, cases to_d, through, from_g).
+    #[test]
+    fn a_false_path_beside_a_latch_is_applied_as_the_reference_applies_it() {
+        let (libs, netlist, sdc) = latch_loop();
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        g.find_delays(&HashMap::new(), None).unwrap();
+        let v = |n: &str| (0..g.vertices.len()).position(|x| g.vname(x) == n).unwrap();
+        let ns = |x: f32| if x.abs() > 1e20 { f32::INFINITY } else { (x * 1e9 * 1e4).round() / 1e4 };
+        // `set_false_path` of neither `-setup` nor `-hold`: one per min/max, as `load` makes it.
+        let fp = |from: &[&str], to: &[&str]| -> Vec<crate::sdc::PathDelay> {
+            [MIN, MAX].map(|mm| crate::sdc::PathDelay { from_pins: from.iter().map(|p| p.to_string()).collect(), from_clock: false, to_pins: to.iter().map(|p| p.to_string()).collect(), to_clock: false, min_max: mm, ignore_clk_latency: false, break_path: false, delay: 0.0, false_path: true, multicycle: None, thrus: Vec::new(), group: None }).into()
+        };
+        let inf = f32::INFINITY;
+        // (case, l1/Q max rise/fall, f1/CLK max rise/fall, slack max/min at l1/D, f2/D, f1/D)
+        type Case = (&'static str, Vec<crate::sdc::PathDelay>, [f32; 2], [f32; 2], [[f32; 2]; 3]);
+        let cases: [Case; 4] = [
+            ("none", vec![], [0.60, 0.66], [0.71, 0.79], [[0.0, 0.89], [0.28, 0.23], [0.84, 0.07]]),
+            ("to_d", fp(&[], &["l1/D"]), [0.25, 0.26], [0.36, 0.62], [[inf, inf], [0.68, 0.23], [0.84, 0.07]]),
+            ("through", fp(&["f1/CLK"], &["f2/D"]), [0.60, 0.66], [0.71, 0.79], [[0.0, 0.89], [0.28, 0.23], [0.84, 0.07]]),
+            ("from_g", fp(&["l1/G"], &["f2/D"]), [0.60, 0.66], [0.71, 0.79], [[0.0, 0.89], [inf, inf], [0.84, 0.07]]),
+        ];
+        for (case, pds, l1q, f1clk, slacks) in cases {
+            let mut sdc = sdc.clone();
+            sdc.path_delays = pds;
+            let mut s = Search::in_graph_order(&g, &sdc);
+            s.constraints_modelled().unwrap_or_else(|e| panic!("{case}: {e}"));
+            s.find_arrivals().unwrap();
+            s.find_requireds().unwrap();
+            let max_rf = |p: &str| [s.arrival_rf(v(p), RISE, MAX), s.arrival_rf(v(p), FALL, MAX)].map(ns);
+            assert_eq!(max_rf("l1/Q"), l1q, "{case}: l1/Q");
+            assert_eq!(max_rf("f1/CLK"), f1clk, "{case}: f1/CLK");
+            for (pin, want) in ["l1/D", "f2/D", "f1/D"].iter().zip(slacks) {
+                let got = [ns(s.slack_of(v(pin), MAX, None)), ns(s.slack_of(v(pin), MIN, None))];
+                assert_eq!(got, want, "{case}: {pin} slack max/min");
+            }
+        }
     }
 
     /// The name lookup the constraint check makes equals a scan in vertex order for every name,
