@@ -2654,6 +2654,26 @@ mod tests {
         }
     }
 
+    /// Once cached, an edge's arc set is the very set the name lookup finds (the cell by name in
+    /// its library, then its set): the cache never answers otherwise than the uncached graph.
+    #[test]
+    fn cached_arc_sets_are_the_ones_the_name_lookup_finds() {
+        let (libs, netlist, _, _) = wide_design(5, 16, 6);
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        let gates: Vec<(usize, usize)> = (0..g.edges.len())
+            .filter_map(|e| match g.edges[e].kind {
+                EdgeKind::Gate { set } => Some((e, set)),
+                EdgeKind::Wire => None,
+            })
+            .collect();
+        let by_name: Vec<*const crate::liberty::ArcSet> = gates.iter().map(|&(e, set)| g.arc_set(e, set) as *const _).collect();
+        assert!(gates.len() > 100 && by_name.iter().collect::<std::collections::HashSet<_>>().len() > 1, "several sets");
+        g.cache_arc_sets();
+        for (&(e, set), &want) in gates.iter().zip(&by_name) {
+            assert!(std::ptr::eq(g.arc_set(e, set), want), "edge {e} set {set}");
+        }
+    }
+
     #[test]
     fn every_thread_count_times_a_multi_level_design_bit_for_bit() {
         let serial = timing_bits(1, 64, 14, 1);
