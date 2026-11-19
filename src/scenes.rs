@@ -349,6 +349,25 @@ impl<'a> SceneTimers<'a> {
 /// `par[k]` is scene k's parasitics. The first call times in full; a later one updates from what
 /// was invalidated since ([`SceneTimers::delays_invalid_from`]), as the resizer's timer does.
 pub fn net_slacks(par: &[&HashMap<String, crate::graph::NetParasitics>], t: &mut SceneTimers<'_>) -> Result<HashMap<String, f32>, String> {
+    net_slacks_ordered(par, t, None)
+}
+
+/// [`net_slacks`] with each net's load pins folded in the reference's pin order: `Sta::slack(net)`
+/// walks `connectedPinIterator`, a `PinSet` ordered by `PinIdLess` — ascending `dbNetwork::id(Pin)`
+/// (an instance terminal's database id × 2, a block terminal's × 2 + 1). The ids come from the
+/// caller's database: `pin_ids[k][j]` is the key of `nets[k].pins[j]` of the timers' netlist. The
+/// fold is fuzzy, so its order decides near-equal ties.
+pub fn net_slacks_in_pin_order(par: &[&HashMap<String, crate::graph::NetParasitics>], t: &mut SceneTimers<'_>, pin_ids: &[Vec<u64>]) -> Result<HashMap<String, f32>, String> {
+    net_slacks_ordered(par, t, Some(pin_ids))
+}
+
+fn net_slacks_ordered(par: &[&HashMap<String, crate::graph::NetParasitics>], t: &mut SceneTimers<'_>, pin_ids: Option<&[Vec<u64>]>) -> Result<HashMap<String, f32>, String> {
+    if let Some(ids) = pin_ids {
+        let nets = &t.graphs[0].netlist.nets;
+        if ids.len() != nets.len() || ids.iter().zip(nets.iter()).any(|(i, n)| i.len() != n.pins.len()) {
+            return Err("pin ids: not one per pin of every net of the timers' netlist".into());
+        }
+    }
     if par.len() != t.graphs.len() {
         return Err(format!("{} scenes, {} parasitic sets", t.graphs.len(), par.len()));
     }
@@ -372,9 +391,10 @@ pub fn net_slacks(par: &[&HashMap<String, crate::graph::NetParasitics>], t: &mut
     Ok(g.netlist
         .nets
         .iter()
-        .map(|n| {
+        .enumerate()
+        .map(|(k, n)| {
             let mut slack = crate::search::INF_SLACK;
-            for c in &n.pins {
+            for c in pin_fold_order(n.pins.len(), pin_ids.map(|ids| ids[k].as_slice())).into_iter().map(|j| &n.pins[j]) {
                 name.clear();
                 let Some(&v) = index.get(g.netlist.pin_name_into(c, &mut name)) else { continue };
                 if g.vertices[v].is_driver {
@@ -388,6 +408,16 @@ pub fn net_slacks(par: &[&HashMap<String, crate::graph::NetParasitics>], t: &mut
             (n.name.clone(), slack)
         })
         .collect())
+}
+
+/// The order a net's pins are folded in: ascending pin id when the caller gives the ids (the
+/// reference's `PinSet` / `PinIdLess`), else the netlist's order.
+fn pin_fold_order(pins: usize, ids: Option<&[u64]>) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..pins).collect();
+    if let Some(ids) = ids {
+        order.sort_by_key(|&j| ids[j]);
+    }
+    order
 }
 
 /// `Sta::slack(vertex, max)` over every scene's paths at `v`, scene by scene (the path array's
@@ -706,6 +736,36 @@ mod tests {
         }
         assert_eq!(all["y"], each[0]["y"], "the slow scene is the worst");
         assert_ne!(each[0]["y"], each[2]["y"]);
+    }
+
+    /// `Sta::slack(net)` folds the loads in ascending pin id (`PinSet` ordered by `PinIdLess`:
+    /// an instance terminal's id × 2, a block terminal's × 2 + 1), and the fold is fuzzy: of two
+    /// loads within the band, the FIRST in that order is kept — so the order is a value.
+    #[test]
+    fn net_pins_fold_in_ascending_pin_id() {
+        assert_eq!(pin_fold_order(3, Some(&[1721 << 1, (1 << 1) | 1, 5 << 1])), vec![1, 2, 0]);
+        assert_eq!(pin_fold_order(2, Some(&[(7 << 1) | 1, 7 << 1])), vec![1, 0], "an instance terminal before the port of the same id");
+        assert_eq!(pin_fold_order(3, None), vec![0, 1, 2], "no ids: the netlist's order");
+        let fold = |vals: &[f32], ids: &[u64]| pin_fold_order(vals.len(), Some(ids)).into_iter().map(|k| vals[k]).fold(crate::search::INF_SLACK, |s, x| if crate::fuzzy::less(x, s) { x } else { s });
+        let near = [1.0f32, 1.0 + 4.0 * f32::EPSILON];
+        assert!(!crate::fuzzy::less(near[0], near[1]) && !crate::fuzzy::less(near[1], near[0]), "within the band");
+        assert_eq!(fold(&near, &[2, 4]), near[0]);
+        assert_eq!(fold(&near, &[4, 2]).to_bits(), near[1].to_bits(), "the lower id's load is kept");
+    }
+
+    /// The pin-ordered read takes ids aligned with the netlist's pins, refuses misaligned ones, and
+    /// with the ids in netlist order reads what the netlist-order read reads.
+    #[test]
+    fn pin_ordered_net_slacks_take_aligned_ids() {
+        let libs = [[lib("ss", true, 1.5)], [lib("ff", false, 0.5)]];
+        let nl = clocked();
+        let scenes: Vec<&[Library]> = libs.iter().map(|l| &l[..]).collect();
+        let plain = net_slacks(&[&HashMap::new(); 2], &mut timers(&scenes, &nl)).unwrap();
+        let ids: Vec<Vec<u64>> = nl.nets.iter().map(|n| (0..n.pins.len() as u64).collect()).collect();
+        let ordered = net_slacks_in_pin_order(&[&HashMap::new(); 2], &mut timers(&scenes, &nl), &ids).unwrap();
+        assert_eq!(ordered, plain);
+        let short: Vec<Vec<u64>> = ids[1..].to_vec();
+        assert!(net_slacks_in_pin_order(&[&HashMap::new(); 2], &mut timers(&scenes, &nl), &short).is_err());
     }
 
     /// An incremental read after the caller invalidated a re-estimated net's pins equals a full
