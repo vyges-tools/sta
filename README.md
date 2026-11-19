@@ -19,7 +19,8 @@ The reference whose arithmetic this crate reproduces is OpenSTA, as the OpenROAD
   tristate enables, bus and bundle pins.
 - Several clocks, each on one port or pin, ideal or propagated, with waveforms and pin network
   latency; virtual clocks for I/O delays.
-- Setup and hold requireds, recovery/removal, gated-clock checks, latches with time borrowing,
+- Setup and hold requireds, recovery/removal, gated-clock checks, latches with time borrowing
+  (the enable edge's clock uncertainty included; a false path at a latch's data pin disables it),
   common-path pessimism removal (CRPR), which can be switched off for a run (as
   `sta::set_crpr_enabled 0` does).
 - Input and output delays (min/max, rise/fall, `-add_delay`), input transitions, port and net
@@ -87,8 +88,8 @@ commands): kept and written back, not applied (no slack moves with it)`), any ot
 - `set_path_margin`; `group_path -default`, two `group_path`s of one name, and `group_path` in a
   file that also has false, multicycle or delay paths (their ids are the order they were made in)
 - exceptions given `-rise_through` / `-fall_through`, from or to a clock with several clocks
-  defined, on an internal pin, or on a design with latches; multicycle paths on a design with
-  gated-clock checks
+  defined, or on an internal pin; multicycle paths on a design with latches or with gated-clock
+  checks
 - any other command that could move a slack (the rule is in `load::constraints`: a command loom
   carries in no record of its own is refused unless it is one of the directives above)
 
