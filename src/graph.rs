@@ -1363,6 +1363,13 @@ impl<'a> Graph<'a> {
 
     /// Topological order over the edges levelization follows ([`Graph::levelize_thru`]).
     pub fn topo_order(&self) -> Result<Vec<usize>, String> {
+        let t = std::time::Instant::now();
+        let r = self.topo_order_inner();
+        crate::par::add_time("topo_order", t.elapsed().as_secs_f64());
+        r
+    }
+
+    fn topo_order_inner(&self) -> Result<Vec<usize>, String> {
         let n = self.vertices.len();
         let mut indeg = vec![0usize; n];
         for (e, ed) in self.edges.iter().enumerate() {

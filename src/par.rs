@@ -58,10 +58,52 @@ pub struct StageTimer {
     started: Option<std::time::Instant>,
 }
 
+fn timing_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VYGES_STA_STAGE_TIMES").is_some_and(|v| v != "0"))
+}
+
+/// Where a stage's time goes, accumulated while [`timing_on`] and printed by the [`StageTimer`]
+/// that ends the stage: [`map`] calls (and how many ran on the calling thread alone because they
+/// had fewer items than threads), the items they visited and their wall time; [`waves`]; and any
+/// other named part ([`add_time`]). The rest of the stage is serial work on the calling thread.
+#[derive(Default)]
+struct Breakdown {
+    maps: usize,
+    serial_maps: usize,
+    items: usize,
+    map_secs: f64,
+    parts: Vec<(&'static str, f64)>,
+}
+
+static BREAKDOWN: std::sync::Mutex<Breakdown> = std::sync::Mutex::new(Breakdown { maps: 0, serial_maps: 0, items: 0, map_secs: 0.0, parts: Vec::new() });
+
+/// Adds `secs` to the named part of the running stage's breakdown (no-op unless timing is on).
+pub fn add_time(part: &'static str, secs: f64) {
+    if !timing_on() {
+        return;
+    }
+    let mut b = BREAKDOWN.lock().unwrap_or_else(|e| e.into_inner());
+    match b.parts.iter_mut().find(|(n, _)| *n == part) {
+        Some(p) => p.1 += secs,
+        None => b.parts.push((part, secs)),
+    }
+}
+
+fn add_map(items: usize, serial: bool, secs: f64) {
+    let mut b = BREAKDOWN.lock().unwrap_or_else(|e| e.into_inner());
+    b.maps += 1;
+    b.serial_maps += usize::from(serial);
+    b.items += items;
+    b.map_secs += secs;
+}
+
 impl StageTimer {
     pub fn start(name: &'static str, threads: usize) -> StageTimer {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let on = *ON.get_or_init(|| std::env::var_os("VYGES_STA_STAGE_TIMES").is_some_and(|v| v != "0"));
+        let on = timing_on();
+        if on {
+            *BREAKDOWN.lock().unwrap_or_else(|e| e.into_inner()) = Breakdown::default();
+        }
         StageTimer { name, threads, started: on.then(std::time::Instant::now) }
     }
 }
@@ -69,7 +111,15 @@ impl StageTimer {
 impl Drop for StageTimer {
     fn drop(&mut self) {
         if let Some(t) = self.started {
-            eprintln!("sta stage {} threads={} secs={:.3}", self.name, self.threads, t.elapsed().as_secs_f64());
+            let secs = t.elapsed().as_secs_f64();
+            let b = std::mem::take(&mut *BREAKDOWN.lock().unwrap_or_else(|e| e.into_inner()));
+            // a `*_count` part is a count, not seconds
+            let parts: f64 = b.parts.iter().filter(|p| !p.0.ends_with("_count")).map(|p| p.1).sum();
+            let named: String = b.parts.iter().map(|(n, s)| if n.ends_with("_count") { format!(" {n}={s}") } else { format!(" {n}_secs={s:.3}") }).collect();
+            eprintln!(
+                "sta stage {} threads={} secs={secs:.3} maps={} serial_maps={} items={} map_secs={:.3}{named} other_secs={:.3}",
+                self.name, self.threads, b.maps, b.serial_maps, b.items, b.map_secs, secs - b.map_secs - parts
+            );
         }
     }
 }
@@ -149,7 +199,17 @@ pub fn group_by_wave(order: &[usize], wave: &[usize]) -> Vec<Vec<usize>> {
 /// The waves of `order` (each vertex once): wave `k` holds, in `order` order, the vertices whose
 /// earliest legal wave is `k`. `access(v, out)` pushes the cells (below `cells`) the visit of `v`
 /// touches.
-pub fn waves(order: &[usize], cells: usize, mut access: impl FnMut(usize, &mut Vec<Access>)) -> Vec<Vec<usize>> {
+pub fn waves(order: &[usize], cells: usize, access: impl FnMut(usize, &mut Vec<Access>)) -> Vec<Vec<usize>> {
+    let t = timing_on().then(std::time::Instant::now);
+    let w = waves_inner(order, cells, access);
+    if let Some(t) = t {
+        add_time("waves", t.elapsed().as_secs_f64());
+        add_time("wave_count", w.len() as f64);
+    }
+    w
+}
+
+fn waves_inner(order: &[usize], cells: usize, mut access: impl FnMut(usize, &mut Vec<Access>)) -> Vec<Vec<usize>> {
     let mut st = WaveState::new(cells);
     let mut wave = Vec::with_capacity(order.len());
     let mut acc = Vec::new();
@@ -185,6 +245,16 @@ pub fn merge_by_index<T>(n: usize, parts: Vec<Vec<(usize, T)>>) -> Vec<T> {
 /// one of them). Workers claim chunks of [`CHUNK`] items in index order. Returns only when every
 /// item is computed (the wave barrier). Fewer items than threads: computed here, serially.
 pub fn map<T: Send>(items: &[usize], threads: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    if timing_on() {
+        let t = std::time::Instant::now();
+        let r = map_inner(items, threads, f);
+        add_map(items.len(), threads <= 1 || items.len() < threads, t.elapsed().as_secs_f64());
+        return r;
+    }
+    map_inner(items, threads, f)
+}
+
+fn map_inner<T: Send>(items: &[usize], threads: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     if threads <= 1 || items.len() < threads {
         return items.iter().map(|&v| f(v)).collect();
     }
