@@ -1599,7 +1599,8 @@ impl<'a> Graph<'a> {
         let _time = crate::par::StageTimer::start("find_delays", self.thread_count);
         let order = self.topo_order()?;
         self.clamped.clear();
-        let index = self.index().clone();
+        // the shared map, not a copy of it
+        let index = std::sync::Arc::clone(self.shared_index());
         let reached = self.dcalc_reached(&order);
         if self.thread_count <= 1 {
             for &v in &order {
@@ -1828,6 +1829,12 @@ impl<'a> Graph<'a> {
 
     /// [`Graph::pin_index`], built once and borrowed.
     pub fn index(&self) -> &HashMap<String, usize> {
+        self.shared_index()
+    }
+
+    /// [`Graph::index`] as its shared handle: a holder that must not borrow the graph takes this,
+    /// never a copy of the map (one name per vertex).
+    pub fn shared_index(&self) -> &std::sync::Arc<HashMap<String, usize>> {
         self.index_cache.get_or_init(|| std::sync::Arc::new((0..self.vertices.len()).map(|i| (self.vname(i), i)).collect()))
     }
 
