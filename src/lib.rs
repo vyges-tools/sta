@@ -32,6 +32,7 @@ pub mod liberty_parse;
 #[cfg(feature = "loom")]
 pub mod load;
 pub mod netlist;
+pub mod par;
 pub mod parasitics;
 pub mod path_enum;
 pub mod path_group;

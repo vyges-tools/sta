@@ -43,6 +43,9 @@ The reference whose arithmetic this crate reproduces is OpenSTA, as the OpenROAD
   when no parasitics are given.
 - Incremental timing across netlist edits, the k worst paths to an endpoint, and switching
   activity and instance power.
+- Delay calculation, arrivals and requireds on several threads (`Graph::set_thread_count`, the
+  reference's `set_thread_count` semantics; 1 by default). Every stored value is the same bits
+  at any thread count. Incremental updates stay on one thread.
 
 Bidirect pins on a net, multiply-driven nets and anything a caller hands it that it does not
 model are refused with a reason, never timed wrong.
@@ -114,6 +117,8 @@ refuses such a design rather than time it without them.
   in-place edits from netlist changes.
 - `sim` — the logic constants and their propagation through the cells' functions.
 - `sdc`, `search` — clocks and constraints; arrivals, requireds, slacks.
+- `par` — the parallel visit: the serial order cut into waves by what each vertex reads and
+  writes, each wave computed on the threads and stored in order.
 - `incr` — the timer's state across edits, each update doing the reference's incremental work.
 - `path_enum` — the k worst paths to one endpoint.
 - `path_group` — which `group_path` a path end is in, a group's path ends, worst first, and

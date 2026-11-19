@@ -1265,19 +1265,16 @@ impl<'g, 'a> Search<'g, 'a> {
     /// (`arrivalsChanged`), and a latch data pin that changed postpones its latch outputs again
     /// (`postponeLatchDataOutputs`). Passes stop when nothing is postponed.
     pub fn find_arrivals(&mut self) -> Result<(), String> {
+        let _time = crate::par::StageTimer::start("find_arrivals", self.graph.thread_count);
         let order = self.graph.topo_order()?;
+        let threads = self.graph.thread_count;
+        let waves = (threads > 1).then(|| self.arrival_waves(&order));
         let mut queued = vec![true; self.graph.vertices.len()];
         let mut pending: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         loop {
-            for &v in &order {
-                if !std::mem::take(&mut queued[v]) {
-                    continue;
-                }
-                if self.is_latch_output(v) {
-                    pending.insert(v);
-                    continue;
-                }
-                self.arrival_pass_visit(v, &mut queued, &mut pending);
+            match &waves {
+                None => self.arrival_pass(&order, &mut queued, &mut pending),
+                Some(waves) => self.arrival_pass_parallel(waves, threads, &mut queued, &mut pending),
             }
             if pending.is_empty() {
                 return Ok(());
@@ -1285,16 +1282,86 @@ impl<'g, 'a> Search<'g, 'a> {
             let mut postponed: Vec<usize> = std::mem::take(&mut pending).into_iter().collect();
             postponed.sort_by_key(|&v| self.vertex_id[v]);
             for v in postponed {
-                self.arrival_pass_visit(v, &mut queued, &mut pending);
+                let new = self.arrival_paths(v);
+                self.arrival_pass_store(v, new, &mut queued, &mut pending);
             }
         }
     }
 
-    /// `ArrivalVisitor::visit(vertex, with_latch_edges)` in a pass: the new paths stored; when they
-    /// changed, the fanout queued for the pass (not across a check or a latch D->Q edge), and a
-    /// latch data pin's latch outputs postponed.
-    fn arrival_pass_visit(&mut self, v: usize, queued: &mut [bool], pending: &mut std::collections::BTreeSet<usize>) {
-        let new = self.arrival_paths(v);
+    /// One pass in level order (`BfsIterator::visit`): each queued vertex visited, a latch output
+    /// postponed.
+    fn arrival_pass(&mut self, order: &[usize], queued: &mut [bool], pending: &mut std::collections::BTreeSet<usize>) {
+        for &v in order {
+            if !std::mem::take(&mut queued[v]) {
+                continue;
+            }
+            if self.is_latch_output(v) {
+                pending.insert(v);
+                continue;
+            }
+            let new = self.arrival_paths(v);
+            self.arrival_pass_store(v, new, queued, pending);
+        }
+    }
+
+    /// [`Search::arrival_pass`] on `threads` threads (`BfsIterator::visitParallel`): per wave, the
+    /// queued vertices' paths computed on the threads, then stored in order ([`crate::par`]).
+    fn arrival_pass_parallel(&mut self, waves: &[Vec<usize>], threads: usize, queued: &mut [bool], pending: &mut std::collections::BTreeSet<usize>) {
+        let mut todo = Vec::new();
+        for wave in waves {
+            todo.clear();
+            for &v in wave {
+                if !std::mem::take(&mut queued[v]) {
+                    continue;
+                }
+                if self.is_latch_output(v) {
+                    pending.insert(v);
+                    continue;
+                }
+                todo.push(v);
+            }
+            let news = {
+                let s = &*self;
+                crate::par::map(&todo, threads, |v| s.arrival_paths(v))
+            };
+            for (&v, new) in todo.iter().zip(news) {
+                self.arrival_pass_store(v, new, queued, pending);
+            }
+        }
+    }
+
+    /// The hazard waves of an arrival pass: a visit reads its fanin's paths (every in-edge but a
+    /// check), takes its own queued bit and writes its own paths, and sets its fanout's queued bits.
+    /// Cells: paths `v`, queued `n + v`.
+    fn arrival_waves(&self, order: &[usize]) -> Vec<Vec<usize>> {
+        use crate::par::Access;
+        let n = self.graph.vertices.len();
+        crate::par::waves(order, 2 * n, |v, out| {
+            for &e in &self.graph.in_edges[v] {
+                if !self.is_check(e) {
+                    out.push(Access::Read(self.graph.edges[e].from));
+                }
+            }
+            out.push(Access::Write(v));
+            out.push(Access::Write(n + v));
+            for &e in &self.graph.out_edges[v] {
+                if self.arrival_queues(e) {
+                    out.push(Access::Set(n + self.graph.edges[e].to));
+                }
+            }
+        })
+    }
+
+    /// Whether a changed arrival at an edge's from-vertex queues its to-vertex: not across a
+    /// check, a latch D->Q edge or a disabled loop.
+    fn arrival_queues(&self, e: usize) -> bool {
+        !self.is_check(e) && self.role(e) != Some(Role::LatchDtoQ) && !self.graph.is_disabled_loop(e)
+    }
+
+    /// `ArrivalVisitor::visit(vertex, with_latch_edges)` in a pass, given the new paths: stored;
+    /// when they changed, the fanout queued for the pass (not across a check or a latch D->Q
+    /// edge), and a latch data pin's latch outputs postponed.
+    fn arrival_pass_store(&mut self, v: usize, new: Vec<Path>, queued: &mut [bool], pending: &mut std::collections::BTreeSet<usize>) {
         let changed = arrivals_changed(&self.paths[v], &new);
         self.paths[v] = new;
         if !changed {
@@ -1304,7 +1371,7 @@ impl<'g, 'a> Search<'g, 'a> {
             pending.extend(self.latch_outputs_of(v));
         }
         for &e in &self.graph.out_edges[v] {
-            if !self.is_check(e) && self.role(e) != Some(Role::LatchDtoQ) && !self.graph.is_disabled_loop(e) {
+            if self.arrival_queues(e) {
                 queued[self.graph.edges[e].to] = true;
             }
         }
@@ -1498,6 +1565,7 @@ impl<'g, 'a> Search<'g, 'a> {
     /// required a path is made with, [`required_init`] (`Path::required_`, ±INF since OpenSTA
     /// f861c627): an input port with no fanout reports an infinite slack.
     pub fn find_requireds(&mut self) -> Result<(), String> {
+        let _time = crate::par::StageTimer::start("find_requireds", self.graph.thread_count);
         let order = self.graph.topo_order()?;
         let mut enqueued = vec![false; self.graph.vertices.len()];
         for v in 0..self.graph.vertices.len() {
@@ -1507,13 +1575,60 @@ impl<'g, 'a> Search<'g, 'a> {
                 self.required_save(v, req, &mut enqueued);
             }
         }
-        for &v in order.iter().rev() {
-            if enqueued[v] {
-                let req = self.required_values(v);
+        let threads = self.graph.thread_count;
+        let backward: Vec<usize> = order.iter().rev().copied().collect();
+        if threads <= 1 {
+            for &v in &backward {
+                if enqueued[v] {
+                    let req = self.required_values(v);
+                    self.required_save(v, req, &mut enqueued);
+                }
+            }
+            return Ok(());
+        }
+        // `visitParallel` on the backward iterator: per wave, the enqueued vertices' requireds
+        // computed on the threads, then saved in order ([`crate::par`]).
+        let mut todo = Vec::new();
+        for wave in self.required_waves(&backward) {
+            todo.clear();
+            todo.extend(wave.iter().copied().filter(|&v| enqueued[v]));
+            let reqs = {
+                let s = &*self;
+                crate::par::map(&todo, threads, |v| s.required_values(v))
+            };
+            for (&v, req) in todo.iter().zip(reqs) {
                 self.required_save(v, req, &mut enqueued);
             }
         }
         Ok(())
+    }
+
+    /// The hazard waves of the required pass (reverse level order): a visit reads its fanout's
+    /// requireds (every out-edge but a check or a latch D->Q) and its own enqueued bit, writes its
+    /// own requireds and sets its fanin's enqueued bits. Cells: requireds `v`, enqueued `n + v`.
+    fn required_waves(&self, backward: &[usize]) -> Vec<Vec<usize>> {
+        use crate::par::Access;
+        let n = self.graph.vertices.len();
+        crate::par::waves(backward, 2 * n, |v, out| {
+            for &e in &self.graph.out_edges[v] {
+                if !self.is_check(e) && self.role(e) != Some(Role::LatchDtoQ) {
+                    out.push(Access::Read(self.graph.edges[e].to));
+                }
+            }
+            out.push(Access::Read(n + v));
+            out.push(Access::Write(v));
+            for &e in &self.graph.in_edges[v] {
+                if self.required_enqueues(e) {
+                    out.push(Access::Set(n + self.graph.edges[e].from));
+                }
+            }
+        })
+    }
+
+    /// `SearchAdj` backward: every in-edge but a timing check, a latch D->Q, a preset/clear arc
+    /// and a disabled bidirect instance path or loop.
+    fn required_enqueues(&self, e: usize) -> bool {
+        !self.is_check(e) && !matches!(self.role(e), Some(Role::LatchDtoQ) | Some(Role::RegSetClr)) && !self.graph.bidirect_inst_paths.contains(&e) && !self.graph.is_disabled_loop(e)
     }
 
     /// `RequiredCmp::requiredsSave` and, when a required changed (not fuzzily equal), the fanin
@@ -1527,8 +1642,7 @@ impl<'g, 'a> Search<'g, 'a> {
         }
         if changed {
             for &e in &self.graph.in_edges[v] {
-                let adj = !self.is_check(e) && !matches!(self.role(e), Some(Role::LatchDtoQ) | Some(Role::RegSetClr)) && !self.graph.bidirect_inst_paths.contains(&e) && !self.graph.is_disabled_loop(e);
-                if adj {
+                if self.required_enqueues(e) {
                     enqueued[self.graph.edges[e].from] = true;
                 }
             }
@@ -2338,6 +2452,220 @@ mod tests {
     /// A clock-gate loop through a latch: f1's Q is the latch's D, the latch (enabled by the clock)
     /// gates the clock through an and2, and the gated clock clocks f1 again; f2 captures the latch
     /// on the clock. In the graph that is a loop, closed only by the latch D->Q edge.
+    /// A library with slew x load tables, so every slew and delay depends on its fanin and load.
+    const LIB_WIDE: &str = r#"library (w) {
+      time_unit : "1ns"; capacitive_load_unit (1, pf);
+      lu_table_template (t) { variable_1 : input_net_transition; variable_2 : total_output_net_capacitance; index_1 ("0.01, 0.5"); index_2 ("0.001, 0.1"); }
+      cell (buf) {
+        pin (A) { direction : input; capacitance : 0.002; }
+        pin (X) { direction : output; function : "A";
+          timing () { related_pin : "A"; timing_sense : positive_unate;
+            cell_rise (t) { values ("0.05, 0.3", "0.08, 0.4"); } rise_transition (t) { values ("0.02, 0.5", "0.06, 0.6"); }
+            cell_fall (t) { values ("0.06, 0.32", "0.09, 0.41"); } fall_transition (t) { values ("0.03, 0.45", "0.05, 0.55"); } } }
+      }
+      cell (and2) {
+        pin (A) { direction : input; capacitance : 0.0015; }
+        pin (B) { direction : input; capacitance : 0.0017; }
+        pin (X) { direction : output; function : "A&B";
+          timing () { related_pin : "A"; timing_sense : positive_unate;
+            cell_rise (t) { values ("0.07, 0.35", "0.1, 0.45"); } rise_transition (t) { values ("0.03, 0.55", "0.07, 0.65"); }
+            cell_fall (t) { values ("0.08, 0.37", "0.11, 0.47"); } fall_transition (t) { values ("0.04, 0.5", "0.06, 0.6"); } }
+          timing () { related_pin : "B"; timing_sense : positive_unate;
+            cell_rise (t) { values ("0.075, 0.36", "0.105, 0.46"); } rise_transition (t) { values ("0.031, 0.56", "0.071, 0.66"); }
+            cell_fall (t) { values ("0.085, 0.38", "0.115, 0.48"); } fall_transition (t) { values ("0.041, 0.51", "0.061, 0.61"); } } }
+      }
+      cell (dff) {
+        ff (IQ, IQN) { clocked_on : "CLK"; next_state : "D"; }
+        pin (CLK) { direction : input; capacitance : 0.001; clock : true; }
+        pin (D) { direction : input; capacitance : 0.001;
+          timing () { related_pin : "CLK"; timing_type : setup_rising;
+            rise_constraint (scalar) { values ("0.05"); } fall_constraint (scalar) { values ("0.06"); } }
+          timing () { related_pin : "CLK"; timing_type : hold_rising;
+            rise_constraint (scalar) { values ("0.02"); } fall_constraint (scalar) { values ("0.03"); } } }
+        pin (Q) { direction : output; function : "IQ";
+          timing () { related_pin : "CLK"; timing_type : rising_edge;
+            cell_rise (t) { values ("0.2, 0.5", "0.25, 0.6"); } rise_transition (t) { values ("0.05, 0.5", "0.08, 0.6"); }
+            cell_fall (t) { values ("0.22, 0.52", "0.27, 0.62"); } fall_transition (t) { values ("0.05, 0.45", "0.07, 0.55"); } } }
+      }
+      cell (lat) {
+        latch (IQ, IQN) { enable : "G"; data_in : "D"; }
+        pin (G) { direction : input; capacitance : 0.001; clock : true; }
+        pin (D) { direction : input; capacitance : 0.001;
+          timing () { related_pin : "G"; timing_type : setup_falling;
+            rise_constraint (scalar) { values ("0.04"); } fall_constraint (scalar) { values ("0.05"); } }
+          timing () { related_pin : "G"; timing_type : hold_falling;
+            rise_constraint (scalar) { values ("0.01"); } fall_constraint (scalar) { values ("0.02"); } } }
+        pin (Q) { direction : output; function : "IQ";
+          timing () { related_pin : "D"; timing_type : combinational; timing_sense : positive_unate;
+            cell_rise (t) { values ("0.15, 0.4", "0.2, 0.5"); } rise_transition (t) { values ("0.04, 0.5", "0.07, 0.6"); }
+            cell_fall (t) { values ("0.16, 0.41", "0.21, 0.51"); } fall_transition (t) { values ("0.04, 0.45", "0.06, 0.55"); } }
+          timing () { related_pin : "G"; timing_type : rising_edge;
+            cell_rise (t) { values ("0.2, 0.45", "0.25, 0.55"); } rise_transition (t) { values ("0.05, 0.5", "0.08, 0.6"); }
+            cell_fall (t) { values ("0.21, 0.46", "0.26, 0.56"); } fall_transition (t) { values ("0.05, 0.45", "0.07, 0.55"); } } }
+      }
+    }"#;
+
+    /// A wide, deep design from `seed`: `width` lanes of `depth` stages from `in<j>` to `out<j>`.
+    /// A stage is an and2 of its lane and a pseudo-random other lane (so fanouts and loads vary),
+    /// a dff every 4th stage, a latch on odd lanes at stage 6. The clock is propagated through a
+    /// two-level buffer tree. Each net gets a star RC network (driver to every load), so the
+    /// gate delays are DMP.
+    pub(crate) fn wide_design(seed: u64, width: usize, depth: usize) -> (Vec<Library>, Netlist, Sdc, HashMap<String, crate::graph::NetParasitics>) {
+        let libs = vec![Library::read(&crate::liberty_parse::parse(LIB_WIDE).unwrap()).unwrap()];
+        let mut st = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+        let mut rnd = |k: usize| {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (st >> 33) as usize % k
+        };
+        let mut insts = Vec::new();
+        let mut pins: HashMap<String, Vec<Conn>> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+        let mut on = |net: String, c: Conn, pins: &mut HashMap<String, Vec<Conn>>| {
+            if !pins.contains_key(&net) {
+                order.push(net.clone());
+            }
+            pins.entry(net).or_default().push(c);
+        };
+        let mut ports: Vec<(String, PortDir)> = vec![("clk".into(), PortDir::Input)];
+        on("clk".into(), Conn::Port(0), &mut pins);
+        insts.push(crate::netlist::inst("cb0", "buf"));
+        on("clk".into(), Conn::Inst(0, "A".into()), &mut pins);
+        on("ck0".into(), Conn::Inst(0, "X".into()), &mut pins);
+        let leaves = 4;
+        for k in 0..leaves {
+            let i = insts.len();
+            insts.push(crate::netlist::inst(format!("cb1_{k}"), "buf"));
+            on("ck0".into(), Conn::Inst(i, "A".into()), &mut pins);
+            on(format!("ck1_{k}"), Conn::Inst(i, "X".into()), &mut pins);
+        }
+        for j in 0..width {
+            let p = ports.len();
+            ports.push((format!("in{j}"), PortDir::Input));
+            on(format!("n0_{j}"), Conn::Port(p), &mut pins);
+        }
+        for d in 1..=depth {
+            for j in 0..width {
+                let i = insts.len();
+                let (prev, out) = (format!("n{}_{j}", d - 1), format!("n{d}_{j}"));
+                let ck = format!("ck1_{}", rnd(leaves));
+                if d % 4 == 0 {
+                    insts.push(crate::netlist::inst(format!("f{d}_{j}"), "dff"));
+                    on(prev, Conn::Inst(i, "D".into()), &mut pins);
+                    on(ck, Conn::Inst(i, "CLK".into()), &mut pins);
+                    on(out, Conn::Inst(i, "Q".into()), &mut pins);
+                } else if d == 6 && j % 2 == 1 {
+                    insts.push(crate::netlist::inst(format!("l{d}_{j}"), "lat"));
+                    on(prev, Conn::Inst(i, "D".into()), &mut pins);
+                    on(ck, Conn::Inst(i, "G".into()), &mut pins);
+                    on(out, Conn::Inst(i, "Q".into()), &mut pins);
+                } else {
+                    insts.push(crate::netlist::inst(format!("g{d}_{j}"), "and2"));
+                    let other = format!("n{}_{}", d - 1, rnd(width));
+                    on(prev, Conn::Inst(i, "A".into()), &mut pins);
+                    on(other, Conn::Inst(i, "B".into()), &mut pins);
+                    on(out, Conn::Inst(i, "X".into()), &mut pins);
+                }
+            }
+        }
+        for j in 0..width {
+            let p = ports.len();
+            ports.push((format!("out{j}"), PortDir::Output));
+            on(format!("n{depth}_{j}"), Conn::Port(p), &mut pins);
+        }
+        let mut par = HashMap::new();
+        let pin_name = |c: &Conn| match c {
+            Conn::Port(p) => ports[*p].0.clone(),
+            Conn::Inst(i, pin) => format!("{}/{pin}", insts[*i].0),
+        };
+        let is_driver = |c: &Conn| match c {
+            Conn::Port(p) => ports[*p].1 == PortDir::Input,
+            Conn::Inst(_, pin) => matches!(pin.as_str(), "X" | "Q"),
+        };
+        for name in &order {
+            let conns = &pins[name];
+            let Some(dr) = conns.iter().position(is_driver) else { continue };
+            let mut names = vec![pin_name(&conns[dr])];
+            names.extend(conns.iter().enumerate().filter(|&(k, _)| k != dr).map(|(_, c)| pin_name(c)));
+            let n = names.len();
+            let node_caps = (0..n).map(|k| 1e-15 * (1 + (k + rnd(5)) % 7) as f32).collect();
+            let resistors = (1..n).map(|k| (0, k, 20.0 + 15.0 * rnd(9) as f32)).collect();
+            par.insert(name.clone(), crate::graph::NetParasitics { node_names: names, network: crate::parasitics::Network { node_caps, resistors }, ..Default::default() });
+        }
+        let nets = order.iter().map(|n| Net { name: n.clone(), pins: pins[n].clone() }.into()).collect();
+        let netlist = Netlist { insts, ports, nets };
+        let ins: Vec<PortDelay> = (0..width).map(|j| PortDelay::uniform(&format!("in{j}"), 0.1e-9 + 0.01e-9 * (j % 5) as f32)).collect();
+        let outs: Vec<PortDelay> = (0..width).map(|j| PortDelay::uniform(&format!("out{j}"), 0.2e-9)).collect();
+        let sdc = Sdc { clocks: vec![Clock::new("c", 2e-9, "clk", true)], input_delays: ins, output_delays: outs, path_delays: Vec::new() };
+        (libs, netlist, sdc, par)
+    }
+
+    /// Everything a timing run stores, as bits: slews, delays, `clamped`, the dcalc trace, and per
+    /// vertex each path's tag, arrival, required and predecessor.
+    pub(crate) fn timing_bits(seed: u64, width: usize, depth: usize, threads: i32) -> Vec<String> {
+        let (libs, netlist, sdc, par) = wide_design(seed, width, depth);
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        assert_eq!(g.set_thread_count(threads), crate::par::resolve_thread_count(threads));
+        let mut trace = Vec::new();
+        g.find_delays(&par, Some(&mut trace)).unwrap();
+        let mut out = Vec::new();
+        for v in 0..g.vertices.len() {
+            let b: Vec<u32> = g.slew[v].iter().flatten().map(|x| x.to_bits()).collect();
+            out.push(format!("slew {} {b:?}", g.vname(v)));
+        }
+        for (e, row) in g.delay.iter().enumerate() {
+            let b: Vec<u32> = row.iter().flatten().map(|x| x.to_bits()).collect();
+            out.push(format!("delay {e} {b:?}"));
+        }
+        out.push(format!("clamped {:?}", g.clamped));
+        out.extend(trace);
+        let mut s = Search::in_graph_order(&g, &sdc);
+        s.find_arrivals().unwrap();
+        s.find_requireds().unwrap();
+        for (v, paths) in s.paths.iter().enumerate() {
+            for p in paths {
+                out.push(format!("path {} {:?} {:08x} {:08x} {:?}", g.vname(v), p.tag, p.arrival.to_bits(), p.required.to_bits(), p.prev));
+            }
+        }
+        out
+    }
+
+    /// 🔑 Rule (`BfsIterator::visitParallel`: a level runs on any thread and is a barrier; each
+    /// visit reads lower levels and writes its own vertex): delay calculation, arrivals and
+    /// requireds on 2, 4 or 16 threads store the same bits as on 1 — every slew, delay, trace line
+    /// and `clamped` entry in the serial order, every path's tag, arrival, required and
+    /// predecessor. Latches (postponed passes) and DMP gates on RC loads included.
+    #[test]
+    fn every_thread_count_times_a_multi_level_design_bit_for_bit() {
+        let serial = timing_bits(1, 64, 14, 1);
+        assert!(serial.iter().any(|l| l.starts_with("dcalc|gate|")), "the fixture takes the DMP path");
+        assert!(serial.len() > 5000, "a multi-level design: {} lines", serial.len());
+        for threads in [2, 4, 16] {
+            let par = timing_bits(1, 64, 14, threads);
+            assert_eq!(par.len(), serial.len(), "threads {threads}");
+            for (a, b) in serial.iter().zip(&par) {
+                assert_eq!(a, b, "threads {threads}");
+            }
+        }
+    }
+
+    /// The same rule on a small design (6 lanes, 5 stages) at 4 threads: waves wider than the
+    /// thread count, small enough for Miri and ThreadSanitizer.
+    #[test]
+    fn a_small_design_times_alike_on_four_threads() {
+        assert_eq!(timing_bits(3, 6, 5, 4), timing_bits(3, 6, 5, 1));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig { cases: 32, ..Default::default() })]
+
+        /// Differential: random designs (seed, width, depth) timed at 1 and at N threads store the
+        /// same bits ([`every_thread_count_times_a_multi_level_design_bit_for_bit`]'s rule).
+        #[test]
+        fn random_designs_time_alike_on_any_thread_count(seed in proptest::prelude::any::<u64>(), width in 1usize..48, depth in 1usize..12, threads in 2i32..17) {
+            proptest::prop_assert_eq!(timing_bits(seed, width, depth, 1), timing_bits(seed, width, depth, threads));
+        }
+    }
+
     const LIB_LATCH: &str = include_str!("../tests/data/latch-loop.lib");
 
     /// in -> f1/D; gclk -> f1/CLK; f1/Q -> l1/D; clk -> l1/G, g1/A, f2/CLK; l1/Q -> g1/B, f2/D;

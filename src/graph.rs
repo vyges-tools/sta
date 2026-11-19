@@ -157,6 +157,9 @@ pub struct Graph<'a> {
     pub slew_limit: HashMap<usize, f32>,
     /// The loads [`Graph::find_delays`] held at their limit, in the order it timed them.
     pub clamped: Vec<usize>,
+    /// Threads the delay calculation and the search run on ([`crate::par`]; 1: serial). Set
+    /// with [`Graph::set_thread_count`]. Every result is the same at any count.
+    pub thread_count: usize,
     /// Annotated max slews (`setAnnotatedSlew`): the vertex's max slew on both transitions IS the
     /// value, whatever the delay calculation finds — applied before its fanout reads it.
     pub slew_annotated: HashMap<usize, f32>,
@@ -235,6 +238,95 @@ pub struct Graph<'a> {
 
 /// [`Graph::parasitic_load`]: `(pin_cap, wire_cap, the pi model and its node names)`.
 type ParasiticLoad<'p> = (f32, f32, Option<(crate::parasitics::PiElmore, &'p [String])>);
+/// What one delay visit stores ([`Graph::vertex_delays`]): whole slew rows of vertices and whole
+/// delay rows of edges, whether the vertex enters `clamped`, and its trace lines.
+#[derive(Default, Debug)]
+pub struct VertexDelays {
+    pub slews: Vec<(usize, [[f32; 2]; 2])>,
+    pub delays: Vec<(usize, Vec<[f32; 2]>)>,
+    pub clamped: bool,
+    pub trace: Vec<String>,
+}
+
+/// The state a driver's delay visit writes, as copies: its own slews, each distinct load's slews
+/// (`slot[i]`: wire `i`'s load), each wire's delay row and each fanin edge's delay row (copied
+/// on first write). A read of a slew the visit already wrote — a fanin from-vertex that is also
+/// one of its loads, on a broken loop — reads the copy, as the in-place visit did.
+struct Overlay {
+    v: usize,
+    sv: [[f32; 2]; 2],
+    loads: Vec<usize>,
+    ls: Vec<[[f32; 2]; 2]>,
+    slot: Vec<usize>,
+    wire_delay: Vec<Vec<[f32; 2]>>,
+    fanin_delay: Vec<(usize, Vec<[f32; 2]>)>,
+    /// (fanin from-vertex, load slot) for a from-vertex among the loads.
+    alias: Vec<(usize, usize)>,
+}
+
+impl Overlay {
+    fn new(g: &Graph<'_>, v: usize, wires: &[usize], fanin: &[usize]) -> Overlay {
+        let mut loads: Vec<usize> = Vec::with_capacity(wires.len());
+        let mut slot = Vec::with_capacity(wires.len());
+        let mut by_load: HashMap<usize, usize> = HashMap::new();
+        for &w in wires {
+            let load = g.edges[w].to;
+            let k = if wires.len() <= 32 { loads.iter().position(|&l| l == load) } else { by_load.get(&load).copied() };
+            let k = k.unwrap_or_else(|| {
+                loads.push(load);
+                if wires.len() > 32 {
+                    by_load.insert(load, loads.len() - 1);
+                }
+                loads.len() - 1
+            });
+            slot.push(k);
+        }
+        let ls = loads.iter().map(|&l| g.slew[l]).collect();
+        let wire_delay = wires.iter().map(|&w| g.delay[w].clone()).collect();
+        let mut alias = Vec::new();
+        for &e in fanin {
+            let from = g.edges[e].from;
+            let k = if wires.len() <= 32 { loads.iter().position(|&l| l == from) } else { by_load.get(&from).copied() };
+            if let Some(k) = k {
+                alias.push((from, k));
+            }
+        }
+        Overlay { v, sv: g.slew[v], loads, ls, slot, wire_delay, fanin_delay: Vec::new(), alias }
+    }
+
+    /// Vertex `x`'s slews as the visit sees them so far.
+    fn slew_of(&self, g: &Graph<'_>, x: usize) -> [[f32; 2]; 2] {
+        if x == self.v {
+            return self.sv;
+        }
+        match self.alias.iter().find(|a| a.0 == x) {
+            Some(&(_, k)) => self.ls[k],
+            None => g.slew[x],
+        }
+    }
+
+    /// Fanin edge `e`'s delay row, copied on first use.
+    fn fanin_row(&mut self, g: &Graph<'_>, e: usize) -> &mut Vec<[f32; 2]> {
+        let k = match self.fanin_delay.iter().position(|r| r.0 == e) {
+            Some(k) => k,
+            None => {
+                self.fanin_delay.push((e, g.delay[e].clone()));
+                self.fanin_delay.len() - 1
+            }
+        };
+        &mut self.fanin_delay[k].1
+    }
+
+    fn into_delays(self, wires: &[usize], trace: Vec<String>) -> VertexDelays {
+        let mut slews = Vec::with_capacity(1 + self.loads.len());
+        slews.push((self.v, self.sv));
+        slews.extend(self.loads.into_iter().zip(self.ls));
+        let mut delays = self.fanin_delay;
+        delays.extend(wires.iter().copied().zip(self.wire_delay));
+        VertexDelays { slews, delays, clamped: false, trace }
+    }
+}
+
 
 /// A reduced parasitic's loads by name (`ReducedParasitic`'s pin-to-Elmore map, read by
 /// `findElmore(load_pin)`): the first entry for a name, as a pass over the list finds it. Built
@@ -783,7 +875,7 @@ impl<'a> Graph<'a> {
                 let _ = index_cache.set(std::sync::Arc::new(map));
             }
         }
-        Some(Graph { libs, netlist: keep, vertices: Arc::new(vertices), edges: Arc::new(edges), in_edges: Arc::new(in_edges), out_edges: Arc::new(out_edges), vertex_net: Arc::new(vertex_net), slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: Default::default(), bidirect_port_paths: Arc::new(bidirect_port_paths), disabled_loops: Default::default(), loops: Default::default(), index_cache, net_slots: Default::default(), scene_sets: None, array_ops: None, edit_seq: None, state_seq: None, hold_failed: false }.with_loops_broken())
+        Some(Graph { libs, netlist: keep, vertices: Arc::new(vertices), edges: Arc::new(edges), in_edges: Arc::new(in_edges), out_edges: Arc::new(out_edges), vertex_net: Arc::new(vertex_net), slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: Default::default(), bidirect_port_paths: Arc::new(bidirect_port_paths), disabled_loops: Default::default(), loops: Default::default(), index_cache, net_slots: Default::default(), scene_sets: None, array_ops: None, edit_seq: None, state_seq: None, hold_failed: false, thread_count: crate::par::default_thread_count() }.with_loops_broken())
     }
 
     /// [`Graph::build_with_pins`] with each pin found by its name.
@@ -1016,7 +1108,7 @@ impl<'a> Graph<'a> {
                 EdgeKind::Wire => vec![[0.0f32; 2]; 2],
             })
             .collect();
-        Ok(Graph { libs, netlist: keep, vertices: Arc::new(vertices), edges: Arc::new(edges), in_edges: Arc::new(in_edges), out_edges: Arc::new(out_edges), vertex_net: Arc::new(vertex_net), slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: Arc::new(bidirect_inst_paths), bidirect_port_paths: Arc::new(bidirect_port_paths), disabled_loops: Default::default(), loops: Default::default(), index_cache: std::sync::OnceLock::new(), net_slots: Default::default(), scene_sets: None, array_ops: None, edit_seq: None, state_seq: None, hold_failed: false }.with_loops_broken())
+        Ok(Graph { libs, netlist: keep, vertices: Arc::new(vertices), edges: Arc::new(edges), in_edges: Arc::new(in_edges), out_edges: Arc::new(out_edges), vertex_net: Arc::new(vertex_net), slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: Arc::new(bidirect_inst_paths), bidirect_port_paths: Arc::new(bidirect_port_paths), disabled_loops: Default::default(), loops: Default::default(), index_cache: std::sync::OnceLock::new(), net_slots: Default::default(), scene_sets: None, array_ops: None, edit_seq: None, state_seq: None, hold_failed: false, thread_count: crate::par::default_thread_count() }.with_loops_broken())
     }
 
     /// Whether vertex `v` is a top-level port's (an instance's vertex may have no library too:
@@ -1094,6 +1186,7 @@ impl<'a> Graph<'a> {
             delay: self.delay.iter().map(|r| vec![[0.0; 2]; r.len()]).collect(),
             slew_limit: HashMap::new(),
             clamped: Vec::new(),
+            thread_count: self.thread_count,
             slew_annotated: HashMap::new(),
             slew_blocked: None,
             sdc: SdcEnv::default(),
@@ -1296,7 +1389,8 @@ impl<'a> Graph<'a> {
     /// intrinsic delay); the port's slew is SET to the gate's, and each load's slew and wire delay
     /// are SET from the gate's load waveforms, the wire delay plus the load-dependent part of the
     /// gate delay (`gate − intrinsic`, in float). A later arc of the same transition overwrites.
-    fn time_input_drive(&mut self, v: usize, wires: &[usize], drive: &InputDrive, parasitics: &HashMap<String, NetParasitics>, index: &HashMap<String, usize>) -> Result<(), String> {
+    fn time_input_drive(&self, o: &mut Overlay, wires: &[usize], drive: &InputDrive, parasitics: &HashMap<String, NetParasitics>, index: &HashMap<String, usize>) -> Result<(), String> {
+        let v = o.v;
         let li = self.libs.iter().position(|l| l.cells.contains_key(&drive.cell)).ok_or_else(|| format!("set_driving_cell: cell {} not found", drive.cell))?;
         let cell = &self.libs[li].cells[&drive.cell];
         let from_port = match &drive.from_port {
@@ -1329,9 +1423,9 @@ impl<'a> Graph<'a> {
                             (f64::from(gd), f64::from(ds), None)
                         }
                     };
-                    self.slew[v][rf][mm] = drvr_slew as f32;
+                    o.sv[rf][mm] = drvr_slew as f32;
                     let load_delay = gate_delay as f32 - intrinsic;
-                    for &w in wires {
+                    for (i, &w) in wires.iter().enumerate() {
                         let load = self.edges[w].to;
                         let (mut wire_delay, mut load_slew) = match (&mut dmp, &pe) {
                             (Some(d), Some((p, names))) => match elmores.get(p, names, &self.vname(load)) {
@@ -1343,11 +1437,11 @@ impl<'a> Graph<'a> {
                         let ll = self.threshold_library(load);
                         threshold_adjust(ll == li, &self.lib_thresholds(li, rf), &self.lib_thresholds(ll, rf), rf == RISE, &mut wire_delay, &mut load_slew);
                         if !slew_blocked_by(&self.slew_blocked, &self.slew_annotated, load, mm) {
-                            self.slew[load][rf][mm] = load_slew as f32;
+                            o.ls[o.slot[i]][rf][mm] = load_slew as f32;
                         } else if let (Some(&a), MAX) = (self.slew_annotated.get(&load), mm) {
-                            self.slew[load][rf][mm] = a;
+                            o.ls[o.slot[i]][rf][mm] = a;
                         }
-                        self.delay[w][rf][mm] = wire_delay as f32 + load_delay;
+                        o.wire_delay[i][rf][mm] = wire_delay as f32 + load_delay;
                     }
                 }
             }
@@ -1502,19 +1596,19 @@ impl<'a> Graph<'a> {
     /// (`dcalc|gate|drvr|rf pair|in_slew|c2|rpi|c1|alg|rd|t0|dt|ceff|valid|delay|slew`, bits in hex)
     /// and per load (`dcalc|load|drvr|load|wire delay|load slew`).
     pub fn find_delays(&mut self, parasitics: &HashMap<String, NetParasitics>, mut trace: Option<&mut Vec<String>>) -> Result<(), String> {
+        let _time = crate::par::StageTimer::start("find_delays", self.thread_count);
         let order = self.topo_order()?;
         self.clamped.clear();
         let index = self.index().clone();
         let reached = self.dcalc_reached(&order);
-        for &v in &order {
-            if reached[v] {
-                self.find_vertex_delays(v, parasitics, &index, trace.as_deref_mut())?;
-            } else if !self.vertices[v].is_driver && self.slew_limit.contains_key(&v) && !self.slew_annotated.contains_key(&v) {
-                // 🔑 A load the search does not reach (its driver held constant: `searchFrom`)
-                // still has the slews its driver's arcs gave it, and the limit is read off them
-                // all the same (repair_design's forward pass reads `graph_->slew` of EVERY load).
-                self.hold_load_at_limit(v);
+        if self.thread_count <= 1 {
+            for &v in &order {
+                if let Some(d) = self.delay_visit(v, reached[v], parasitics, &index, trace.is_some())? {
+                    self.store_vertex_delays(v, d, trace.as_deref_mut());
+                }
             }
+        } else {
+            self.find_delays_parallel(&order, &reached, parasitics, &index, trace)?;
         }
         // Timing-check delays, after every slew is known.
         for e in 0..self.edges.len() {
@@ -1529,6 +1623,101 @@ impl<'a> Graph<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The delay pass on [`Graph::thread_count`] threads ([`crate::par`]): the topological order
+    /// cut into hazard waves — a visit reads the slews of its fanin's from-vertices and writes its
+    /// own slew and its loads' — each wave computed on the threads, then stored in topological
+    /// order. The trace lines and `clamped` come out in topological position, as the serial pass
+    /// emits them. Equal to the serial pass bit for bit.
+    fn find_delays_parallel(&mut self, order: &[usize], reached: &[bool], parasitics: &HashMap<String, NetParasitics>, index: &HashMap<String, usize>, trace: Option<&mut Vec<String>>) -> Result<(), String> {
+        let threads = self.thread_count;
+        let want_trace = trace.is_some();
+        let waves = {
+            let g = &*self;
+            crate::par::waves(order, g.vertices.len(), |v, out| {
+                for &e in g.in_edges[v].iter() {
+                    if !g.is_check(e) {
+                        out.push(crate::par::Access::Read(g.edges[e].from));
+                    }
+                }
+                out.push(crate::par::Access::Write(v));
+                for &e in g.out_edges[v].iter() {
+                    if matches!(g.edges[e].kind, EdgeKind::Wire) {
+                        out.push(crate::par::Access::Write(g.edges[e].to));
+                    }
+                }
+            })
+        };
+        let mut pos = vec![0usize; self.vertices.len()];
+        for (i, &v) in order.iter().enumerate() {
+            pos[v] = i;
+        }
+        let mut side: Vec<(usize, Vec<String>, bool)> = Vec::new();
+        for wave in &waves {
+            let results = {
+                let g = &*self;
+                crate::par::map(wave, threads, |v| g.delay_visit(v, reached[v], parasitics, index, want_trace))
+            };
+            for (&v, r) in wave.iter().zip(results) {
+                if let Some(mut d) = r? {
+                    let lines = std::mem::take(&mut d.trace);
+                    let clamped = d.clamped;
+                    d.clamped = false;
+                    self.store_vertex_delays(v, d, None);
+                    if !lines.is_empty() || clamped {
+                        side.push((pos[v], lines, clamped));
+                    }
+                }
+            }
+        }
+        side.sort_by_key(|s| s.0);
+        let mut trace = trace;
+        for (p, lines, clamped) in side {
+            if clamped {
+                self.clamped.push(order[p]);
+            }
+            if let Some(t) = trace.as_deref_mut() {
+                t.extend(lines);
+            }
+        }
+        Ok(())
+    }
+
+    /// One vertex of the delay pass, computed, not stored: a vertex the search reaches is timed
+    /// ([`Graph::vertex_delays`]); an unreached load with a slew limit is held at it.
+    fn delay_visit(&self, v: usize, reached: bool, parasitics: &HashMap<String, NetParasitics>, index: &HashMap<String, usize>, trace: bool) -> Result<Option<VertexDelays>, String> {
+        if reached {
+            return self.vertex_delays(v, parasitics, index, trace).map(Some);
+        }
+        if !self.vertices[v].is_driver && self.slew_limit.contains_key(&v) && !self.slew_annotated.contains_key(&v) {
+            // 🔑 A load the search does not reach (its driver held constant: `searchFrom`)
+            // still has the slews its driver's arcs gave it, and the limit is read off them
+            // all the same (repair_design's forward pass reads `graph_->slew` of EVERY load).
+            let mut d = VertexDelays::default();
+            if let Some(s) = self.held_at_limit(v, self.slew[v]) {
+                d.slews.push((v, s));
+                d.clamped = true;
+            }
+            return Ok(Some(d));
+        }
+        Ok(None)
+    }
+
+    /// Stores one visit's slews and delays, then its `clamped` entry and trace lines.
+    fn store_vertex_delays(&mut self, v: usize, d: VertexDelays, trace: Option<&mut Vec<String>>) {
+        for (x, s) in d.slews {
+            self.slew[x] = s;
+        }
+        for (e, row) in d.delays {
+            self.delay[e] = row;
+        }
+        if d.clamped {
+            self.clamped.push(v);
+        }
+        if let Some(t) = trace {
+            t.extend(d.trace);
+        }
     }
 
     /// `GraphDelayCalc::findLatchEdgeDelays`: a latch D -> Q edge's arcs at the D slew and the Q
@@ -1588,17 +1777,26 @@ impl<'a> Graph<'a> {
     }
 
     /// A load with a slew limit ([`Graph::slew_limit`]): its driver set its slew; before its
-    /// fanout reads it, an excess on either transition holds BOTH max slews at the limit.
-    fn hold_load_at_limit(&mut self, v: usize) {
-        let Some(&limit) = self.slew_limit.get(&v) else { return };
+    /// fanout reads it, an excess on either transition holds BOTH max slews at the limit — the
+    /// held slews, `None` when nothing is held (`clamped` takes the vertex).
+    fn held_at_limit(&self, v: usize, mut slew: [[f32; 2]; 2]) -> Option<[[f32; 2]; 2]> {
+        let &limit = self.slew_limit.get(&v)?;
         if self.in_edges[v].iter().all(|&e| self.is_check(e)) {
-            return;
+            return None;
         }
-        if self.slew[v][RISE][MAX] > limit || self.slew[v][FALL][MAX] > limit {
-            self.slew[v][RISE][MAX] = limit;
-            self.slew[v][FALL][MAX] = limit;
-            self.clamped.push(v);
+        if slew[RISE][MAX] > limit || slew[FALL][MAX] > limit {
+            slew[RISE][MAX] = limit;
+            slew[FALL][MAX] = limit;
+            return Some(slew);
         }
+        None
+    }
+
+    /// `set_thread_count`: `<= 0` every hardware thread, above the machine's count clamped to it
+    /// ([`crate::par::resolve_thread_count`]). Returns the count set.
+    pub fn set_thread_count(&mut self, requested: i32) -> usize {
+        self.thread_count = crate::par::resolve_thread_count(requested);
+        self.thread_count
     }
 
     pub fn is_constant(&self, v: usize) -> bool {
@@ -1667,35 +1865,50 @@ impl<'a> Graph<'a> {
     /// One vertex of the delay calculation (`findVertexDelay`): a load takes its root slew, its
     /// annotation or its limit; an input port its drive; a driver every arc of every in-edge,
     /// its slew and its loads' slews and wire delays merged from the initial values.
-    pub fn find_vertex_delays(&mut self, v: usize, parasitics: &HashMap<String, NetParasitics>, index: &HashMap<String, usize>, mut trace: Option<&mut Vec<String>>) -> Result<(), String> {
+    pub fn find_vertex_delays(&mut self, v: usize, parasitics: &HashMap<String, NetParasitics>, index: &HashMap<String, usize>, trace: Option<&mut Vec<String>>) -> Result<(), String> {
+        let d = self.vertex_delays(v, parasitics, index, trace.is_some())?;
+        self.store_vertex_delays(v, d, trace);
+        Ok(())
+    }
+
+    /// [`Graph::find_vertex_delays`] computed, not stored: the visit runs on copies of the slews
+    /// and delay rows it writes ([`Overlay`]) and returns them, so visits of one wave can run on
+    /// several threads ([`crate::par`]). With `trace`, the trace lines it would push.
+    pub fn vertex_delays(&self, v: usize, parasitics: &HashMap<String, NetParasitics>, index: &HashMap<String, usize>, trace: bool) -> Result<VertexDelays, String> {
+        let mut lines: Vec<String> = Vec::new();
         const INIT: [f32; 2] = [1e30, -1e30];
         // Fuzzily worse for this min/max, so the merge order matters.
         let worse = |mm: usize, a: f32, b: f32| if mm == MAX { crate::fuzzy::greater(a, b) } else { crate::fuzzy::less(a, b) };
         let fanin: Vec<usize> = self.in_edges[v].iter().copied().filter(|&e| !self.is_check(e)).collect();
         let wires: Vec<usize> = self.out_edges[v].iter().copied().filter(|&e| matches!(self.edges[e].kind, EdgeKind::Wire)).collect();
         if !self.vertices[v].is_driver {
+            let mut d = VertexDelays::default();
             if fanin.is_empty() {
                 // A root load's slew is 0.
-                self.slew[v] = [[0.0; 2]; 2];
+                d.slews.push((v, [[0.0; 2]; 2]));
             } else if let Some(&value) = self.slew_annotated.get(&v) {
                 // Kept only while it is blocked: an annotation the bits do not protect
                 // ([`Graph::slew_blocked`]) was overwritten by its driver, and visiting the load
                 // (`findVertexDelay`) writes no slew.
                 if slew_blocked_by(&self.slew_blocked, &self.slew_annotated, v, MAX) {
-                    self.slew[v][RISE][MAX] = value;
-                    self.slew[v][FALL][MAX] = value;
+                    let mut s = self.slew[v];
+                    s[RISE][MAX] = value;
+                    s[FALL][MAX] = value;
+                    d.slews.push((v, s));
                 }
-            } else {
-                self.hold_load_at_limit(v);
+            } else if let Some(s) = self.held_at_limit(v, self.slew[v]) {
+                d.slews.push((v, s));
+                d.clamped = true;
             }
-            return Ok(());
+            return Ok(d);
         }
+        let mut o = Overlay::new(self, v, &wires, &fanin);
         // `findVertexDelay`: a root, or a top-level bidirect port's driver vertex (its load's wire
         // into it aside), is seeded as an input.
         if fanin.is_empty() || self.is_port(v) {
             if let Some(drive) = self.sdc_at(&self.sdc.input_drive, v).cloned() {
-                self.time_input_drive(v, &wires, &drive, parasitics, index)?;
-                return Ok(());
+                self.time_input_drive(&mut o, &wires, &drive, parasitics, index)?;
+                return Ok(o.into_delays(&wires, lines));
             }
             // An input port (`seedNoDrvrCellSlew` / `seedNoDrvrSlew`): its slew is the
             // `set_input_transition`, else 0; its loads by the input-port delay at that slew
@@ -1708,10 +1921,10 @@ impl<'a> Graph<'a> {
             for rf in [RISE, FALL] {
                 for mm in [MIN, MAX] {
                     let in_slew = self.sdc_at(&self.sdc.input_slew, v).and_then(|s| s[rf][mm]).unwrap_or(0.0);
-                    self.slew[v][rf][mm] = annotated.unwrap_or(in_slew);
+                    o.sv[rf][mm] = annotated.unwrap_or(in_slew);
                     let (_, _, pe) = self.parasitic_load(v, rf, mm, parasitics, index);
                     let elmores = LoadElmores::new(pe.as_ref());
-                    for &e in &wires {
+                    for (i, &e) in wires.iter().enumerate() {
                         let load = self.edges[e].to;
                         let mut wire_delay = 0.0f64;
                         let mut load_slew = f64::from(in_slew);
@@ -1725,15 +1938,15 @@ impl<'a> Graph<'a> {
                         threshold_adjust(ll == 0, &self.lib_thresholds(0, rf), &self.lib_thresholds(ll, rf), rf == RISE, &mut wire_delay, &mut load_slew);
                         // A load's own annotation stands (`annotateLoadDelays`), as from a cell driver.
                         if !slew_blocked_by(&self.slew_blocked, &self.slew_annotated, load, mm) {
-                            self.slew[load][rf][mm] = annotated.unwrap_or(load_slew as f32);
+                            o.ls[o.slot[i]][rf][mm] = annotated.unwrap_or(load_slew as f32);
                         } else if let (Some(&a), MAX) = (self.slew_annotated.get(&load), mm) {
-                            self.slew[load][rf][mm] = a;
+                            o.ls[o.slot[i]][rf][mm] = a;
                         }
-                        self.delay[e][rf][mm] = wire_delay as f32;
+                        o.wire_delay[i][rf][mm] = wire_delay as f32;
                     }
                 }
             }
-            return Ok(());
+            return Ok(o.into_delays(&wires, lines));
         }
         // Driver delays: init, then every arc of every in-edge.
         let drvr_lib = self.vertices[v].lib.expect("an instance driver");
@@ -1741,20 +1954,20 @@ impl<'a> Graph<'a> {
         // load (`setAnnotatedSlew`, max rise and fall) keeps its annotation through its driver's
         // timing, not just after its own visit.
         // (`initLoadSlews`: a blocked slew is not reset — [`Graph::slew_blocked`].)
-        for &e in &wires {
+        for (i, &e) in wires.iter().enumerate() {
             let load = self.edges[e].to;
             for mm in [MIN, MAX] {
                 if !slew_blocked_by(&self.slew_blocked, &self.slew_annotated, load, mm) {
-                    self.slew[load][RISE][mm] = INIT[mm];
-                    self.slew[load][FALL][mm] = INIT[mm];
+                    o.ls[o.slot[i]][RISE][mm] = INIT[mm];
+                    o.ls[o.slot[i]][FALL][mm] = INIT[mm];
                 } else if let (Some(&a), MAX) = (self.slew_annotated.get(&load), mm) {
-                    self.slew[load][RISE][MAX] = a;
-                    self.slew[load][FALL][MAX] = a;
+                    o.ls[o.slot[i]][RISE][MAX] = a;
+                    o.ls[o.slot[i]][FALL][MAX] = a;
                 }
             }
-            self.delay[e] = vec![[INIT[MIN], INIT[MAX]]; 2];
+            o.wire_delay[i] = vec![[INIT[MIN], INIT[MAX]]; 2];
         }
-        self.slew[v] = [[INIT[MIN], INIT[MAX]], [INIT[MIN], INIT[MAX]]];
+        o.sv = [[INIT[MIN], INIT[MAX]], [INIT[MIN], INIT[MAX]]];
         let mut exists = [false; 2];
         // `parasiticLoad` depends on the driver, the transition and min/max only, not on the arc:
         // reduced once per pair, on first use, rather than once per arc.
@@ -1785,7 +1998,7 @@ impl<'a> Graph<'a> {
                     let Model::Gate(model) = &arc.model else { continue };
                     let rf = arc.to_rf;
                     // `edgeFromSlew`: an ideal clock's slew for a register clk->q edge
-                    let in_slew = if ideal_clk_to_q { self.ideal_clk_slew(from, arc.from_rf, mm) } else { self.slew[from][arc.from_rf][mm] };
+                    let in_slew = if ideal_clk_to_q { self.ideal_clk_slew(from, arc.from_rf, mm) } else { o.slew_of(self, from)[arc.from_rf][mm] };
                     if loads[rf][mm].is_none() {
                         loads[rf][mm] = Some(self.parasitic_load(v, rf, mm, parasitics, index));
                     }
@@ -1806,7 +2019,7 @@ impl<'a> Graph<'a> {
                         }
                     };
                     exists[rf] = true;
-                    if let (Some(t), Some(d), Some((p, _))) = (trace.as_deref_mut(), &dmp, &pe) {
+                    if let (true, Some(d), Some((p, _))) = (trace, &dmp, &pe) {
                         let (rd, t0, dt, ceff) = d.state();
                         let alg = match d.alg {
                             crate::dcalc::Alg::Cap => "cap",
@@ -1814,14 +2027,14 @@ impl<'a> Graph<'a> {
                             crate::dcalc::Alg::ZeroC2 => "c2=0",
                         };
                         let rfc = |r: usize| if r == RISE { '^' } else { 'v' };
-                        t.push(format!("dcalc|gate|{}|{}{}|{:08x}|{:08x}|{:08x}|{:08x}|{alg}|{:016x}|{:016x}|{:016x}|{:016x}|{}|{:016x}|{:016x}", self.vname(v), rfc(arc.from_rf), rfc(rf), in_slew.to_bits(), p.c2.to_bits(), p.rpi.to_bits(), p.c1.to_bits(), rd.to_bits(), t0.to_bits(), dt.to_bits(), ceff.to_bits(), i32::from(d.driver_valid()), gate_delay.to_bits(), drvr_slew.to_bits()));
+                        lines.push(format!("dcalc|gate|{}|{}{}|{:08x}|{:08x}|{:08x}|{:08x}|{alg}|{:016x}|{:016x}|{:016x}|{:016x}|{}|{:016x}|{:016x}", self.vname(v), rfc(arc.from_rf), rfc(rf), in_slew.to_bits(), p.c2.to_bits(), p.rpi.to_bits(), p.c1.to_bits(), rd.to_bits(), t0.to_bits(), dt.to_bits(), ceff.to_bits(), i32::from(d.driver_valid()), gate_delay.to_bits(), drvr_slew.to_bits()));
                     }
                     let (gd32, ds32) = (gate_delay as f32, drvr_slew as f32);
-                    if worse(mm, ds32, self.slew[v][rf][mm]) {
-                        self.slew[v][rf][mm] = ds32;
+                    if worse(mm, ds32, o.sv[rf][mm]) {
+                        o.sv[rf][mm] = ds32;
                     }
-                    self.delay[e][k][mm] = gd32;
-                    for &w in &wires {
+                    o.fanin_row(self, e)[k][mm] = gd32;
+                    for (i, &w) in wires.iter().enumerate() {
                         let load = self.edges[w].to;
                         let (mut wire_delay, mut load_slew) = match (&mut dmp, &pe) {
                             (Some(d), Some((p, names))) => match elmores.get(p, names, &self.vname(load)) {
@@ -1830,16 +2043,16 @@ impl<'a> Graph<'a> {
                             },
                             _ => (0.0, f64::from(ds32)),
                         };
-                        if let (Some(t), Some(_)) = (trace.as_deref_mut(), &dmp) {
-                            t.push(format!("dcalc|load|{}|{}|{:016x}|{:016x}", self.vname(v), self.vname(load), wire_delay.to_bits(), load_slew.to_bits()));
+                        if let (true, Some(_)) = (trace, &dmp) {
+                            lines.push(format!("dcalc|load|{}|{}|{:016x}|{:016x}", self.vname(v), self.vname(load), wire_delay.to_bits(), load_slew.to_bits()));
                         }
                         let ll = self.threshold_library(load);
                         threshold_adjust(ll == drvr_lib, &self.lib_thresholds(drvr_lib, rf), &self.lib_thresholds(ll, rf), rf == RISE, &mut wire_delay, &mut load_slew);
-                        if worse(mm, load_slew as f32, self.slew[load][rf][mm]) && !slew_blocked_by(&self.slew_blocked, &self.slew_annotated, load, mm) {
-                            self.slew[load][rf][mm] = load_slew as f32;
+                        if worse(mm, load_slew as f32, o.ls[o.slot[i]][rf][mm]) && !slew_blocked_by(&self.slew_blocked, &self.slew_annotated, load, mm) {
+                            o.ls[o.slot[i]][rf][mm] = load_slew as f32;
                         }
-                        if worse(mm, wire_delay as f32, self.delay[w][rf][mm]) {
-                            self.delay[w][rf][mm] = wire_delay as f32;
+                        if worse(mm, wire_delay as f32, o.wire_delay[i][rf][mm]) {
+                            o.wire_delay[i][rf][mm] = wire_delay as f32;
                         }
                     }
                 }
@@ -1848,18 +2061,18 @@ impl<'a> Graph<'a> {
         for rf in [RISE, FALL] {
             if !exists[rf] {
                 for mm in [MIN, MAX] {
-                    self.slew[v][rf][mm] = INIT[mm];
-                    for &w in &wires {
-                        self.delay[w][rf][mm] = 0.0;
+                    o.sv[rf][mm] = INIT[mm];
+                    for (i, &w) in wires.iter().enumerate() {
+                        o.wire_delay[i][rf][mm] = 0.0;
                         let load = self.edges[w].to;
                         if !slew_blocked_by(&self.slew_blocked, &self.slew_annotated, load, mm) {
-                            self.slew[load][rf][mm] = 0.0;
+                            o.ls[o.slot[i]][rf][mm] = 0.0;
                         }
                     }
                 }
             }
         }
-        Ok(())
+        Ok(o.into_delays(&wires, lines))
     }
 
     /// `Search::timingDerate`: the factor on edge `e`'s arc `k` for a clock (`is_clk`) or data

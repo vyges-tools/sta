@@ -20,10 +20,27 @@ loom = ["dep:vyges-loom"]
 [dependencies]
 vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "main", optional = true }
 
+[dev-dependencies]
+# Differential property tests: random designs timed at 1 and N threads.
+proptest = { version = "1", default-features = false, features = ["std"] }
+# An exhaustive interleaving model of the parallel visit (`tests/par_model.rs`). Renamed: the
+# `loom` FEATURE above is the netlist reader, an unrelated crate.
+loom-model = { package = "loom", version = "0.7" }
+
 [[example]]
 name = "load_graph"
+required-features = ["loom"]
+
+[[example]]
+name = "time_stages"
 required-features = ["loom"]
 
 [[test]]
 name = "correlation"
 required-features = ["loom"]
+
+[lints.rust]
+# The parallel passes (`par`) rely on Send/Sync and the borrow checker alone.
+unsafe_code = "forbid"
+# `cfg(kani)`: the Kani proofs in `par`.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
