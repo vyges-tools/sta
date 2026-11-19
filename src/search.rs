@@ -1144,16 +1144,10 @@ impl<'g, 'a> Search<'g, 'a> {
         if self.sdc.state_slots() > 64 {
             return Err(format!("{} exception states: not modelled (64 are)", self.sdc.state_slots()));
         }
-        // A latch's borrow takes the enable clock's uncertainty too (`latchBorrowInfo`'s
-        // `open_uncertainty`), which `latch_required` does not carry.
-        let uncertain = self.sdc.clocks.iter().any(|c| c.uncertainty.iter().any(Option::is_some) || !c.inter_uncertainties.is_empty());
         // `latchBorrowInfo` reads the enable's insertion as well, which `latch_required` does not.
         let inserted = self.sdc.clocks.iter().any(|c| c.insertion.iter().flatten().flatten().any(Option::is_some));
         if inserted && self.latch_data.iter().any(|&l| l) {
             return Err("set_clock_latency -source on a design with latches: not modelled".into());
-        }
-        if uncertain && self.latch_data.iter().any(|&l| l) {
-            return Err("set_clock_uncertainty on a design with latches: not modelled".into());
         }
         let find = |pin: &str| (0..self.graph.vertices.len()).position(|x| self.graph.vname(x) == pin);
         for pd in &self.sdc.path_delays {
@@ -1828,10 +1822,10 @@ impl<'g, 'a> Search<'g, 'a> {
         (self.edge_clock(edge).insertion_of(edge % 2, tag.mm, tag.mm) + self.edge_time(edge)) + f32::from_bits(tag.latency)
     }
 
-    /// `Latches::latchRequired` with no exception (no multicycle, no path delay, no uncertainty, no
-    /// borrow limit): `(required, borrow, adjusted data arrival)`. With the enable and disable clock
-    /// paths: the enable's arrival = the latch-setup cycle's required + its network delay + the
-    /// open CRPR; data at or before it needs nothing borrowed; else it borrows, up to the enable's
+    /// `Latches::latchRequired` with no exception (no multicycle, no path delay, no borrow limit):
+    /// `(required, borrow, adjusted data arrival)`. With the enable and disable clock paths: the
+    /// enable's arrival = (the latch-setup cycle's required + the open uncertainty) + its network
+    /// delay + the open CRPR; data at or before it needs nothing borrowed; else it borrows, up to the enable's
     /// pulse width less (the latency and CRPR differences + the margin) — the required then the
     /// data's arrival, or the enable plus the borrow limit; the data leaves shifted from the data
     /// clock's cycle to the enable's. With the disable path alone: its clock arrival − the margin.
@@ -1850,7 +1844,10 @@ impl<'g, 'a> Search<'g, 'a> {
                 let max_borrow = nom_pulse_width - ((latency_diff + crpr_diff) + margin);
                 let acct = self.accting(data_edge, en_edge);
                 let tgt_clk_time = acct.required[ACCT_LATCH_SETUP];
-                let enable_arrival = ((0.0 + tgt_clk_time + 0.0 + 0.0) + open_latency) + open_crpr;
+                // `latchBorrowInfo`'s `open_uncertainty`: `checkClkUncertainty(data edge, enable
+                // edge, enable path, latchSetup)` — a setup role, so the max value negated.
+                let open_uncertainty = self.sdc.check_clk_uncertainty(Some(data_edge), en_edge, MAX);
+                let enable_arrival = ((0.0 + tgt_clk_time + open_uncertainty + 0.0) + open_latency) + open_crpr;
                 if crate::fuzzy::less_equal(data_arrival, enable_arrival) {
                     (enable_arrival, 0.0, data_arrival)
                 } else {
@@ -2418,6 +2415,69 @@ mod tests {
         sdc_false.path_delays = vec![pd(None, true)];
         let s = Search::in_graph_order(&g, &sdc_false);
         assert!(s.constraints_modelled().is_err_and(|e| e.contains("on a design with latches")));
+    }
+
+    /// Rule (`Latches::latchRequired` / `latchBorrowInfo`): a latch's enable arrives at (the
+    /// latch-setup cycle's required + `open_uncertainty`) + its network delay + the open CRPR,
+    /// `open_uncertainty` being `checkClkUncertainty(data edge, enable edge, enable path,
+    /// latchSetup)` — the setup uncertainty, negated. It moves the required time with no borrow (ln
+    /// at 0.1), the borrow (ln at 0.3), and — the borrow capped at the pulse width — the adjusted
+    /// data arrival, so the latch's Q (l1: 0.66 -> 0.56 -> 0.36). Every value is the reference's
+    /// (pinned OpenSTA, `instruments/sta/latch-uncertainty`, `get_property arrival_*` / `slack_*`),
+    /// with the latch-loop design plus a negative latch `ln` between two registers.
+    #[test]
+    fn a_latch_check_takes_the_open_edge_uncertainty() {
+        let libs = vec![Library::read(&crate::liberty_parse::parse(include_str!("../tests/data/latch-uncertainty.lib")).unwrap()).unwrap()];
+        let i = |k: usize, p: &str| Conn::Inst(k, p.into());
+        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins }.into();
+        let netlist = Netlist {
+            insts: ["f1 dff", "l1 lat", "g1 and2", "f2 dff", "f3 dff", "ln latn", "f4 dff"].iter().map(|x| { let (a, b) = x.split_once(' ').unwrap(); crate::netlist::inst(a, b) }).collect(),
+            ports: vec![("clk".into(), PortDir::Input), ("in".into(), PortDir::Input), ("out".into(), PortDir::Output), ("out2".into(), PortDir::Output)],
+            nets: vec![
+                net("clk", vec![Conn::Port(0), i(1, "G"), i(2, "A"), i(3, "CLK"), i(4, "CLK"), i(5, "G"), i(6, "CLK")]),
+                net("in", vec![Conn::Port(1), i(0, "D"), i(4, "D")]),
+                net("q1", vec![i(0, "Q"), i(1, "D")]),
+                net("lq", vec![i(1, "Q"), i(2, "B"), i(3, "D")]),
+                net("gclk", vec![i(2, "X"), i(0, "CLK")]),
+                net("out", vec![i(3, "Q"), Conn::Port(2)]),
+                net("q3", vec![i(4, "Q"), i(5, "D")]),
+                net("nq", vec![i(5, "Q"), i(6, "D")]),
+                net("out2", vec![i(6, "Q"), Conn::Port(3)]),
+            ],
+        };
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        g.find_delays(&HashMap::new(), None).unwrap();
+        let v = |n: &str| (0..g.vertices.len()).position(|x| g.vname(x) == n).unwrap();
+        let ns = |x: f32| (x * 1e9 * 1e4).round() / 1e4;
+        // (setup U, hold H): l1/Q, ln/Q max rise/fall; slack max/min at l1/D, f2/D, ln/D, f4/D.
+        type Want = ([f32; 2], [f32; 2], [[f32; 2]; 4]);
+        let cases: [(f32, f32, Want); 4] = [
+            (0.0, 0.02, ([0.60, 0.66], [0.75, 0.76], [[0.0, 0.87], [0.28, 0.21], [0.15, 0.27], [0.18, 0.71]])),
+            (0.1, 0.02, ([0.56, 0.56], [0.75, 0.76], [[-0.1, 0.87], [0.28, 0.21], [0.05, 0.27], [0.08, 0.71]])),
+            (0.3, 0.02, ([0.36, 0.36], [0.75, 0.76], [[-0.3, 0.87], [0.28, 0.21], [0.0, 0.27], [-0.12, 0.71]])),
+            (0.1, 0.1, ([0.56, 0.56], [0.75, 0.76], [[-0.1, 0.79], [0.28, 0.13], [0.05, 0.19], [0.08, 0.63]])),
+        ];
+        for (u, h, (l1q, lnq, slacks)) in cases {
+            let mut clock = Clock::new("c", 1e-9, "clk", true);
+            clock.uncertainty = [Some(h * 1e-9), Some(u * 1e-9)];
+            let sdc = Sdc {
+                clocks: vec![clock],
+                input_delays: vec![PortDelay::uniform("in", 0.2e-9)],
+                output_delays: vec![PortDelay::uniform("out", 0.2e-9), PortDelay::uniform("out2", 0.2e-9)],
+                path_delays: Vec::new(),
+            };
+            let mut s = Search::in_graph_order(&g, &sdc);
+            s.constraints_modelled().expect("clock uncertainty on a latch design is modelled");
+            s.find_arrivals().unwrap();
+            s.find_requireds().unwrap();
+            let max_rf = |p: &str| [s.arrival_rf(v(p), RISE, MAX), s.arrival_rf(v(p), FALL, MAX)].map(ns);
+            assert_eq!(max_rf("l1/Q"), l1q, "U={u}: l1/Q (capped borrow)");
+            assert_eq!(max_rf("ln/Q"), lnq, "U={u}: ln/Q");
+            for (pin, want) in ["l1/D", "f2/D", "ln/D", "f4/D"].iter().zip(slacks) {
+                let got = [ns(s.slack_of(v(pin), MAX, None)), ns(s.slack_of(v(pin), MIN, None))];
+                assert_eq!(got, want, "U={u} H={h}: {pin} slack max/min");
+            }
+        }
     }
 
     /// A register reset asynchronously: `RESET_B` with a rising recovery check and the clear arc on
