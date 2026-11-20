@@ -1576,28 +1576,37 @@ impl<'g, 'a> Search<'g, 'a> {
         let order = self.graph.topo_order()?;
         let mut enqueued = vec![false; self.graph.vertices.len()];
         // `seedRequireds`: every endpoint (`endpoints()`, vertex order) seeded from its own path
-        // ends (`seedRequired`). Timed in parts: the endpoint scan, the path-end visits, the saves.
-        let t = std::time::Instant::now();
-        let ends: Vec<usize> = (0..self.graph.vertices.len()).filter(|&v| self.is_endpoint(v)).collect();
-        let mut is_end = vec![false; self.graph.vertices.len()];
-        for &v in &ends {
-            is_end[v] = true;
-        }
-        crate::par::add_time("seed_scan", t.elapsed().as_secs_f64());
-        let (mut ends_secs, mut save_secs) = (0.0, 0.0);
-        for &v in &ends {
-            let t = std::time::Instant::now();
-            let mut req: Vec<f32> = self.paths[v].iter().map(|p| if p.tag.mm == MAX { INF } else { -INF }).collect();
-            self.visit_path_ends(v, &mut req);
-            let t2 = std::time::Instant::now();
-            ends_secs += (t2 - t).as_secs_f64();
-            self.required_save(v, req, &mut enqueued);
-            save_secs += t2.elapsed().as_secs_f64();
-        }
-        crate::par::add_time("seed_ends", ends_secs);
-        crate::par::add_time("seed_save", save_secs);
-        crate::par::add_time("seed_count", ends.len() as f64);
+        // ends (`seedRequired`). ⚠️ Serial in the reference; here two maps over the threads, then
+        // the saves in endpoint order: a seed reads arrivals and the SDC, never a required, and
+        // writes only its own endpoint's; the fanin it enqueues is a union — so any split stores
+        // the bits the serial loop does. Timed in parts: the endpoint scan, the path-end visits,
+        // the saves (the maps unrecorded as maps, so a part is counted once).
         let threads = self.graph.thread_count;
+        let t = std::time::Instant::now();
+        let all: Vec<usize> = (0..self.graph.vertices.len()).collect();
+        let is_end = {
+            let s = &*self;
+            crate::par::map_inner(&all, threads, |v| s.is_endpoint(v))
+        };
+        drop(all);
+        let ends: Vec<usize> = (0..self.graph.vertices.len()).filter(|&v| is_end[v]).collect();
+        crate::par::add_time("seed_scan", t.elapsed().as_secs_f64());
+        let t = std::time::Instant::now();
+        let seeds = {
+            let s = &*self;
+            crate::par::map_inner(&ends, threads, |v| {
+                let mut req: Vec<f32> = s.paths[v].iter().map(|p| if p.tag.mm == MAX { INF } else { -INF }).collect();
+                s.visit_path_ends(v, &mut req);
+                req
+            })
+        };
+        crate::par::add_time("seed_ends", t.elapsed().as_secs_f64());
+        let t = std::time::Instant::now();
+        for (&v, req) in ends.iter().zip(seeds) {
+            self.required_save(v, req, &mut enqueued);
+        }
+        crate::par::add_time("seed_save", t.elapsed().as_secs_f64());
+        crate::par::add_time("seed_count", ends.len() as f64);
         let backward: Vec<usize> = order.iter().rev().copied().collect();
         if threads <= 1 {
             for &v in &backward {

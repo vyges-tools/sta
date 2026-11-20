@@ -254,7 +254,9 @@ pub fn map<T: Send>(items: &[usize], threads: usize, f: impl Fn(usize) -> T + Sy
     map_inner(items, threads, f)
 }
 
-fn map_inner<T: Send>(items: &[usize], threads: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+/// [`map`] without recording the call in the stage breakdown — for a caller timing it as a part
+/// of its own ([`add_time`]), so the time is not counted twice.
+pub(crate) fn map_inner<T: Send>(items: &[usize], threads: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     if threads <= 1 || items.len() < threads {
         return items.iter().map(|&v| f(v)).collect();
     }
