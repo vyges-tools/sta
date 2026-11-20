@@ -1576,6 +1576,10 @@ impl<'g, 'a> Search<'g, 'a> {
         // ends (`seedRequired`). Timed in parts: the endpoint scan, the path-end visits, the saves.
         let t = std::time::Instant::now();
         let ends: Vec<usize> = (0..self.graph.vertices.len()).filter(|&v| self.is_endpoint(v)).collect();
+        let mut is_end = vec![false; self.graph.vertices.len()];
+        for &v in &ends {
+            is_end[v] = true;
+        }
         crate::par::add_time("seed_scan", t.elapsed().as_secs_f64());
         let (mut ends_secs, mut save_secs) = (0.0, 0.0);
         for &v in &ends {
@@ -1595,7 +1599,7 @@ impl<'g, 'a> Search<'g, 'a> {
         if threads <= 1 {
             for &v in &backward {
                 if enqueued[v] {
-                    let req = self.required_values(v);
+                    let req = self.required_values_at(v, is_end[v]);
                     self.required_save(v, req, &mut enqueued);
                 }
             }
@@ -1609,7 +1613,8 @@ impl<'g, 'a> Search<'g, 'a> {
             todo.extend(wave.iter().copied().filter(|&v| enqueued[v]));
             let reqs = {
                 let s = &*self;
-                crate::par::map(&todo, threads, |v| s.required_values(v))
+                let is_end = &is_end;
+                crate::par::map(&todo, threads, |v| s.required_values_at(v, is_end[v]))
             };
             for (&v, req) in todo.iter().zip(reqs) {
                 self.required_save(v, req, &mut enqueued);
@@ -1664,12 +1669,22 @@ impl<'g, 'a> Search<'g, 'a> {
         }
     }
 
-    /// The requireds a visit of `v` computes for its paths (`RequiredVisitor`: from the fanout's
-    /// requireds as they stand, then the endpoint's path ends) — not stored.
+    /// The requireds a visit of `v` computes for its paths (`RequiredVisitor::visit`: from the
+    /// fanout's requireds as they stand, then — at an endpoint only — its path ends) — not stored.
     pub fn required_values(&self, v: usize) -> Vec<f32> {
+        self.required_values_at(v, self.is_endpoint(v))
+    }
+
+    /// [`Search::required_values`] with `is_endpoint(v)` already known (`end`).
+    /// 🔑 `RequiredVisitor::visit` visits path ends only `if (isEndpoint(vertex))`. Under the
+    /// constraints modelled a non-endpoint has none to visit (a path delay needs a `-to`, whose
+    /// internal pins are endpoints), so the test is a call-sequence match that saves the visit.
+    fn required_values_at(&self, v: usize, end: bool) -> Vec<f32> {
         let mut req: Vec<f32> = self.paths[v].iter().map(|p| if p.tag.mm == MAX { INF } else { -INF }).collect();
         self.visit_fanout_paths(v, &mut req);
-        self.visit_path_ends(v, &mut req);
+        if end {
+            self.visit_path_ends(v, &mut req);
+        }
         req
     }
 
@@ -2820,6 +2835,42 @@ mod tests {
         sdc_mcp.path_delays = vec![crate::sdc::PathDelay { multicycle: Some(crate::sdc::Multicycle { multiplier: 2, use_end_clk: true, all: true }), group: None, ..pd(None, false) }];
         let s = Search::in_graph_order(&g, &sdc_mcp);
         assert!(s.constraints_modelled().is_err_and(|e| e.contains("set_multicycle_path on a design with latches")));
+    }
+
+    /// Rule (`RequiredVisitor::visit`: path ends visited only `if (isEndpoint(vertex))`): under
+    /// every exception modelled — false paths, a path delay to an internal pin (an endpoint by
+    /// `recordPathDelayInternalTo`), a group path — a non-endpoint's path ends set no required, so
+    /// visiting them at endpoints only changes nothing; and the endpoint's own visit does.
+    #[test]
+    fn path_ends_set_requireds_at_endpoints_only() {
+        let (libs, netlist, sdc) = latch_loop();
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        g.find_delays(&HashMap::new(), None).unwrap();
+        let pd = |from: &str, to: &str, mm: usize, false_path: bool, group: Option<&str>| crate::sdc::PathDelay { from_pins: vec![from.into()], from_clock: false, to_pins: vec![to.into()], to_clock: false, min_max: mm, ignore_clk_latency: true, break_path: false, delay: 1e-9, false_path, multicycle: None, thrus: Vec::new(), group: group.map(String::from) };
+        let cases = [vec![], vec![pd("f1/CLK", "f2/D", MAX, true, None), pd("l1/G", "f1/D", MIN, true, None)], vec![pd("f1/CLK", "l1/Q", MIN, false, None)], vec![pd("l1/G", "f2/D", MAX, false, Some("g"))]];
+        let mut ends_with_own = 0;
+        for (k, pds) in cases.into_iter().enumerate() {
+            let mut sdc = sdc.clone();
+            sdc.path_delays = pds;
+            let mut s = Search::in_graph_order(&g, &sdc);
+            s.constraints_modelled().unwrap_or_else(|e| panic!("case {k}: {e}"));
+            s.find_arrivals().unwrap();
+            s.find_requireds().unwrap();
+            for v in 0..g.vertices.len() {
+                let init: Vec<f32> = s.paths[v].iter().map(|p| if p.tag.mm == MAX { INF } else { -INF }).collect();
+                let mut req = init.clone();
+                s.visit_path_ends(v, &mut req);
+                if s.is_endpoint(v) {
+                    ends_with_own += usize::from(req != init);
+                } else {
+                    assert_eq!(req, init, "case {k}: {} is no endpoint but its path ends set a required", g.vname(v));
+                }
+                let full = s.required_values(v);
+                let have: Vec<f32> = s.paths[v].iter().map(|p| p.required).collect();
+                assert_eq!(full, have, "case {k}: {} requireds are the visit's", g.vname(v));
+            }
+        }
+        assert!(ends_with_own > 0, "the endpoints' own path ends set requireds");
     }
 
     /// Rules (`Latches::latchOutArrival` → `exceptionTo(any, data path, D, enable clock edge)`;
