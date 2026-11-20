@@ -363,6 +363,28 @@ impl States {
     }
 }
 
+/// The reference's per-key exception sets (`Sdc::first_to_pin_exceptions_`,
+/// `first_to_clk_exceptions_`) for one [`Sdc`]: each pin's exceptions naming it in `-to`, and the
+/// exceptions whose first point is a `-to` the clock — ids ascending, the order a scan visits them.
+/// Made by [`Sdc::first_to`]; valid while that Sdc's exceptions are unchanged.
+#[derive(Debug, Default, Clone)]
+pub struct FirstTo {
+    to_pin: std::collections::HashMap<String, Vec<usize>>,
+    first_to_clk: Vec<usize>,
+}
+
+impl FirstTo {
+    /// Whether exception `id` names `pin` in its `-to`.
+    fn names(&self, id: usize, pin: &str) -> bool {
+        self.to_pin.get(pin).is_some_and(|ids| ids.binary_search(&id).is_ok())
+    }
+
+    /// The exceptions whose first point is a `-to` naming `pin`, ids ascending.
+    fn first_to_pin<'s>(&'s self, sdc: &'s Sdc, pin: &str) -> impl Iterator<Item = usize> + 's {
+        self.to_pin.get(pin).map_or(&[][..], Vec::as_slice).iter().copied().filter(move |&id| sdc.path_delays[id].first_is_to())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sdc {
     /// The clocks, in the order they were made (`Clock::index`): a clock edge's index is the
@@ -598,9 +620,51 @@ impl Sdc {
     /// end is visited, so a match makes no end at the pin at all — check, output delay, path delay
     /// or gated clock. No clock edge is passed, so `-to` the clock never matches here.
     pub fn false_path_to(&self, states: States, pin: &str, mm: usize) -> bool {
-        let to = |pd: &PathDelay| pd.false_path && pd.min_max == mm && pd.to_matches(pin, false);
-        states.ids().map(|s| self.state_of(s)).any(|(id, index)| index == self.path_delays[id].last_index() && to(&self.path_delays[id]))
-            || self.path_delays.iter().any(|pd| pd.first_is_to() && !pd.to_pins.is_empty() && to(pd))
+        self.false_path_to_in(None, states, pin, mm)
+    }
+
+    /// [`Sdc::false_path_to`] looking the `-to` pins up in `first_to` ([`Sdc::first_to`]).
+    pub fn false_path_to_with(&self, first_to: &FirstTo, states: States, pin: &str, mm: usize) -> bool {
+        self.false_path_to_in(Some(first_to), states, pin, mm)
+    }
+
+    fn false_path_to_in(&self, first_to: Option<&FirstTo>, states: States, pin: &str, mm: usize) -> bool {
+        let to = |id: usize| {
+            let pd = &self.path_delays[id];
+            pd.false_path && pd.min_max == mm && self.to_matches_in(first_to, id, pin, false)
+        };
+        states.ids().map(|s| self.state_of(s)).any(|(id, index)| index == self.path_delays[id].last_index() && to(id))
+            || match first_to {
+                Some(f) => f.first_to_pin(self, pin).any(to),
+                None => self.path_delays.iter().enumerate().any(|(id, pd)| pd.first_is_to() && !pd.to_pins.is_empty() && to(id)),
+            }
+    }
+
+    /// [`PathDelay::to_matches`] for exception `id`, its `-to` pins looked up in `first_to` when given.
+    fn to_matches_in(&self, first_to: Option<&FirstTo>, id: usize, pin: &str, clocked: bool) -> bool {
+        let pd = &self.path_delays[id];
+        match first_to {
+            Some(f) => f.names(id, pin) || (clocked && pd.to_clock) || (pd.to_pins.is_empty() && !pd.to_clock),
+            None => pd.to_matches(pin, clocked),
+        }
+    }
+
+    /// `Sdc::first_to_pin_exceptions_` / `first_to_clk_exceptions_`, made once for a search: every
+    /// exception's `-to` pins by pin, and the exceptions whose first point is a `-to` the clock.
+    pub fn first_to(&self) -> FirstTo {
+        let mut f = FirstTo::default();
+        for (id, pd) in self.path_delays.iter().enumerate() {
+            for p in &pd.to_pins {
+                let ids = f.to_pin.entry(p.clone()).or_default();
+                if ids.last() != Some(&id) {
+                    ids.push(id);
+                }
+            }
+            if pd.first_is_to() && pd.to_pins.is_empty() && pd.to_clock {
+                f.first_to_clk.push(id);
+            }
+        }
+        f
     }
 
     /// `Search::exceptionTo(any, path, pin, rf, clk_edge, min_max)` over path delays: the highest
@@ -611,7 +675,12 @@ impl Sdc {
     /// False paths are not candidates: a false path at the pin has already stopped the end
     /// ([`Sdc::false_path_to`]), and one that does not match here could not win.
     pub fn path_delay_to(&self, states: States, pin: &str, clocked: bool, mm: usize) -> Option<usize> {
-        self.exception_to(states, pin, clocked, mm, false, &|pd| pd.is_path_delay())
+        self.exception_to(None, states, pin, clocked, mm, false, &|pd| pd.is_path_delay())
+    }
+
+    /// [`Sdc::path_delay_to`] looking the `-to` pins up in `first_to`.
+    pub fn path_delay_to_with(&self, first_to: &FirstTo, states: States, pin: &str, clocked: bool, mm: usize) -> Option<usize> {
+        self.exception_to(Some(first_to), states, pin, clocked, mm, false, &|pd| pd.is_path_delay())
     }
 
     /// `Latches::exceptionTo` → `Search::exceptionTo(any, data path, D pin, rf, enable clock edge,
@@ -621,13 +690,23 @@ impl Sdc {
     /// D->Q. Both outrank a multicycle or group path, so the highest of all is one of them exactly
     /// when one of them matches.
     pub fn latch_dq_disabled_to(&self, states: States, pin: &str, clocked: bool, mm: usize) -> Option<usize> {
-        self.exception_to(states, pin, clocked, mm, false, &|pd| pd.false_path || pd.is_path_delay())
+        self.exception_to(None, states, pin, clocked, mm, false, &|pd| pd.false_path || pd.is_path_delay())
+    }
+
+    /// [`Sdc::latch_dq_disabled_to`] looking the `-to` pins up in `first_to`.
+    pub fn latch_dq_disabled_to_with(&self, first_to: &FirstTo, states: States, pin: &str, clocked: bool, mm: usize) -> Option<usize> {
+        self.exception_to(Some(first_to), states, pin, clocked, mm, false, &|pd| pd.false_path || pd.is_path_delay())
     }
 
     /// `Search::exceptionTo(multi_cycle, …, match_min_max_exactly)`: the multicycle path ruling a
     /// check of min/max `mm` at `pin` — at a check, below any path delay (2000 against 3000).
     pub fn multicycle_to(&self, states: States, pin: &str, clocked: bool, mm: usize, exactly: bool) -> Option<usize> {
-        self.exception_to(states, pin, clocked, mm, exactly, &|pd| pd.multicycle.is_some())
+        self.exception_to(None, states, pin, clocked, mm, exactly, &|pd| pd.multicycle.is_some())
+    }
+
+    /// [`Sdc::multicycle_to`] looking the `-to` pins up in `first_to`.
+    pub fn multicycle_to_with(&self, first_to: &FirstTo, states: States, pin: &str, clocked: bool, mm: usize, exactly: bool) -> Option<usize> {
+        self.exception_to(Some(first_to), states, pin, clocked, mm, exactly, &|pd| pd.multicycle.is_some())
     }
 
     /// `Search::groupPathsTo(path_end)`: the group paths a path end at `pin` is in, as ids, in the
@@ -659,11 +738,14 @@ impl Sdc {
     }
 
     /// `Search::exceptionTo` over the exceptions `kind` admits.
-    fn exception_to(&self, states: States, pin: &str, clocked: bool, mm: usize, exactly: bool, kind: &dyn Fn(&PathDelay) -> bool) -> Option<usize> {
+    /// `first_to`: the `-to` pins looked up there ([`Sdc::first_to`]) instead of scanned — the same
+    /// candidates in the same (id) order, so a tie resolves alike.
+    #[allow(clippy::too_many_arguments)]
+    fn exception_to(&self, first_to: Option<&FirstTo>, states: States, pin: &str, clocked: bool, mm: usize, exactly: bool, kind: &dyn Fn(&PathDelay) -> bool) -> Option<usize> {
         let mut best: Option<usize> = None;
         let consider = |id: usize, best: &mut Option<usize>| {
             let pd = &self.path_delays[id];
-            if !kind(pd) || !pd.matches(mm, exactly) || !pd.to_matches(pin, clocked) {
+            if !kind(pd) || !pd.matches(mm, exactly) || !self.to_matches_in(first_to, id, pin, clocked) {
                 return;
             }
             let better = match *best {
@@ -687,6 +769,17 @@ impl Sdc {
         }
         // `Sdc::exceptionTo`: `first_to_pin_exceptions_`, then `first_to_clk_exceptions_` (clocked
         // ends only).
+        if let Some(f) = first_to {
+            for id in f.first_to_pin(self, pin) {
+                consider(id, &mut best);
+            }
+            if clocked {
+                for &id in &f.first_to_clk {
+                    consider(id, &mut best);
+                }
+            }
+            return best;
+        }
         for (id, pd) in self.path_delays.iter().enumerate() {
             if pd.first_is_to() && !pd.to_pins.is_empty() && pd.to_pins.iter().any(|p| p == pin) {
                 consider(id, &mut best);
@@ -1212,6 +1305,45 @@ mod tests {
         assert_eq!(sdc.path_delay_to(all, "r3/D", true, crate::liberty::MIN), None);
         assert_eq!(sdc.exception_from_states(&pin_at("r1/CLK"), true, MAX), all);
         assert_eq!(sdc.exception_from_states(&pin_at("r1/CLK"), true, crate::liberty::MIN), States::NONE);
+    }
+
+    /// Rule (`Sdc::exceptionTo` over `first_to_pin_exceptions_[pin]` / `first_to_clk_exceptions_`):
+    /// the exceptions looked up by pin answer as the scan of every exception does — false path,
+    /// path delay, latch D->Q and multicycle alike, ties (two equal delays) to the lower id.
+    #[test]
+    fn exceptions_looked_up_by_pin_answer_as_the_scan() {
+        let pd = |from: &[&str], to_pins: &[&str], to_clock: bool, delay: f32, mm: usize, false_path: bool, mcp: bool| PathDelay { from_pins: from.iter().map(|p| p.to_string()).collect(), from_clock: false, to_pins: to_pins.iter().map(|p| p.to_string()).collect(), to_clock, min_max: mm, ignore_clk_latency: true, break_path: false, delay, false_path, multicycle: mcp.then_some(Multicycle { multiplier: 2, use_end_clk: true, all: true }), thrus: Vec::new(), group: None };
+        let pds = vec![
+            pd(&["r1/CLK"], &[], true, 1.0, MAX, false, false),
+            pd(&[], &["r3/D"], false, 2.0, MAX, false, false),
+            pd(&[], &["r3/D", "r4/D"], false, 2.0, MAX, false, false),
+            pd(&[], &["r4/D"], false, 0.0, MIN, true, false),
+            pd(&["r1/CLK"], &["r3/D"], false, 0.0, MAX, false, true),
+            pd(&[], &[], true, 3.0, MAX, false, false),
+            pd(&[], &["r4/D", "r4/D"], false, 0.0, MAX, true, false),
+        ];
+        let sdc = Sdc { clocks: vec![Clock::new("c", 2.0, "clk", true)], input_delays: Vec::new(), output_delays: Vec::new(), path_delays: pds };
+        let f = sdc.first_to();
+        let mut hits = 0;
+        for states in [States::NONE, States(0b1), States(0b11), States(0b111)] {
+            for pin in ["r3/D", "r4/D", "r5/D"] {
+                for mm in [MIN, MAX] {
+                    assert_eq!(sdc.false_path_to_with(&f, states, pin, mm), sdc.false_path_to(states, pin, mm), "false {pin} {mm}");
+                    for clocked in [false, true] {
+                        let want = sdc.path_delay_to(states, pin, clocked, mm);
+                        hits += usize::from(want.is_some());
+                        assert_eq!(sdc.path_delay_to_with(&f, states, pin, clocked, mm), want, "delay {pin} {clocked} {mm}");
+                        assert_eq!(sdc.latch_dq_disabled_to_with(&f, states, pin, clocked, mm), sdc.latch_dq_disabled_to(states, pin, clocked, mm));
+                        for exactly in [false, true] {
+                            assert_eq!(sdc.multicycle_to_with(&f, states, pin, clocked, mm, exactly), sdc.multicycle_to(states, pin, clocked, mm, exactly));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(hits > 0);
+        assert_eq!(sdc.path_delay_to_with(&f, States::NONE, "r3/D", false, MAX), Some(1), "the tie goes to the lower id");
+        assert!(sdc.false_path_to_with(&f, States::NONE, "r4/D", MAX) && sdc.false_path_to_with(&f, States::NONE, "r4/D", MIN));
     }
 
     #[test]

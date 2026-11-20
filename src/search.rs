@@ -198,6 +198,9 @@ pub struct Search<'g, 'a> {
     internal_from_break: Vec<bool>,
     internal_to: Vec<bool>,
     internal_to_break: Vec<bool>,
+    /// The SDC's exceptions by `-to` pin and clock ([`crate::sdc::Sdc::first_to`]), as the
+    /// reference keeps them (`first_to_pin_exceptions_`): looked up, not scanned, at every path end.
+    first_to: crate::sdc::FirstTo,
     /// Per edge, `Sim::isDisabledCond` and `Sim::simTimingSense` on instances with a constant pin.
     sim: SimEdges,
     /// Per latch D -> Q edge, the enable vertex and edge (`LibertyCell::latchEnable`).
@@ -608,7 +611,7 @@ impl<'g, 'a> Search<'g, 'a> {
         let (latch_en, latch_data) = latch_enables(graph);
         let clk_network = clock_network(graph, sdc);
         let clock_leaf = (0..graph.vertices.len()).map(|v| { let name = graph.vname(v); sdc.clocks.iter().any(|c| !c.source.is_empty() && name == c.source) }).collect();
-        let mut search = Search { graph, sdc, paths: vec![Vec::new(); n], vertex_id, input_delay, output_delay, is_reg_clk, internal_from, internal_from_break, internal_to, internal_to_break, sim, latch_en, latch_data, clk_network, clock_leaf, gated: HashMap::new() };
+        let mut search = Search { graph, sdc, paths: vec![Vec::new(); n], vertex_id, input_delay, output_delay, is_reg_clk, internal_from, internal_from_break, internal_to, internal_to_break, sim, latch_en, latch_data, clk_network, clock_leaf, gated: HashMap::new(), first_to: sdc.first_to() };
         search.gated = search.gated_clk_enables();
         search
     }
@@ -1779,12 +1782,12 @@ impl<'g, 'a> Search<'g, 'a> {
             return out;
         }
         for (i, path) in self.paths[v].iter().enumerate() {
-            if self.sdc.false_path_to(path.tag.states, name, path.tag.mm) {
+            if self.sdc.false_path_to_with(&self.first_to, path.tag.states, name, path.tag.mm) {
                 continue;
             }
             let Some(src_edge) = path.tag.clk_edge else { continue };
             let mm = path.tag.mm;
-            if self.sdc.path_delay_to(path.tag.states, name, true, mm).is_some() {
+            if self.sdc.path_delay_to_with(&self.first_to, path.tag.states, name, true, mm).is_some() {
                 continue;
             }
             if mm == MAX && self.latch_data[v] {
@@ -1827,7 +1830,7 @@ impl<'g, 'a> Search<'g, 'a> {
         let gated = self.gated.get(&v).copied();
         for (i, path) in self.paths[v].iter().enumerate() {
             // `visitPathEnds1`: a false path `-to` the pin makes no end of the path here at all.
-            if self.sdc.false_path_to(path.tag.states, name, path.tag.mm) {
+            if self.sdc.false_path_to_with(&self.first_to, path.tag.states, name, path.tag.mm) {
                 continue;
             }
             // `visitGatedClkEnd`, besides any other end.
@@ -1839,7 +1842,7 @@ impl<'g, 'a> Search<'g, 'a> {
             // `visitClkedPathEnds`: no output delay and no check — a path delay `-to` the pin
             // (`pathDelayTo`, no target clock), whatever the path's clock.
             if ods.is_empty() && !checks {
-                if let Some(id) = self.sdc.path_delay_to(path.tag.states, name, false, path.tag.mm) {
+                if let Some(id) = self.sdc.path_delay_to_with(&self.first_to, path.tag.states, name, false, path.tag.mm) {
                     Self::required_set(req, i, self.path_delay_required(path, id, 0.0, 0.0, 0.0, 0.0), path.tag.mm);
                 }
                 continue;
@@ -1905,13 +1908,13 @@ impl<'g, 'a> Search<'g, 'a> {
                         }
                         // `PathEndLatchCheck`: at a latch's data pin, the check's target is the
                         // DISABLE path; the required is `latchRequired`'s, the check arc the margin.
-                        if self.latch_data[v] && self.sdc.path_delay_to(path.tag.states, name, true, MAX).is_none() {
+                        if self.latch_data[v] && self.sdc.path_delay_to_with(&self.first_to, path.tag.states, name, true, MAX).is_none() {
                             let enable = self.latch_other_path(tgt_v, tgt);
                             let (required, _, _) = self.latch_required(path, tgt_v, enable, Some(tgt), self.check_margin(e, k, MAX));
                             Self::required_set(req, i, required, MAX);
                             continue;
                         }
-                        if let Some(id) = self.sdc.path_delay_to(path.tag.states, name, true, MAX) {
+                        if let Some(id) = self.sdc.path_delay_to_with(&self.first_to, path.tag.states, name, true, MAX) {
                             let latency = self.tgt_clk_delay(tgt);
                             let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MAX);
                             let required = self.path_delay_required(path, id, self.check_margin(e, k, MAX), latency, unc, self.check_crpr(path, tgt_v, tgt));
@@ -1945,7 +1948,7 @@ impl<'g, 'a> Search<'g, 'a> {
     /// false path has already taken the end), not asked exactly — so a `-setup` one rules a hold
     /// end too — adjusted by [`Sdc::multicycle_adjustment`]; 0 with none.
     fn mcp_adjustment(&self, path: &Path, pin: &str, src_edge: usize, tgt_edge: usize, mm: usize) -> f32 {
-        let id = self.sdc.multicycle_to(path.tag.states, pin, true, mm, false);
+        let id = self.sdc.multicycle_to_with(&self.first_to, path.tag.states, pin, true, mm, false);
         self.sdc.multicycle_adjustment(id, path.tag.states, pin, Some(src_edge), tgt_edge, mm)
     }
 
@@ -2056,7 +2059,7 @@ impl<'g, 'a> Search<'g, 'a> {
         let en = self.paths[en_v].iter().find(|p| p.tag.mm == MIN && p.tag.rf == en_rf && p.tag.is_clock)?;
         // `exceptionTo(data_path, en_clk_edge)`: a false path or path delay -to D (or the enable
         // clock) disables D->Q.
-        if self.sdc.latch_dq_disabled_to(from.tag.states, d_pin, true, MAX).is_some() {
+        if self.sdc.latch_dq_disabled_to_with(&self.first_to, from.tag.states, d_pin, true, MAX).is_some() {
             return None;
         }
         let disable = self.latch_other_path(en_v, en);
@@ -2087,7 +2090,7 @@ impl<'g, 'a> Search<'g, 'a> {
                 if arc.to_rf != path.tag.rf {
                     continue;
                 }
-                if let Some(id) = self.sdc.path_delay_to(path.tag.states, &self.graph.vname(v), false, path.tag.mm) {
+                if let Some(id) = self.sdc.path_delay_to_with(&self.first_to, path.tag.states, &self.graph.vname(v), false, path.tag.mm) {
                     Self::required_set(req, i, self.path_delay_required(path, id, self.check_margin(e, k, path.tag.mm), 0.0, 0.0, 0.0), path.tag.mm);
                 }
             }
@@ -2182,7 +2185,7 @@ impl<'g, 'a> Search<'g, 'a> {
                     }
                     let latency = self.tgt_clk_delay(tgt);
                     // `visitCheckEnd`: a path delay completing here overrides the check.
-                    if let Some(id) = self.sdc.path_delay_to(path.tag.states, &self.graph.vname(v), true, MIN) {
+                    if let Some(id) = self.sdc.path_delay_to_with(&self.first_to, path.tag.states, &self.graph.vname(v), true, MIN) {
                         let unc = self.sdc.check_clk_uncertainty(Some(src_edge), tgt_edge, MIN);
                         let required = self.path_delay_required(path, id, self.check_margin(e, k, MIN), latency, unc, self.check_crpr(path, tgt_v, tgt));
                         Self::required_set(req, i, required, MIN);
