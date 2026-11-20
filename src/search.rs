@@ -1572,13 +1572,24 @@ impl<'g, 'a> Search<'g, 'a> {
         let _time = crate::par::StageTimer::start("find_requireds", self.graph.thread_count);
         let order = self.graph.topo_order()?;
         let mut enqueued = vec![false; self.graph.vertices.len()];
-        for v in 0..self.graph.vertices.len() {
-            if self.is_endpoint(v) {
-                let mut req: Vec<f32> = self.paths[v].iter().map(|p| if p.tag.mm == MAX { INF } else { -INF }).collect();
-                self.visit_path_ends(v, &mut req);
-                self.required_save(v, req, &mut enqueued);
-            }
+        // `seedRequireds`: every endpoint (`endpoints()`, vertex order) seeded from its own path
+        // ends (`seedRequired`). Timed in parts: the endpoint scan, the path-end visits, the saves.
+        let t = std::time::Instant::now();
+        let ends: Vec<usize> = (0..self.graph.vertices.len()).filter(|&v| self.is_endpoint(v)).collect();
+        crate::par::add_time("seed_scan", t.elapsed().as_secs_f64());
+        let (mut ends_secs, mut save_secs) = (0.0, 0.0);
+        for &v in &ends {
+            let t = std::time::Instant::now();
+            let mut req: Vec<f32> = self.paths[v].iter().map(|p| if p.tag.mm == MAX { INF } else { -INF }).collect();
+            self.visit_path_ends(v, &mut req);
+            let t2 = std::time::Instant::now();
+            ends_secs += (t2 - t).as_secs_f64();
+            self.required_save(v, req, &mut enqueued);
+            save_secs += t2.elapsed().as_secs_f64();
         }
+        crate::par::add_time("seed_ends", ends_secs);
+        crate::par::add_time("seed_save", save_secs);
+        crate::par::add_time("seed_count", ends.len() as f64);
         let threads = self.graph.thread_count;
         let backward: Vec<usize> = order.iter().rev().copied().collect();
         if threads <= 1 {
