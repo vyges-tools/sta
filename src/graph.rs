@@ -1166,12 +1166,14 @@ impl<'a> Graph<'a> {
         if !self.stale_out_arcs.is_empty() || self.arc_cache.is_some() {
             return;
         }
+        let t = std::time::Instant::now();
         let edges: Vec<usize> = (0..self.edges.len()).collect();
         let sets = crate::par::map(&edges, self.thread_count, |e| match self.edges[e].kind {
             EdgeKind::Gate { set } => Some(self.arc_set_by_name(e, set)),
             EdgeKind::Wire => None,
         });
         self.arc_cache = Some(Arc::new(sets));
+        crate::par::add_time("arc_cache", t.elapsed().as_secs_f64());
     }
 
     /// [`Graph::arc_set`] found through the cell's name (and the scene map), uncached.
