@@ -2674,6 +2674,19 @@ mod tests {
         }
     }
 
+    /// The order kept for the passes is the order levelization finds, and loop breaking drops it
+    /// (what levelization follows may change): the cache never answers otherwise than the graph.
+    #[test]
+    fn the_kept_topological_order_is_the_computed_one() {
+        let (libs, netlist, _, _) = wide_design(5, 16, 6);
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        let want = g.topo_order().unwrap();
+        g.cache_topo_order();
+        assert_eq!(g.topo_order().unwrap(), want);
+        g.break_loops();
+        assert_eq!(g.topo_order().unwrap(), want, "recomputed after loop breaking");
+    }
+
     #[test]
     fn every_thread_count_times_a_multi_level_design_bit_for_bit() {
         let serial = timing_bits(1, 64, 14, 1);

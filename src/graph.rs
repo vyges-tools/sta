@@ -219,6 +219,11 @@ pub struct Graph<'a> {
     /// consulted while stale arcs are set. A plain field, not a lazy cell: a lazy cell would make
     /// the graph invariant in `'a`, which callers that shorten it rely on.
     arc_cache: Option<Arc<Vec<Option<&'a crate::liberty::ArcSet>>>>,
+    /// The topological order ([`Graph::topo_order`]) computed once ([`Graph::cache_topo_order`], at
+    /// the head of [`Graph::find_delays`]) for every pass after it, as the reference levelizes once.
+    /// Dropped wherever what levelization follows can change: loop breaking, stale arcs (the arc
+    /// sets, so the roles), detach/reattach, another scene's view; not consulted while stale arcs are set.
+    topo_cache: Option<Arc<Vec<usize>>>,
     /// Each net's slot in [`Graph::netlist`] by name, kept across in-place edits (an edit replaces
     /// nets in their slots or appends them): [`Graph::apply_edits`] finds the nets its edits named
     /// without a pass over every net. Checked by name at each slot read; made again on a miss.
@@ -882,7 +887,7 @@ impl<'a> Graph<'a> {
                 let _ = index_cache.set(std::sync::Arc::new(map));
             }
         }
-        Some(Graph { libs, netlist: keep, vertices: Arc::new(vertices), edges: Arc::new(edges), in_edges: Arc::new(in_edges), out_edges: Arc::new(out_edges), vertex_net: Arc::new(vertex_net), slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: Default::default(), bidirect_port_paths: Arc::new(bidirect_port_paths), disabled_loops: Default::default(), loops: Default::default(), index_cache, arc_cache: None, net_slots: Default::default(), scene_sets: None, array_ops: None, edit_seq: None, state_seq: None, hold_failed: false, thread_count: crate::par::default_thread_count() }.with_loops_broken())
+        Some(Graph { libs, netlist: keep, vertices: Arc::new(vertices), edges: Arc::new(edges), in_edges: Arc::new(in_edges), out_edges: Arc::new(out_edges), vertex_net: Arc::new(vertex_net), slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: Default::default(), bidirect_port_paths: Arc::new(bidirect_port_paths), disabled_loops: Default::default(), loops: Default::default(), index_cache, arc_cache: None, topo_cache: None, net_slots: Default::default(), scene_sets: None, array_ops: None, edit_seq: None, state_seq: None, hold_failed: false, thread_count: crate::par::default_thread_count() }.with_loops_broken())
     }
 
     /// [`Graph::build_with_pins`] with each pin found by its name.
@@ -1115,7 +1120,7 @@ impl<'a> Graph<'a> {
                 EdgeKind::Wire => vec![[0.0f32; 2]; 2],
             })
             .collect();
-        Ok(Graph { libs, netlist: keep, vertices: Arc::new(vertices), edges: Arc::new(edges), in_edges: Arc::new(in_edges), out_edges: Arc::new(out_edges), vertex_net: Arc::new(vertex_net), slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: Arc::new(bidirect_inst_paths), bidirect_port_paths: Arc::new(bidirect_port_paths), disabled_loops: Default::default(), loops: Default::default(), index_cache: std::sync::OnceLock::new(), arc_cache: None, net_slots: Default::default(), scene_sets: None, array_ops: None, edit_seq: None, state_seq: None, hold_failed: false, thread_count: crate::par::default_thread_count() }.with_loops_broken())
+        Ok(Graph { libs, netlist: keep, vertices: Arc::new(vertices), edges: Arc::new(edges), in_edges: Arc::new(in_edges), out_edges: Arc::new(out_edges), vertex_net: Arc::new(vertex_net), slew: vec![[[0.0; 2]; 2]; n], delay, slew_limit: HashMap::new(), clamped: Vec::new(), slew_annotated: HashMap::new(), slew_blocked: None, sdc: SdcEnv::default(), pin_cap_cell: HashMap::new(), ideal_clock: std::collections::HashSet::new(), ideal_clock_slew: HashMap::new(), stale_out_arcs: HashMap::new(), bidirect_inst_paths: Arc::new(bidirect_inst_paths), bidirect_port_paths: Arc::new(bidirect_port_paths), disabled_loops: Default::default(), loops: Default::default(), index_cache: std::sync::OnceLock::new(), arc_cache: None, topo_cache: None, net_slots: Default::default(), scene_sets: None, array_ops: None, edit_seq: None, state_seq: None, hold_failed: false, thread_count: crate::par::default_thread_count() }.with_loops_broken())
     }
 
     /// Whether vertex `v` is a top-level port's (an instance's vertex may have no library too:
@@ -1237,7 +1242,7 @@ impl<'a> Graph<'a> {
             loops: self.loops.clone(),
             index_cache,
             // another scene's libraries: its own arc sets
-            arc_cache: None,
+            arc_cache: None, topo_cache: None,
             net_slots: self.net_slots.clone(),
             scene_sets,
             array_ops: None,
@@ -1263,6 +1268,7 @@ impl<'a> Graph<'a> {
         self.net_slots = Arc::default();
         self.index_cache = std::sync::OnceLock::new();
         self.arc_cache = None;
+        self.topo_cache = None;
         self.netlist = NetlistRef::Borrowed(NONE.get_or_init(Netlist::default));
     }
 
@@ -1281,6 +1287,7 @@ impl<'a> Graph<'a> {
         self.net_slots = from.net_slots.clone();
         // `from` resolved its arcs in its own libraries: this view resolves its own again
         self.arc_cache = None;
+        self.topo_cache = None;
         self.index_cache = std::sync::OnceLock::new();
         if let Some(ix) = from.index_cache.get() {
             let _ = self.index_cache.set(ix.clone());
@@ -1290,6 +1297,7 @@ impl<'a> Graph<'a> {
     /// [`Graph::stale_out_arcs`] from instance → cell name, each cell found in the graph's libraries
     /// (the first holding it); an instance whose cell is in none is left with its own.
     pub fn set_stale_out_arcs(&mut self, cells: &std::collections::BTreeMap<String, String>) {
+        self.topo_cache = None;
         self.stale_out_arcs = cells.iter().filter_map(|(inst, name)| self.libs.iter().position(|l| l.cells.contains_key(name)).map(|lib| (inst.clone(), (lib, name.clone())))).collect();
     }
 
@@ -1306,6 +1314,7 @@ impl<'a> Graph<'a> {
         let lb = crate::levelize::break_loops(&LevelizeView(self));
         self.disabled_loops = Arc::new(lb.disabled.iter().copied().collect());
         self.loops = Arc::new(lb);
+        self.topo_cache = None;
     }
 
     /// `Levelize::isDisabledLoop`.
@@ -1365,10 +1374,24 @@ impl<'a> Graph<'a> {
 
     /// Topological order over the edges levelization follows ([`Graph::levelize_thru`]).
     pub fn topo_order(&self) -> Result<Vec<usize>, String> {
+        if let (true, Some(c)) = (self.stale_out_arcs.is_empty(), &self.topo_cache) {
+            return Ok(c.as_ref().clone());
+        }
         let t = std::time::Instant::now();
         let r = self.topo_order_inner();
         crate::par::add_time("topo_order", t.elapsed().as_secs_f64());
         r
+    }
+
+    /// [`Graph::topo_order`] computed once and kept for the passes after it (a no-op when kept
+    /// already, while stale arcs are set, or when the graph has a loop — the passes then refuse it).
+    pub fn cache_topo_order(&mut self) {
+        if !self.stale_out_arcs.is_empty() || self.topo_cache.is_some() {
+            return;
+        }
+        if let Ok(order) = self.topo_order() {
+            self.topo_cache = Some(Arc::new(order));
+        }
     }
 
     fn topo_order_inner(&self) -> Result<Vec<usize>, String> {
@@ -1647,6 +1670,7 @@ impl<'a> Graph<'a> {
     pub fn find_delays(&mut self, parasitics: &HashMap<String, NetParasitics>, mut trace: Option<&mut Vec<String>>) -> Result<(), String> {
         let _time = crate::par::StageTimer::start("find_delays", self.thread_count);
         self.cache_arc_sets();
+        self.cache_topo_order();
         let order = self.topo_order()?;
         self.clamped.clear();
         // the shared map, not a copy of it
