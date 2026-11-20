@@ -265,6 +265,60 @@ pub enum DesignRef<'d> {
 /// different `Sdc` (one mode is one `Sdc`).
 #[cfg(feature = "loom")]
 pub fn scene_constraints(s: &vyges_loom::sdc::Sdc, d: DesignRef<'_>, scenes: &[&[Library]]) -> Result<SceneConstraints, String> {
+    scene_constraints_each(s, d, scenes)
+}
+
+/// [`scene_constraints`] as the reference holds a mode: ONE `Sdc` and ONE simulation (`Mode`'s
+/// `sdc_` and `sim_`; `Sim` evaluates the link cells, `network_->libertyCell(inst)`), read on the
+/// link scene's libraries; each other scene adds only its own environment (its libraries' loads
+/// and slews, [`crate::load::ModeRead::scene_env`]). A scene whose time scale differs from the
+/// link's is read in full as [`scene_constraints`] reads it, so it is refused the same way when
+/// its `Sdc` differs. The result equals [`scene_constraints`]'s wherever the scenes' cells share
+/// their functions.
+#[cfg(feature = "loom")]
+pub fn mode_constraints(s: &vyges_loom::sdc::Sdc, d: DesignRef<'_>, scenes: &[&[Library]], link: usize) -> Result<SceneConstraints, String> {
+    let libs = scenes.get(link).ok_or("no scene to read the constraints for")?;
+    let (nl, constant_nets) = match d {
+        DesignRef::Netlist(nl) => (nl, None),
+        DesignRef::Design(x) => (&x.netlist, Some(x.constant_nets.as_slice())),
+    };
+    let scale = |l: &[Library]| l.first().map(|l| l.time_scale);
+    let mode = crate::load::constraints_mode(s, nl, libs, constant_nets).map_err(|e| format!("scene {link}: {e}"))?;
+    let mut envs = Vec::with_capacity(scenes.len());
+    let mut notes: Vec<String> = Vec::new();
+    for note in &mode.notes {
+        if !notes.contains(note) {
+            notes.push(note.clone());
+        }
+    }
+    for (k, l) in scenes.iter().enumerate() {
+        if k == link {
+            envs.push(mode.env.clone());
+        } else if scale(l) == scale(libs) {
+            envs.push(mode.scene_env(nl, l).map_err(|e| format!("scene {k}: {e}"))?);
+        } else {
+            let (sk, env, n) = match d {
+                DesignRef::Netlist(nl) => crate::load::constraints(s, nl, l),
+                DesignRef::Design(x) => crate::load::design_constraints(s, x, l),
+            }
+            .map_err(|e| format!("scene {k}: {e}"))?;
+            if sk != mode.sdc {
+                return Err(format!("scene {k}: the SDC reads differently than in scene {link} (one mode is one Sdc)"));
+            }
+            envs.push(env);
+            for note in n {
+                if !notes.contains(&note) {
+                    notes.push(note);
+                }
+            }
+        }
+    }
+    Ok(SceneConstraints { sdc: mode.sdc, envs, notes })
+}
+
+/// [`scene_constraints`]: every scene's constraints read in full on its own libraries.
+#[cfg(feature = "loom")]
+fn scene_constraints_each(s: &vyges_loom::sdc::Sdc, d: DesignRef<'_>, scenes: &[&[Library]]) -> Result<SceneConstraints, String> {
     let mut sdc: Option<crate::sdc::Sdc> = None;
     let (mut envs, mut notes) = (Vec::with_capacity(scenes.len()), Vec::new());
     for (k, libs) in scenes.iter().enumerate() {
@@ -790,6 +844,42 @@ mod tests {
             net_slacks(&[&par, &par], &mut u).unwrap()
         };
         assert_ne!(stale["y"], full["y"], "without the invalidation the read is stale (the test can fail)");
+    }
+
+    #[cfg(feature = "loom")]
+    /// Rule (one `Sdc` and one `Sim` per `Mode`; `Sim::evalInstance` reads the link cell): the mode
+    /// is read once on the link scene and each other scene adds its own environment. Where the
+    /// scenes' cells share their functions it equals reading every scene in full; where a scene's
+    /// cell computes another function, the constants are still the link cells' (a per-scene
+    /// simulation would give that scene its own, so the check can fail); a scene with another time
+    /// scale is still read in full and refused when its `Sdc` differs.
+    #[test]
+    fn mode_constraints_read_the_mode_once_on_the_link_scene() {
+        let (slow, fast) = ([lib("slow", true, 1.0)], [lib("fast", true, 0.5)]);
+        let nl = clocked();
+        let design = crate::load::Design { netlist: nl.clone(), constant_nets: Vec::new() };
+        let text = "create_clock -name clk -period 2 [get_ports clk]\nset_input_delay 0.1 -clock clk [get_ports {a b}]\nset_output_delay 0.1 -clock clk [get_ports y]\nset_load 0.01 [get_ports y]\nset_input_transition 0.05 [get_ports a]\nset_case_analysis 0 [get_ports b]\n";
+        let s = vyges_loom::sdc::Sdc::parse_with(text, &crate::load::sdc_design(&nl, &slow)).expect("the constraints read");
+        let d = DesignRef::Design(&design);
+        let each = scene_constraints(&s, d, &[&slow, &fast]).unwrap();
+        let once = mode_constraints(&s, d, &[&slow, &fast], 0).unwrap();
+        assert_eq!((&once.sdc, &once.envs, &once.notes), (&each.sdc, &each.envs, &each.notes));
+        assert_eq!(once.envs[0].constants.get("x1/B"), Some(&false), "the simulation ran");
+        // scene 1's xor2 computes XNOR: case values a = 0 via b = 0 is not enough, hold a too
+        let text2 = text.replace("set_case_analysis 0 [get_ports b]", "set_case_analysis 0 [get_ports {a b}]");
+        let s2 = vyges_loom::sdc::Sdc::parse_with(&text2, &crate::load::sdc_design(&nl, &slow)).expect("the constraints read");
+        let mut xnor = lib("fast", true, 0.5);
+        xnor.cells.get_mut("xor2").expect("xor2").ports.iter_mut().find(|p| p.name == "Y").expect("Y").function = Some("!(A^B)".into());
+        let xnor = [xnor];
+        let each = scene_constraints(&s2, d, &[&slow, &xnor]).unwrap();
+        let once = mode_constraints(&s2, d, &[&slow, &xnor], 0).unwrap();
+        assert_eq!(each.envs[1].constants.get("x1/Y"), Some(&true), "scene 1's own cell: XNOR of 0, 0");
+        assert_eq!(once.envs[1].constants.get("x1/Y"), Some(&false), "the link cell: XOR of 0, 0");
+        assert_eq!(once.envs[1].constants, once.envs[0].constants);
+        let mut ps = lib("ps", true, 1.0);
+        ps.time_scale = 1e-12;
+        let why = mode_constraints(&s, d, &[&slow, &[ps]], 0).unwrap_err();
+        assert!(why.contains("scene 1") && why.contains("one mode"), "{why}");
     }
 
     /// Every scene reads the SDC as `load::constraints` reads it for that scene alone; scenes that

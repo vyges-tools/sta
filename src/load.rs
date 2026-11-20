@@ -482,6 +482,34 @@ fn moves_a_slack(cmd: &str) -> bool {
 }
 
 fn constraints_with(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library], constant_nets: Option<&[(String, bool)]>) -> Result<(crate::sdc::Sdc, crate::graph::SdcEnv, Vec<String>), String> {
+    constraints_mode(s, nl, libs, constant_nets).map(|m| (m.sdc, m.env, m.notes))
+}
+
+/// One mode's constraints as read for one scene's libraries ([`constraints_mode`]), with what
+/// another scene of the same mode reads its own environment from ([`ModeRead::scene_env`]).
+pub(crate) struct ModeRead {
+    pub sdc: crate::sdc::Sdc,
+    pub env: crate::graph::SdcEnv,
+    pub notes: Vec<String>,
+    /// The constraints with their port patterns expanded: what `sdc_env` reads.
+    expanded: vyges_loom::sdc::Sdc,
+}
+
+impl ModeRead {
+    /// Another scene's environment in the same mode: its own `sdc_env` (its libraries' loads and
+    /// slews), the mode's derates, and the mode's one simulation (`Mode::sim_`: the reference
+    /// evaluates constants once per mode, on the link cells, not per scene).
+    pub fn scene_env(&self, nl: &Netlist, libs: &[Library]) -> Result<crate::graph::SdcEnv, String> {
+        let mut env = sdc_env(&self.expanded, libs, nl)?;
+        env.derates.clone_from(&self.env.derates);
+        env.constants.clone_from(&self.env.constants);
+        env.sim_transitions.clone_from(&self.env.sim_transitions);
+        Ok(env)
+    }
+}
+
+/// [`constraints_with`], keeping what [`ModeRead::scene_env`] needs.
+pub(crate) fn constraints_mode(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library], constant_nets: Option<&[(String, bool)]>) -> Result<ModeRead, String> {
     // everything loom read and carries in no record (`Sdc::not_applied`, the rejected commands
     // and unevaluated queries among them): refused if it can move a slack, else a note
     let mut notes = Vec::new();
@@ -569,7 +597,7 @@ fn constraints_with(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[Library], co
         env.sim_transitions = v.transitions;
         notes.extend(v.warnings.into_iter().map(|w| format!("sim: {w}")));
     }
-    Ok((sdc, env, notes))
+    Ok(ModeRead { sdc, env, notes, expanded: s })
 }
 
 /// `set_clock_uncertainty` as the reference's command sets it, in file order, the later value
