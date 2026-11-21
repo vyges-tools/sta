@@ -6933,7 +6933,6 @@ slack _3129_/A 3.882514
 slack _3129_/X 3.882514
 slack _3130_/A 3.947582
 slack _3130_/X 3.947582
-slack clk_i -16.083910
 slack intr_src_i[0] -15.577023
 slack intr_src_i[10] -9.985993
 slack intr_src_i[11] -9.592211
