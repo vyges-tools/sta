@@ -1689,4 +1689,35 @@ mod tests {
         assert_eq!(pairs("QN"), opposite, "IQN inverts the data_in sense");
         assert_eq!(pairs("QD"), like, "a declared sense stands");
     }
+
+    /// `latch_data` reads `seqs[k]` with `k` an index into `sequentials`: the two are filled in
+    /// the same loop (`ff` groups, then `latch` groups, as `makeSequentials`), so the indices
+    /// agree even when the file declares the latch before the flip-flop. A cell with both: the
+    /// latch's D→Q is a latch arc; the flip-flop's output, combinational from its D, is not.
+    #[test]
+    fn sequentials_and_seqs_index_the_same_groups() {
+        let t = r#"cell_rise (scalar) { values ("1"); } cell_fall (scalar) { values ("2"); }"#;
+        let lib = Library::read(
+            &crate::liberty_parse::parse(&format!(
+                r#"library (t) {{ cell (M) {{
+                  latch (LQ, LQN) {{ enable : "G" ; data_in : "D" ; }}
+                  ff (FQ, FQN) {{ clocked_on : "CK" ; next_state : "E" ; }}
+                  pin (D) {{ direction : input ; }} pin (E) {{ direction : input ; }}
+                  pin (G) {{ direction : input ; }} pin (CK) {{ direction : input ; }}
+                  pin (Q) {{ direction : output ; function : "LQ" ; timing () {{ related_pin : "D" ; {t} }} }}
+                  pin (P) {{ direction : output ; function : "FQ" ; timing () {{ related_pin : "CK" ; timing_type : rising_edge ; {t} }} }} }} }}"#
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let c = &lib.cells["M"];
+        assert_eq!(c.sequentials.iter().map(|s| s.1).collect::<Vec<_>>(), [true, false], "ff first");
+        assert_eq!(c.seqs.iter().map(|s| s.is_register).collect::<Vec<_>>(), [true, false], "the same order");
+        for (k, (outs, _, _)) in c.sequentials.iter().enumerate() {
+            assert_eq!(c.seqs[k].output.as_ref(), outs.first(), "group {k}");
+        }
+        let q = c.arc_sets.iter().find(|s| s.to == "Q" && s.from == "D").unwrap();
+        assert_eq!(q.role, Role::LatchDtoQ);
+    }
 }
+
