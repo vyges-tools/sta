@@ -1,3 +1,3 @@
-OpenSTA 3.1.0 (cc9027d65e75b9bfcc58b9b6343dd124dceacb87 2026-10-31), the OpenROAD project tree
-regenerated 2026-11-06 (worst/tns and every pin slack, max and min, six digits, sorted)
-set_propagated_clock names the clock with get_clocks (the loader's form); the reference's output is byte-identical to [all_clocks], rerun 2026-11-06
+OpenSTA 3.2.0 (4e6ff54479701a9b367d2f1c77521c34c0b1e875 2026-11-19), the OpenROAD project tree
+regenerated 2026-11-21 (worst/tns and every pin slack, max and min, six digits, sorted)
+set_propagated_clock names the clock with get_clocks (the loader's form); the reference's output was byte-identical to [all_clocks] when checked on 2026-11-06
