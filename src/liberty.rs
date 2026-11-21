@@ -931,6 +931,29 @@ impl LogicValue {
     }
 }
 
+/// `makeLatchDtoQArcs` with no `timing_sense` on the group (OpenSTA 102fc163 #556, in the
+/// f11b4276 pin): the sense of the latch's `data_in` at `from` when the output's function IS the
+/// latch's output (IQ), the opposite when it is its inverted output (IQN); any other function
+/// (Warning 1320) or none leaves it unknown — like edges. Whether that sense is negative.
+fn latch_d_to_q_inferred_negative(cell: &Cell, function: Option<&str>, from: &str) -> Result<bool, String> {
+    let Some(f) = function else { return Ok(false) };
+    let parse = |e: &str| FuncExpr::parse(e).map_err(|err| format!("cell {}: {err}", cell.name));
+    let FuncExpr::Port(out) = parse(f)? else { return Ok(false) };
+    let Some(latch) = cell.seqs.iter().find(|q| !q.is_register && (q.output.as_deref() == Some(out.as_str()) || q.output_inv.as_deref() == Some(out.as_str()))) else { return Ok(false) };
+    let Some(data) = latch.data.as_deref() else { return Ok(false) };
+    let q = parse(data)?.port_timing_sense(from);
+    let sense = if latch.output.as_deref() == Some(out.as_str()) {
+        q
+    } else {
+        match q {
+            Sense::PositiveUnate => Sense::NegativeUnate,
+            Sense::NegativeUnate => Sense::PositiveUnate,
+            other => other,
+        }
+    };
+    Ok(sense == Sense::NegativeUnate)
+}
+
 /// One `ff` (register) or `latch` group as `LibertyReader::makeSequentials` makes it: its
 /// clock (`clocked_on` / `enable`), data (`next_state` / `data_in`), `clear` and `preset`
 /// expressions as text (an empty attribute is none), the two `clear_preset_var`s, and its output
@@ -1173,9 +1196,14 @@ impl Library {
             };
             let set = match timing_type.as_str() {
                 // `LibertyBuilder::makeLatchDtoQArcs`: per output transition with a model, from the
-                // same transition (the opposite for negative_unate).
+                // same transition (the opposite for negative_unate). The sense (OpenSTA 102fc163
+                // #556, in the f11b4276 pin): the group's `timing_sense`; else the `data_in` sense
+                // at `from`, opposite when the output's function is the latch's inverted output.
                 "combinational" if latch_data(from) => {
-                    let negative = sense.as_deref() == Some("negative_unate");
+                    let negative = match sense.as_deref() {
+                        Some(s) => s == "negative_unate",
+                        None => latch_d_to_q_inferred_negative(cell, function, from)?,
+                    };
                     let arcs = [RISE, FALL].into_iter().filter_map(|to_rf| models[to_rf].clone().map(|model| Arc { from_rf: if negative { 1 - to_rf } else { to_rf }, to_rf, model })).collect();
                     ArcSet { from: from.clone(), to: to.to_string(), role: Role::LatchDtoQ, timing_type: timing_type.clone(), cond: cond.clone(), arcs }
                 }
@@ -1628,5 +1656,37 @@ mod tests {
         assert_eq!(c.port("A").unwrap().capacitance, [[1.5 * s, 1.5 * s], [1.25 * s, 1.25 * s]]);
         assert_eq!(c.port("B").unwrap().capacitance, [[0.5 * s, 0.75 * s], [2.0 * s, 2.0 * s]]);
         assert_eq!(c.port("Y").unwrap().capacitance, [[0.0; 2]; 2]);
+    }
+
+    /// Rule (`LibertyBuilder::makeLatchDtoQArcs`, OpenSTA 102fc163 #556, in the f11b4276 pin): the
+    /// D->Q arc's sense is the group's `timing_sense`; with none, the latch's `data_in` sense at D,
+    /// inverted on the IQN output. Negative pairs opposite edges. At 4155ac31 an undeclared arc
+    /// paired like edges here whatever the output.
+    #[test]
+    fn a_latch_d_to_q_arc_takes_its_declared_else_inferred_sense() {
+        let t = r#"cell_rise (scalar) { values ("1"); } cell_fall (scalar) { values ("2"); }"#;
+        let lib = Library::read(
+            &crate::liberty_parse::parse(&format!(
+                r#"library (t) {{ cell (L) {{
+                  latch (IQ, IQN) {{ enable : "G" ; data_in : "D" ; }}
+                  pin (D) {{ direction : input ; }} pin (G) {{ direction : input ; }}
+                  pin (Q) {{ direction : output ; function : "IQ" ; timing () {{ related_pin : "D" ; {t} }} }}
+                  pin (QN) {{ direction : output ; function : "IQN" ; timing () {{ related_pin : "D" ; {t} }} }}
+                  pin (QD) {{ direction : output ; function : "IQN" ; timing () {{ related_pin : "D" ; timing_sense : positive_unate ; {t} }} }} }} }}"#
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let c = &lib.cells["L"];
+        let pairs = |to: &str| {
+            let set = c.arc_sets.iter().find(|s| s.to == to && s.from == "D").unwrap();
+            assert_eq!(set.role, Role::LatchDtoQ);
+            set.arcs.iter().map(|a| (a.from_rf, a.to_rf)).collect::<Vec<_>>()
+        };
+        let like = vec![(RISE, RISE), (FALL, FALL)];
+        let opposite = vec![(FALL, RISE), (RISE, FALL)];
+        assert_eq!(pairs("Q"), like, "IQ, data_in D positive");
+        assert_eq!(pairs("QN"), opposite, "IQN inverts the data_in sense");
+        assert_eq!(pairs("QD"), like, "a declared sense stands");
     }
 }
