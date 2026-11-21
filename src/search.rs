@@ -478,71 +478,130 @@ fn sim_edges(graph: &Graph<'_>) -> SimEdges {
     if constants.is_empty() {
         return sim;
     }
-    let inst_name = |v: usize| match &graph.vertices[v].conn {
-        crate::netlist::Conn::Inst(i, _) => Some(graph.netlist.insts[*i].0.as_str()),
-        crate::netlist::Conn::Port(_) => None,
-    };
-    let annotated: std::collections::HashSet<&str> = (0..graph.vertices.len()).filter(|&v| constants.contains_key(&graph.vname(v))).filter_map(inst_name).collect();
-    for (e, ed) in graph.edges.iter().enumerate() {
-        let EdgeKind::Gate { set } = ed.kind else { continue };
-        let Some(inst) = inst_name(ed.to) else { continue };
+    let annotated: std::collections::HashSet<&str> = (0..graph.vertices.len()).filter(|&v| constants.contains_key(&graph.vname(v))).filter_map(|v| sim_inst_name(graph, v)).collect();
+    for e in 0..n {
+        let EdgeKind::Gate { .. } = graph.edges[e].kind else { continue };
+        let Some(inst) = sim_inst_name(graph, graph.edges[e].to) else { continue };
         if !annotated.contains(inst) {
             continue;
         }
-        let to = &graph.vertices[ed.to];
-        let (Some(lib), Some(cell_name)) = (to.lib, to.cell.as_deref()) else { continue };
-        let cell = &graph.libs[lib].cells[cell_name];
-        let arc_set = &cell.arc_sets[graph.scene_set(lib, cell_name, set)];
-        let fixed = |p: &str| constants.get(&format!("{inst}/{p}")).copied();
-        let parse = |f: &str| crate::func_expr::FuncExpr::parse(f).ok();
-        let sense = if graph.is_constant(ed.from) {
-            Ok(SimSense::None)
-        } else {
-            match cell.ports.iter().find(|p| p.name == arc_set.to).and_then(|p| p.function.as_deref()).and_then(parse) {
-                Some(f) => {
-                    let mut ports = Vec::new();
-                    func_ports(&f, &mut ports);
-                    if ports.contains(&arc_set.from) {
-                        function_sense(&f, &arc_set.from, &fixed)
-                    } else {
-                        Ok(SimSense::Unknown)
-                    }
+        match sim_edge(graph, e, inst) {
+            Ok(None) => {}
+            Ok(Some((sense, disabled))) => {
+                sim.sense[e] = sense;
+                sim.disabled_cond[e] = disabled;
+            }
+            Err((sense, why)) => {
+                if let Some(sense) = sense {
+                    sim.sense[e] = sense;
                 }
-                None => Ok(SimSense::Unknown),
-            }
-        };
-        let sense = match sense {
-            Ok(s) => s,
-            Err(why) => {
-                sim.error.get_or_insert(format!("{inst}/{}: {why} under constants", arc_set.to));
-                continue;
-            }
-        };
-        sim.sense[e] = sense;
-        if sense == SimSense::None {
-            continue;
-        }
-        let cond_is = |c: &str, want: bool| -> Result<bool, String> { Ok(parse(c).map(|f| eval_exact(&f, &fixed)).transpose()?.flatten() == Some(want)) };
-        let disabled = match arc_set.cond.as_deref() {
-            Some(c) => cond_is(c, false),
-            // A true conditional set disables the default set only when it has an arc to every
-            // output edge the default set has (`arcEdgesMatch`: asap7's ICG conditional
-            // CLK->GCLK set has the fall arc alone, and the rise arc stays timed).
-            None => cell
-                .arc_sets
-                .iter()
-                .filter(|o| o.from == arc_set.from && o.to == arc_set.to && arc_edges_match(arc_to_edges(arc_set), arc_to_edges(o)))
-                .filter_map(|o| o.cond.as_deref())
-                .try_fold(false, |d, c| Ok::<bool, String>(d || cond_is(c, true)?)),
-        };
-        match disabled {
-            Ok(d) => sim.disabled_cond[e] = d,
-            Err(why) => {
-                sim.error.get_or_insert(format!("{inst}: a when condition: {why} under constants"));
+                sim.error.get_or_insert(why);
             }
         }
     }
     sim
+}
+
+/// The instance a vertex is a pin of (none for a top port).
+fn sim_inst_name<'g>(graph: &'g Graph<'_>, v: usize) -> Option<&'g str> {
+    match &graph.vertices[v].conn {
+        crate::netlist::Conn::Inst(i, _) => Some(graph.netlist.insts[*i].0.as_str()),
+        crate::netlist::Conn::Port(_) => None,
+    }
+}
+
+/// One gate edge of an instance with a constant pin, as `Sim::findDisabledEdges` annotates it:
+/// `(sense, isDisabledCond)`, `None` for an edge with no liberty cell. The error carries the sense
+/// when that much was found.
+#[allow(clippy::type_complexity)]
+fn sim_edge(graph: &Graph<'_>, e: usize, inst: &str) -> Result<Option<(SimSense, bool)>, (Option<SimSense>, String)> {
+    let constants = &graph.sdc.constants;
+    let ed = &graph.edges[e];
+    let EdgeKind::Gate { set } = ed.kind else { return Ok(None) };
+    let to = &graph.vertices[ed.to];
+    let (Some(lib), Some(cell_name)) = (to.lib, to.cell.as_deref()) else { return Ok(None) };
+    let cell = &graph.libs[lib].cells[cell_name];
+    let arc_set = &cell.arc_sets[graph.scene_set(lib, cell_name, set)];
+    let fixed = |p: &str| constants.get(&format!("{inst}/{p}")).copied();
+    let parse = |f: &str| crate::func_expr::FuncExpr::parse(f).ok();
+    let sense = if graph.is_constant(ed.from) {
+        Ok(SimSense::None)
+    } else {
+        match cell.ports.iter().find(|p| p.name == arc_set.to).and_then(|p| p.function.as_deref()).and_then(parse) {
+            Some(f) => {
+                let mut ports = Vec::new();
+                func_ports(&f, &mut ports);
+                if ports.contains(&arc_set.from) {
+                    function_sense(&f, &arc_set.from, &fixed)
+                } else {
+                    Ok(SimSense::Unknown)
+                }
+            }
+            None => Ok(SimSense::Unknown),
+        }
+    };
+    let sense = sense.map_err(|why| (None, format!("{inst}/{}: {why} under constants", arc_set.to)))?;
+    if sense == SimSense::None {
+        return Ok(Some((sense, false)));
+    }
+    let cond_is = |c: &str, want: bool| -> Result<bool, String> { Ok(parse(c).map(|f| eval_exact(&f, &fixed)).transpose()?.flatten() == Some(want)) };
+    let disabled = match arc_set.cond.as_deref() {
+        Some(c) => cond_is(c, false),
+        // A true conditional set disables the default set only when it has an arc to every
+        // output edge the default set has (`arcEdgesMatch`: asap7's ICG conditional
+        // CLK->GCLK set has the fall arc alone, and the rise arc stays timed).
+        None => cell
+            .arc_sets
+            .iter()
+            .filter(|o| o.from == arc_set.from && o.to == arc_set.to && arc_edges_match(arc_to_edges(arc_set), arc_to_edges(o)))
+            .filter_map(|o| o.cond.as_deref())
+            .try_fold(false, |d, c| Ok::<bool, String>(d || cond_is(c, true)?)),
+    };
+    disabled.map(|d| Some((sense, d))).map_err(|why| (Some(sense), format!("{inst}: a when condition: {why} under constants")))
+}
+
+/// Gate edge `e` under the constants, as delay calculation reads it (OpenSTA `7515b043` +
+/// `564d3efb`, in the f11b4276 pin): `(sense, isDisabledCond)` on an instance with a constant pin,
+/// `(Unknown, false)` elsewhere. A sim error leaves the edge timed (the search reports it).
+pub(crate) fn dcalc_edge_sim(graph: &Graph<'_>, e: usize) -> (SimSense, bool) {
+    let constants = &graph.sdc.constants;
+    if constants.is_empty() {
+        return (SimSense::Unknown, false);
+    }
+    let ed = &graph.edges[e];
+    let Some(inst) = sim_inst_name(graph, ed.to) else { return (SimSense::Unknown, false) };
+    let to = &graph.vertices[ed.to];
+    let (Some(lib), Some(cell_name)) = (to.lib, to.cell.as_deref()) else { return (SimSense::Unknown, false) };
+    // `instances_to_annotate_`: an instance with a constant pin (a pin is a vertex by its name).
+    if !graph.libs[lib].cells[cell_name].ports.iter().any(|p| constants.contains_key(&format!("{inst}/{}", p.name))) {
+        return (SimSense::Unknown, false);
+    }
+    match sim_edge(graph, e, inst) {
+        Ok(Some(x)) => x,
+        Err((Some(sense), _)) => (sense, false),
+        Ok(None) | Err((None, _)) => (SimSense::Unknown, false),
+    }
+}
+
+/// Whether `findDriverEdgeDelays` times arc `from_rf -> to_rf` of gate edge `e` (OpenSTA
+/// `7515b043` + `564d3efb`, in the f11b4276 pin): `searchThru(edge, arc, mode)` —
+/// `searchThruTimingSense` under the edge's sense and `searchThruSimEdge` at both ends (a pin a
+/// rising / falling case value holds) — and the edge's `when` not disabled (`Sim::isDisabledCond`).
+/// An arc not timed merges no slew into its driver or loads. `sim` is [`dcalc_edge_sim`].
+pub(crate) fn dcalc_thru_arc(graph: &Graph<'_>, e: usize, sim: (SimSense, bool), from_rf: usize, to_rf: usize) -> bool {
+    let held = &graph.sdc.sim_transitions;
+    let ed = &graph.edges[e];
+    let sim_edge_ok = |v: usize, rf: usize| held.is_empty() || held.get(&graph.vname(v)).is_none_or(|&only| only == rf);
+    let (sense, disabled_cond) = sim;
+    !disabled_cond
+        && sim_edge_ok(ed.from, from_rf)
+        && sim_edge_ok(ed.to, to_rf)
+        && match sense {
+            SimSense::Positive => from_rf == to_rf,
+            SimSense::Negative => from_rf != to_rf,
+            SimSense::None => false,
+            SimSense::Unknown | SimSense::NonUnate => true,
+        }
 }
 
 /// The output edges (rise, fall) an arc set has an arc to (`TimingArcSet::arcTo(rf)`).

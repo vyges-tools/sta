@@ -2074,9 +2074,16 @@ impl<'a> Graph<'a> {
             if self.arc_set(e, set).role == Role::LatchDtoQ {
                 continue;
             }
+            // `findDriverEdgeDelays` (OpenSTA 7515b043 + 564d3efb, in the f11b4276 pin): only the
+            // arcs the search goes through and not under a constant-disabled `when`; a skipped arc
+            // computes no delay and merges no slew ([`crate::search::dcalc_thru_arc`]).
+            let sim = crate::search::dcalc_edge_sim(self, e);
             for mm in [MIN, MAX] {
                 for (k, arc) in arcs.iter().enumerate() {
                     let Model::Gate(model) = &arc.model else { continue };
+                    if !crate::search::dcalc_thru_arc(self, e, sim, arc.from_rf, arc.to_rf) {
+                        continue;
+                    }
                     let rf = arc.to_rf;
                     // `edgeFromSlew`: an ideal clock's slew for a register clk->q edge
                     let in_slew = if ideal_clk_to_q { self.ideal_clk_slew(from, arc.from_rf, mm) } else { o.slew_of(self, from)[arc.from_rf][mm] };
@@ -2698,12 +2705,15 @@ mod tests {
         assert_eq!(g.slew[u2a][RISE][MIN], 1.000_000_5f32 * 1e-9, "only max is held");
     }
 
-    /// Rule (`RepairDesign::repairDesign`'s forward pass reads `graph_->slew` of every load;
-    /// `findDriverArcDelays` sets a load's slew from its driver's arcs whether or not the search
-    /// goes on from the driver): u1/Y held constant (u1/A = 0, the AND's output 0) is still timed
-    /// through u1/B, so its load u2/A, which the search never reaches, is held at its limit too.
+    /// Rule (`GraphDelayCalc::findDriverEdgeDelays` at the f11b4276 pin, OpenSTA `7515b043`: only
+    /// the arcs `searchThru(edge, arc, mode)` passes are timed; `zeroUnsetLoadSlews` then zeroes a
+    /// transition no arc set). u1/Y held constant (u1/A = 0, the AND's output 0): its B arc has
+    /// sense NONE under the constant (`searchThruTimingSense`), so no arc of u1 is timed and its
+    /// load u2/A takes slew 0 — under its limit, not held. ⚠️ At 4155ac31 the B arc WAS timed
+    /// (the arc test came in with `7515b043`) and u2/A was held at the limit; the resizer's
+    /// `repairDesign` reads these slews.
     #[test]
-    fn a_load_of_a_constant_driver_over_its_limit_is_held_at_it() {
+    fn a_constant_drivers_arcs_of_sense_none_set_no_load_slew() {
         let libs = [Library::read(&crate::liberty_parse::parse(LIB).unwrap()).unwrap()];
         let nl = chain();
         let mut g = Graph::build(&libs, &nl).unwrap();
@@ -2713,8 +2723,53 @@ mod tests {
         let u2a = (0..g.vertices.len()).position(|v| g.vname(v) == "u2/A").unwrap();
         g.slew_limit.insert(u2a, 0.5e-9);
         g.find_delays(&HashMap::new(), None).unwrap();
-        assert_eq!(g.clamped, vec![u2a]);
-        assert_eq!([g.slew[u2a][RISE][MAX], g.slew[u2a][FALL][MAX]], [0.5e-9, 0.5e-9]);
+        assert!(g.clamped.is_empty(), "no arc of u1 is timed, so u2/A is not over its limit");
+        assert_eq!(g.slew[u2a], [[0.0; 2]; 2]);
+    }
+
+    /// Rule (`GraphDelayCalc::findDriverEdgeDelays` and `annotateDelaySlew` at the f11b4276 pin,
+    /// OpenSTA `564d3efb`: an edge whose `when` the constants disable, `Sim::isDisabledCond`, is not
+    /// timed, so its slew does not reach the driver). u1's A->X has two sets: `when S` (fast) and
+    /// `when !S` (slow). With S tied to 1 only the fast set is timed; with S free both are and the
+    /// slow one sets the slew.
+    #[test]
+    fn a_cond_disabled_arc_merges_no_slew() {
+        const CLIB: &str = r#"library (c) {
+          time_unit : "1ns"; capacitive_load_unit (1, pf);
+          cell (cbuf) {
+            pin (A) { direction : input; capacitance : 0.001; }
+            pin (S) { direction : input; capacitance : 0.001; }
+            pin (X) { direction : output; function : "A";
+              timing () { related_pin : "A"; timing_sense : positive_unate; when : "S";
+                cell_rise (scalar) { values ("0.1"); } rise_transition (scalar) { values ("0.05"); }
+                cell_fall (scalar) { values ("0.1"); } fall_transition (scalar) { values ("0.05"); } }
+              timing () { related_pin : "A"; timing_sense : positive_unate; when : "!S";
+                cell_rise (scalar) { values ("0.2"); } rise_transition (scalar) { values ("0.5"); }
+                cell_fall (scalar) { values ("0.2"); } fall_transition (scalar) { values ("0.5"); } } }
+          }
+        }"#;
+        let libs = [Library::read(&crate::liberty_parse::parse(CLIB).unwrap()).unwrap()];
+        let pin = |p: &str| Conn::Inst(0, p.into());
+        let nl = Netlist {
+            insts: vec![crate::netlist::inst("u1", "cbuf")],
+            ports: vec![("a".into(), PortDir::Input), ("s".into(), PortDir::Input), ("y".into(), PortDir::Output)],
+            nets: vec![
+                Net { name: "a".into(), pins: vec![pin("A"), Conn::Port(0)] }.into(),
+                Net { name: "s".into(), pins: vec![pin("S"), Conn::Port(1)] }.into(),
+                Net { name: "y".into(), pins: vec![pin("X"), Conn::Port(2)] }.into(),
+            ],
+        };
+        let slew_x = |tie: bool| {
+            let mut g = Graph::build(&libs, &nl).unwrap();
+            if tie {
+                g.sdc.constants.insert("u1/S".into(), true);
+                g.sdc.constants.insert("s".into(), true);
+            }
+            g.find_delays(&HashMap::new(), None).unwrap();
+            g.slew[(0..g.vertices.len()).position(|v| g.vname(v) == "u1/X").unwrap()][RISE][MAX]
+        };
+        assert!((slew_x(true) - 0.05e-9).abs() < 1e-15, "S = 1: only the `when S` set is timed, got {}", slew_x(true));
+        assert!((slew_x(false) - 0.5e-9).abs() < 1e-15, "S free: the slower set sets the slew, got {}", slew_x(false));
     }
 
     /// Rule (an annotated slew): the annotation IS the max slew, even below what the calculation
