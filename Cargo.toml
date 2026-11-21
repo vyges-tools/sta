@@ -18,7 +18,7 @@ path = "src/lib.rs"
 loom = ["dep:vyges-loom"]
 
 [dependencies]
-vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "main", optional = true }
+vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "repin-f11b4276", optional = true }
 
 [dev-dependencies]
 # Differential property tests: random designs timed at 1 and N threads.
