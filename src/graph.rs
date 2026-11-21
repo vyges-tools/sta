@@ -2149,7 +2149,14 @@ impl<'a> Graph<'a> {
         for rf in [RISE, FALL] {
             if !exists[rf] {
                 for mm in [MIN, MAX] {
-                    o.sv[rf][mm] = INIT[mm];
+                    // `zeroDrvrSlew`: a transition no arc set is 0 at the driver (an annotation stands).
+                    o.sv[rf][mm] = if !slew_blocked_by(&self.slew_blocked, &self.slew_annotated, v, mm) {
+                        0.0
+                    } else if let (Some(&a), MAX) = (self.slew_annotated.get(&v), mm) {
+                        a
+                    } else {
+                        INIT[mm]
+                    };
                     for (i, &w) in wires.iter().enumerate() {
                         o.wire_delay[i][rf][mm] = 0.0;
                         let load = self.edges[w].to;
@@ -2725,6 +2732,9 @@ mod tests {
         g.find_delays(&HashMap::new(), None).unwrap();
         assert!(g.clamped.is_empty(), "no arc of u1 is timed, so u2/A is not over its limit");
         assert_eq!(g.slew[u2a], [[0.0; 2]; 2]);
+        // `zeroDrvrSlew`: the driver of transitions no arc set is 0 too, not the init values.
+        let u1y = (0..g.vertices.len()).position(|v| g.vname(v) == "u1/Y").unwrap();
+        assert_eq!(g.slew[u1y], [[0.0; 2]; 2]);
     }
 
     /// Rule (`GraphDelayCalc::findDriverEdgeDelays` and `annotateDelaySlew` at the f11b4276 pin,
