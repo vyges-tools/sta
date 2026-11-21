@@ -583,6 +583,48 @@ pub(crate) fn dcalc_edge_sim(graph: &Graph<'_>, e: usize) -> (SimSense, bool) {
     }
 }
 
+/// `Resizer::driveResistance(drvr_pin)` for an instance's driver pin at the f11b4276 pin
+/// (OpenROAD #12109): the largest `TimingArc::driveResistance` over the arcs of the driver
+/// vertex's fanin gate edges that `EvalPred` searches (`visitFaninEdges`: the vertex searched
+/// from, then per edge `searchThru` and its from vertex searched from). `None` when no arc is seen
+/// (the caller then falls back to the liberty port's `driveResistance`).
+///
+/// `EvalPred` as this timer has it (one mode; `set_disable_timing` is refused at load): nothing
+/// from or to a constant pin; no timing check; no edge whose `when` the constants disable or whose
+/// sense they make none; no register preset / clear edge (`preset_clr_arcs_enabled` off by
+/// default); no bidirect instance path (off by default); no loop-breaking edge
+/// (`dynamic_loop_breaking` off by default). A latch D -> Q edge is searched (open), as the
+/// arrival search here takes it.
+pub fn eval_drive_resistance(graph: &Graph<'_>, v: usize) -> Option<f32> {
+    if graph.is_constant(v) {
+        return None;
+    }
+    let mut max_res = f32::NEG_INFINITY;
+    for &e in graph.in_edges[v].iter() {
+        let ed = &graph.edges[e];
+        let EdgeKind::Gate { set } = ed.kind else { continue };
+        if graph.is_check(e) || graph.is_constant(ed.from) || graph.bidirect_inst_paths.contains(&e) || graph.is_disabled_loop(e) {
+            continue;
+        }
+        let arc_set = graph.arc_set(e, set);
+        if arc_set.role == Role::RegSetClr {
+            continue;
+        }
+        let (sense, disabled_cond) = dcalc_edge_sim(graph, e);
+        if disabled_cond || sense == SimSense::None {
+            continue;
+        }
+        for arc in &arc_set.arcs {
+            let drive = match &arc.model {
+                crate::liberty::Model::Gate(m) => m.drive_resistance(),
+                _ => 0.0,
+            };
+            max_res = max_res.max(drive);
+        }
+    }
+    max_res.is_finite().then_some(max_res)
+}
+
 /// Whether `findDriverEdgeDelays` times arc `from_rf -> to_rf` of gate edge `e` (OpenSTA
 /// `7515b043` + `564d3efb`, in the f11b4276 pin): `searchThru(edge, arc, mode)` —
 /// `searchThruTimingSense` under the edge's sense and `searchThruSimEdge` at both ends (a pin a
@@ -2466,6 +2508,44 @@ mod tests {
 
     use super::*;
     use crate::liberty::{Library, FALL, RISE};
+
+    /// Rule (`Resizer::driveResistance(drvr_pin)`, OpenROAD #12109 in the f11b4276 pin): the
+    /// largest arc drive over the driver's fanin edges `EvalPred` searches — not
+    /// `LibertyPort::driveResistance` over every arc into the port. A register's clear arc
+    /// (preset / clear arcs disabled by default) does not count: Q's drive here is CLK -> Q's
+    /// (3 ns / 2 pF), not the clear arc's larger 7 ns / 2 pF. With CLK held constant no edge is
+    /// searched (`None`: the caller falls back to the port's).
+    #[test]
+    fn drive_resistance_reads_only_the_searched_fanin_arcs() {
+        let text = r#"library (l) { time_unit : "1ns" ; capacitive_load_unit (1, pf) ;
+            lu_table_template (t) { variable_1 : input_net_transition ; variable_2 : total_output_net_capacitance ;
+              index_1 ("0, 1") ; index_2 ("0, 2") ; }
+            cell (dffr) {
+              ff (IQ, IQN) { clocked_on : "CLK"; next_state : "D"; clear : "!RN"; }
+              pin (CLK) { direction : input ; clock : true ; }
+              pin (D) { direction : input ; }
+              pin (RN) { direction : input ; }
+              pin (Q) { direction : output ; function : "IQ" ;
+                timing () { related_pin : "CLK" ; timing_type : rising_edge ;
+                  rise_transition (t) { values ("1, 3", "5, 9") ; } fall_transition (t) { values ("1, 3", "5, 9") ; } }
+                timing () { related_pin : "RN" ; timing_type : clear ; timing_sense : positive_unate ;
+                  fall_transition (t) { values ("1, 7", "5, 9") ; } } } } }"#;
+        let libs = vec![Library::read(&crate::liberty_parse::parse(text).unwrap()).unwrap()];
+        let i = |k: usize, p: &str| Conn::Inst(k, p.into());
+        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins }.into();
+        let netlist = Netlist {
+            insts: vec![crate::netlist::inst("f1", "dffr")],
+            ports: vec![("clk".into(), PortDir::Input), ("d".into(), PortDir::Input), ("rn".into(), PortDir::Input), ("q".into(), PortDir::Output)],
+            nets: vec![net("clk", vec![i(0, "CLK"), Conn::Port(0)]), net("d", vec![i(0, "D"), Conn::Port(1)]), net("rn", vec![i(0, "RN"), Conn::Port(2)]), net("q", vec![i(0, "Q"), Conn::Port(3)])],
+        };
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        let q = (0..g.vertices.len()).find(|&x| g.vname(x) == "f1/Q").unwrap();
+        let (clk_q, clear) = ((3.0 * 1e-9f32) / (2.0 * 1e-12f32), (7.0 * 1e-9f32) / (2.0 * 1e-12f32));
+        assert_eq!(libs[0].cells["dffr"].drive_resistance("Q"), clear, "the port's: every arc");
+        assert_eq!(eval_drive_resistance(&g, q), Some(clk_q), "the searched arcs: not the clear arc");
+        g.sdc.constants.insert("f1/CLK".into(), false);
+        assert_eq!(eval_drive_resistance(&g, q), None, "CLK constant: nothing searched");
+    }
     use crate::netlist::{Conn, Net, Netlist, PortDir};
     use crate::sdc::{Clock, PortDelay};
 
