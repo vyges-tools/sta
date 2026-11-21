@@ -1180,11 +1180,12 @@ pub fn find_requireds_scenes(incs: &mut [IncTimer], searches: &mut [Search<'_, '
                 let search = &mut searches[k];
                 let g = search.graph;
                 let req = search.required_values(v);
-                for (p, r) in search.paths[v].iter_mut().zip(req) {
-                    if !crate::fuzzy::equal(p.required, r) {
+                for (i, r) in req.into_iter().enumerate() {
+                    // `requiredsSave`: a register clock pin's ideal clock path is not a change.
+                    if !crate::fuzzy::equal(search.paths[v][i].required, r) && !search.is_ideal_reg_clk_path(v, &search.paths[v][i].tag) {
                         changed = true;
                     }
-                    p.required = r;
+                    search.paths[v][i].required = r;
                 }
                 if let Some(stored) = incs[k].paths.get_mut(&name) {
                     for sp in stored.iter_mut() {

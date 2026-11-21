@@ -1666,11 +1666,17 @@ impl<'g, 'a> Search<'g, 'a> {
     /// `RequiredCmp::requiredsSave` and, when a required changed (not fuzzily equal), the fanin
     /// enqueued over `SearchAdj` (`BfsBkwdIterator::enqueueAdjacentVertices`): every in-edge but a
     /// timing check, a latch D->Q, a preset/clear arc and a disabled bidirect instance path.
+    ///
+    /// A register clock pin's ideal clock path ([`Search::is_ideal_reg_clk_path`]) never counts as
+    /// a change: nothing upstream of it reads its required.
     fn required_save(&mut self, v: usize, req: Vec<f32>, enqueued: &mut [bool]) {
         let mut changed = false;
-        for (p, r) in self.paths[v].iter_mut().zip(req) {
-            changed |= !crate::fuzzy::equal(p.required, r);
-            p.required = r;
+        for (i, r) in req.into_iter().enumerate() {
+            let p = &self.paths[v][i];
+            if !crate::fuzzy::equal(p.required, r) && !self.is_ideal_reg_clk_path(v, &p.tag) {
+                changed = true;
+            }
+            self.paths[v][i].required = r;
         }
         if changed {
             for &e in &self.graph.in_edges[v] {
@@ -1705,6 +1711,17 @@ impl<'g, 'a> Search<'g, 'a> {
         self.is_reg_clk[v]
     }
 
+    /// `isIdealRegClkPath(vertex, tag)` (OpenSTA fork `9c58ac39`, in the f11b4276 pin): a clock
+    /// path with a clock edge at a register clock pin, its clock not propagated. Its required comes
+    /// from the clock-to-output arc as before, but is not carried back into the clock network:
+    /// `RequiredVisitor::visitFromToPath` skips a fanout path that is one, and
+    /// `RequiredCmp::requiredsSave` does not count its change toward enqueuing the fanin. Clock
+    /// network pins above the register clock pins keep the initial (infinite) required while the
+    /// clock is ideal.
+    pub(crate) fn is_ideal_reg_clk_path(&self, v: usize, tag: &Tag) -> bool {
+        self.is_reg_clk[v] && tag.is_clock && tag.clk_edge.is_some_and(|e| !self.propagated(e))
+    }
+
     /// `RequiredCmp::requiredSet` with the path's opposite min/max: a MAX path's required is the
     /// fuzzily smaller, a MIN path's the fuzzily greater.
     fn required_set(req: &mut [f32], i: usize, value: f32, mm: usize) {
@@ -1724,6 +1741,10 @@ impl<'g, 'a> Search<'g, 'a> {
             for (i, from) in self.paths[v].iter().enumerate() {
                 for arc in self.arcs_from(e, from.tag.rf) {
                     let Some((to_tag, delay, _)) = self.visit_from_path(v, from, e, &arc) else { continue };
+                    // `visitFromToPath`: nothing back from a register clock pin's ideal clock path.
+                    if self.is_ideal_reg_clk_path(to_v, &to_tag) {
+                        continue;
+                    }
                     let to_paths = &self.paths[to_v];
                     let to_required = match to_paths.iter().find(|p| p.tag.matches(&to_tag)) {
                         Some(p) => Some(p.required),
@@ -3555,6 +3576,35 @@ mod tests {
             }
             assert!(ends.iter().any(|e| s.paths[d][e.path].tag.mm == MIN) && ends.iter().any(|e| s.paths[d][e.path].tag.mm == MAX));
             assert!(s.check_ends(v("out")).is_empty());
+        });
+    }
+
+    /// Rule (OpenSTA fork `9c58ac39`, "stop ideal clock network required propagation at reg clk
+    /// pins", in the f11b4276 pin; `RequiredVisitor::visitFromToPath` + `RequiredCmp::requiredsSave`
+    /// via `isIdealRegClkPath`): on an IDEAL clock a register clock pin keeps its required from the
+    /// clock-to-output arc, but nothing flows back past it, so the clock network above it — the
+    /// buffer output and the clock port — keeps the initial required: an INFINITE slack, max and
+    /// min. A propagated clock is unaffected. (The correlation goldens' `slack clk_i` line went
+    /// away at this pin for this reason.) ⚠️ In a full pass either half alone gives this result
+    /// (no change counted ⇒ the clock net is never enqueued; skipped ⇒ it reads nothing); the test
+    /// fails only with BOTH removed. The `requiredsSave` half is what keeps incremental updates in
+    /// step.
+    #[test]
+    fn an_ideal_clock_network_takes_no_required_from_its_registers() {
+        timed_with(
+            |sdc| sdc.clocks[0].propagated = false,
+            |s, v| {
+                for mm in [MAX, MIN] {
+                    assert!(s.slack_of(v("f1/CLK"), mm, None).is_finite(), "a register clock pin keeps its clk->q required");
+                    assert_eq!(s.slack_of(v("b1/X"), mm, None), INF, "clock network above the register: no required");
+                    assert_eq!(s.slack_of(v("clk"), mm, None), INF, "the clock port: no required");
+                }
+            },
+        );
+        timed(|s, v| {
+            for mm in [MAX, MIN] {
+                assert!(s.slack_of(v("clk"), mm, None).is_finite(), "a propagated clock's port still has a required");
+            }
         });
     }
 
