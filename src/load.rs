@@ -559,6 +559,27 @@ pub(crate) fn constraints_mode(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[L
     }
     let mut s = expanded_ports(s, nl, &mut notes)?;
     let lib0 = libs.first().ok_or("constraints before any liberty library")?;
+    let (sdc, derates) = mode_search(&mut s, nl, lib0.time_scale, false, &mut notes)?;
+    let mut env = sdc_env(&s, libs, nl)?;
+    env.derates = derates;
+    if let Some(constant_nets) = constant_nets {
+        let (logic, case) = (logic_values(&s.logic_values, nl)?, logic_values(&s.case_values, nl)?);
+        let v = crate::sim::simulate(libs, nl, constant_nets, &logic, &case)?;
+        env.constants = v.constants;
+        env.sim_transitions = v.transitions;
+        notes.extend(v.warnings.into_iter().map(|w| format!("sim: {w}")));
+    }
+    Ok(ModeRead { sdc, env, notes, expanded: s })
+}
+
+/// The search's constraints as one mode holds them (`Mode::sdc_`), whatever command searches
+/// them: the timer's own report ([`constraints_mode`]) and a repair's search
+/// ([`crate::scenes::mode_search_sdc`]) read the SAME constraints, so a slack the repair ranks
+/// is the slack the timer reports. Takes out of `s` what goes elsewhere: the uncertainties, the
+/// clock groups and transitions (per clock), the false / multicycle / group paths (one list in
+/// creation order) and the derates (returned, for the graph). `propagated`: the run's command
+/// made every clock the file names in no `set_propagated_clock` propagated.
+fn mode_search(s: &mut vyges_loom::sdc::Sdc, nl: &Netlist, time_scale: f32, propagated: bool, notes: &mut Vec<String>) -> Result<(crate::sdc::Sdc, Option<Box<crate::graph::DerateFactors>>), String> {
     // uncertainties are applied per clock below; the search's design-wide refusal is for rsz
     let uncertainties = std::mem::take(&mut s.uncertainties);
     (s.setup_uncertainty, s.hold_uncertainty) = (0.0, 0.0);
@@ -573,31 +594,30 @@ pub(crate) fn constraints_mode(s: &vyges_loom::sdc::Sdc, nl: &Netlist, libs: &[L
     (s.late_derate, s.early_derate) = (None, None);
     // group paths after the false paths below (the search's reader would read them first)
     let group_cmds = std::mem::take(&mut s.other_exceptions);
-    let mut sdc = search_sdc_on(&s, nl, lib0.time_scale, false, false)?;
-    clock_uncertainties(&uncertainties, &mut sdc.clocks, lib0.time_scale)?;
+    let mut sdc = search_sdc_on(s, nl, time_scale, propagated, false)?;
+    clock_uncertainties(&uncertainties, &mut sdc.clocks, time_scale)?;
     clock_groups(&groups, &mut sdc.clocks)?;
-    clock_transitions(&s.clock_transitions, &mut sdc.clocks, lib0.time_scale, &mut notes)?;
+    clock_transitions(&s.clock_transitions, &mut sdc.clocks, time_scale, notes)?;
     // what `get_pins` patterns match: built once, and only when a pattern needs it
     let pins = std::cell::OnceCell::new();
-    let falses = timing_exceptions_made(&exceptions, &s, nl, &pins)?;
+    let falses = timing_exceptions_made(&exceptions, s, nl, &pins)?;
     if !falses.is_empty() && !sdc.path_delays.is_empty() {
         return Err("set_false_path / set_multicycle_path with set_max_delay / set_min_delay: not modelled (the ids across them are the order they were made in)".into());
     }
-    let groups = group_paths_made(&group_cmds, &s, nl, &pins)?;
+    let groups = group_paths_made(&group_cmds, s, nl, &pins)?;
     if !groups.is_empty() && !sdc.path_delays.is_empty() {
         return Err("group_path with set_max_delay / set_min_delay: not modelled (the ids across them are the order they were made in)".into());
     }
     sdc.path_delays.extend(in_creation_order(falses, groups)?);
-    let mut env = sdc_env(&s, libs, nl)?;
-    env.derates = derates;
-    if let Some(constant_nets) = constant_nets {
-        let (logic, case) = (logic_values(&s.logic_values, nl)?, logic_values(&s.case_values, nl)?);
-        let v = crate::sim::simulate(libs, nl, constant_nets, &logic, &case)?;
-        env.constants = v.constants;
-        env.sim_transitions = v.transitions;
-        notes.extend(v.warnings.into_iter().map(|w| format!("sim: {w}")));
-    }
-    Ok(ModeRead { sdc, env, notes, expanded: s })
+    Ok((sdc, derates))
+}
+
+/// [`mode_search`] on a loom-parsed SDC as written (its port patterns expanded first).
+pub(crate) fn mode_search_sdc(s: &vyges_loom::sdc::Sdc, nl: &Netlist, time_scale: f32, propagated: bool) -> Result<(crate::sdc::Sdc, Vec<String>), String> {
+    let mut notes = Vec::new();
+    let mut s = expanded_ports(s, nl, &mut notes)?;
+    let (sdc, _) = mode_search(&mut s, nl, time_scale, propagated, &mut notes)?;
+    Ok((sdc, notes))
 }
 
 /// `set_clock_uncertainty` as the reference's command sets it, in file order, the later value
@@ -2225,6 +2245,47 @@ mod tests {
         assert!(search_sdc(&sdc("group_path -name g -to [get_ports y]"), 1e-9, false, false).unwrap_err().contains("without the netlist"));
         let e = search_sdc_on(&sdc("set_max_delay 1 -from [get_pins b/A] -to [get_pins b/X]\ngroup_path -name g -to [get_ports y]"), &nl, 1e-9, false, false).unwrap_err();
         assert!(e.contains("the ids across them"), "{e}");
+    }
+
+    /// Rule (one `Sta` per run: `Resizer` ranks the slacks `Search` finds on the mode's one
+    /// `Sdc`): a repair's search reads the constraints the timer reports on —
+    /// [`crate::scenes::mode_search_sdc`] equals [`constraints`]' `Sdc`. Each clock keeps BOTH
+    /// uncertainties (`ClockUncertainties` holds `-setup` and `-hold` whatever the command), the
+    /// latency on the ideal real clock and the virtual one, and the group and false paths in the
+    /// order they were made (`write_sdc` writes the groups first). The design-wide search reader
+    /// a setup repair used refused all of it.
+    #[test]
+    fn a_repair_searches_the_constraints_the_timer_reports_on() {
+        let nl = netlist(&vyges_loom::netlist::parse_compact("module t (ck, a, r, y, h); input ck, a, r; output y, h; BUF b (.A(a), .X(y)); BUF c (.A(r), .X(h)); endmodule
+").unwrap(), &[lib()]).unwrap();
+        let text = "create_clock -name ck -period 5 [get_ports {ck}]\n\
+            set_clock_uncertainty -setup 0.25 ck\nset_clock_uncertainty -hold 0.03 ck\n\
+            create_clock -name vck -period 5\n\
+            set_clock_uncertainty -setup 0.25 vck\nset_clock_uncertainty -hold 0.03 vck\n\
+            set_clock_latency 1.05 [get_clocks {ck}]\nset_clock_latency 1.05 [get_clocks {vck}]\n\
+            set_input_delay 1.75 -clock [get_clocks {vck}] -max [get_ports {a r}]\n\
+            set_output_delay 1.75 -clock [get_clocks {vck}] -max [get_ports {y h}]\n\
+            group_path -name INPUTS -from [list [get_ports {a}] [get_ports {r}]]\n\
+            group_path -name COMBO -from [list [get_ports {a}]] -to [list [get_ports {y}]]\n\
+            group_path -name OUTPUTS -to [list [get_ports {y}] [get_ports {h}]]\n\
+            set_false_path -from [list [get_ports {r}]]\nset_false_path -to [list [get_ports {h}]]\n";
+        let s = vyges_loom::sdc::Sdc::parse(text).unwrap();
+        let ns = |v: f64| crate::sdc::user_to_sta(v, 1e-9);
+        let repair = crate::scenes::mode_search_sdc(&s, &nl, 1e-9, false).unwrap();
+        let (timer, _, _) = constraints(&s, &nl, &[lib()]).unwrap();
+        assert_eq!(format!("{repair:?}"), format!("{timer:?}"), "the repair's search reads what the timer reads");
+        for c in &repair.clocks {
+            assert_eq!(c.uncertainty, [Some(ns(0.03)), Some(ns(0.25))], "{}: hold and setup", c.name);
+            assert_eq!(c.latency[0][1], Some(ns(1.05)), "{}: the ideal latency", c.name);
+        }
+        // a false path is one exception per min/max (`-setup` and `-hold` both), in file order
+        let (min, max) = (crate::liberty::MIN, crate::liberty::MAX);
+        let kinds: Vec<(Option<&str>, bool, usize)> = repair.path_delays.iter().map(|p| (p.group.as_deref(), p.false_path, p.min_max)).collect();
+        assert_eq!(kinds, vec![(Some("INPUTS"), false, max), (Some("COMBO"), false, max), (Some("OUTPUTS"), false, max), (None, true, min), (None, true, max), (None, true, min), (None, true, max)]);
+        assert!(search_sdc_on(&s, &nl, 1e-9, false, false).is_err(), "the design-wide reader refuses it");
+        // the run's command propagating the clocks is read through too
+        let prop = crate::scenes::mode_search_sdc(&vyges_loom::sdc::Sdc::parse("create_clock -name ck -period 5 [get_ports {ck}]\nset_clock_uncertainty -setup 0.25 ck\n").unwrap(), &nl, 1e-9, true).unwrap();
+        assert!(prop.clocks[0].propagated);
     }
 
     /// Rules (`SdcNetwork::findPinsMatching` / `findInstancesMatching`, `parse_from_arg`,

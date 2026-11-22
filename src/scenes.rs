@@ -268,6 +268,20 @@ pub fn scene_constraints(s: &vyges_loom::sdc::Sdc, d: DesignRef<'_>, scenes: &[&
     scene_constraints_each(s, d, scenes)
 }
 
+/// A repair's search constraints, read as the mode reads them for the timer
+/// ([`mode_constraints`]): every clock with its uncertainties (`-setup` and `-hold`, as
+/// `ClockUncertainties` holds both whatever the command that searches), clock groups and
+/// transitions, the false, multicycle and group paths in the order they were made, and the path
+/// delays — so the slack a repair ranks is the slack the timer reports
+/// (`Resizer` asks the one `Sta` of the run). `propagated`: the run's command propagated every
+/// clock the file does not name in a `set_propagated_clock`. Derates go onto the graph, not here
+/// (`timing_derates`). The forms the search does not model refuse here or in
+/// `Search::constraints_modelled`, never dropped.
+#[cfg(feature = "loom")]
+pub fn mode_search_sdc(s: &vyges_loom::sdc::Sdc, nl: &crate::netlist::Netlist, time_scale: f32, propagated: bool) -> Result<crate::sdc::Sdc, String> {
+    crate::load::mode_search_sdc(s, nl, time_scale, propagated).map(|(sdc, _)| sdc)
+}
+
 /// [`scene_constraints`] as the reference holds a mode: ONE `Sdc` and ONE simulation (`Mode`'s
 /// `sdc_` and `sim_`; `Sim` evaluates the link cells, `network_->libertyCell(inst)`), read on the
 /// link scene's libraries; each other scene adds only its own environment (its libraries' loads
