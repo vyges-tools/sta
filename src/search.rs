@@ -213,6 +213,9 @@ pub struct Search<'g, 'a> {
     /// `Sdc::isLeafPinClock`: a clock's source pin — a port or any instance pin, both vertices of
     /// a bidirect one.
     clock_leaf: Vec<bool>,
+    /// `ArrivalVisitor::clks_only_` while [`Search::find_clk_arrivals`] runs: a register clock
+    /// pin's fanout is not queued.
+    clks_only: bool,
     /// `GatedClk::isGatedClkEnable`: an enable pin, its gate's clock pin and whether the gate's
     /// active value is 1 (AND-like) or 0 (OR-like) — when the clock pin reaches a register clock
     /// pin (`hasDownstreamClkPin`).
@@ -712,7 +715,7 @@ impl<'g, 'a> Search<'g, 'a> {
         let (latch_en, latch_data) = latch_enables(graph);
         let clk_network = clock_network(graph, sdc);
         let clock_leaf = (0..graph.vertices.len()).map(|v| { let name = graph.vname(v); sdc.clocks.iter().any(|c| !c.source.is_empty() && name == c.source) }).collect();
-        let mut search = Search { graph, sdc, paths: vec![Vec::new(); n], vertex_id, input_delay, output_delay, is_reg_clk, internal_from, internal_from_break, internal_to, internal_to_break, sim, latch_en, latch_data, clk_network, clock_leaf, gated: HashMap::new(), first_to: sdc.first_to() };
+        let mut search = Search { graph, sdc, paths: vec![Vec::new(); n], vertex_id, input_delay, output_delay, is_reg_clk, internal_from, internal_from_break, internal_to, internal_to_break, sim, latch_en, latch_data, clk_network, clock_leaf, clks_only: false, gated: HashMap::new(), first_to: sdc.first_to() };
         search.gated = search.gated_clk_enables();
         search
     }
@@ -1370,10 +1373,32 @@ impl<'g, 'a> Search<'g, 'a> {
     /// (`postponeLatchDataOutputs`). Passes stop when nothing is postponed.
     pub fn find_arrivals(&mut self) -> Result<(), String> {
         let _time = crate::par::StageTimer::start("find_arrivals", self.graph.thread_count);
+        let queued = vec![true; self.graph.vertices.len()];
+        self.find_arrivals_from(queued)
+    }
+
+    /// `Search::findClkArrivals` (`ensureClkArrivals`): the arrivals of the clock network alone.
+    /// Reference rule (OpenSTA `Search::findClkArrivals`): `arrival_visitor_->init(false, true,
+    /// eval_pred_)` — clocks only — then `enqueueClkRoots` (the vertices of every clock's leaf
+    /// pins, `findClkVertexPins`) and the level-order search to the max level; in
+    /// `ArrivalVisitor::visit` a changed vertex queues its fanout, except that with `clks_only_` a
+    /// REGISTER CLOCK pin's fanout is marked invalid instead (not searched). So nothing past a
+    /// register is timed, and a vertex no clock reaches keeps no path. The visit itself (fanin
+    /// paths, seeds) is the full search's.
+    pub fn find_clk_arrivals(&mut self) -> Result<(), String> {
+        let _time = crate::par::StageTimer::start("find_clk_arrivals", self.graph.thread_count);
+        let queued = self.clock_leaf.clone();
+        self.clks_only = true;
+        let r = self.find_arrivals_from(queued);
+        self.clks_only = false;
+        r
+    }
+
+    /// The level-order arrival search from the vertices `queued` holds (`findArrivals2`).
+    fn find_arrivals_from(&mut self, mut queued: Vec<bool>) -> Result<(), String> {
         let order = self.graph.topo_order()?;
         let threads = self.graph.thread_count;
         let waves = (threads > 1).then(|| self.arrival_waves(&order));
-        let mut queued = vec![true; self.graph.vertices.len()];
         let mut pending: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         loop {
             match &waves {
@@ -1473,6 +1498,10 @@ impl<'g, 'a> Search<'g, 'a> {
         }
         if self.latch_data[v] {
             pending.extend(self.latch_outputs_of(v));
+        }
+        // `clks_only_ && vertex->isRegClk()`: `arrivalInvalid(fanout)`, not queued
+        if self.clks_only && self.is_reg_clk[v] {
+            return;
         }
         for &e in &self.graph.out_edges[v] {
             if self.arrival_queues(e) {
@@ -3524,6 +3553,31 @@ mod tests {
         // launching clock but is not one; with no clock, the CLK pin's segment start is not one.
         timed(|s, v| assert!(s.has_clock_arrival(v("f1/CLK")) && !s.has_clock_arrival(v("f1/Q"))));
         timed_with(|sdc| sdc.clocks.clear(), |s, v| assert!(!s.has_clock_arrival(v("f1/CLK")) && !s.paths[v("f1/CLK")].is_empty()));
+    }
+
+    /// Rule (OpenSTA `Search::findClkArrivals`: clocks only, from the clock leaf pins; a register
+    /// clock pin's fanout is not searched): the clock network's arrivals are the full search's —
+    /// the register clock pin's every path equal — and nothing past the register (its Q, the data
+    /// cone) or off the clock (the data input port) is timed.
+    #[test]
+    fn clock_arrivals_alone_stop_at_the_register_clock_pins() {
+        let (libs, netlist, sdc) = design();
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        g.find_delays(&HashMap::new(), None).unwrap();
+        let v = |n: &str| (0..g.vertices.len()).position(|x| g.vname(x) == n).unwrap();
+        let mut full = Search::in_graph_order(&g, &sdc);
+        full.find_arrivals().unwrap();
+        let mut clk = Search::in_graph_order(&g, &sdc);
+        clk.find_clk_arrivals().unwrap();
+        let ck = v("f1/CLK");
+        assert!(!clk.paths[ck].is_empty() && clk.has_clock_arrival(ck));
+        assert_eq!(clk.paths[ck], full.paths[ck], "the register clock pin's paths");
+        assert!(clk.paths[v("b1/X")] == full.paths[v("b1/X")], "the clock buffer's");
+        assert!(clk.paths[v("f1/Q")].is_empty() && !full.paths[v("f1/Q")].is_empty(), "past the register: not searched");
+        assert!(clk.paths[v("f1/D")].is_empty() && clk.paths[v("in")].is_empty(), "the data side: not searched");
+        // and the full search afterwards is unchanged by the flag
+        clk.find_arrivals().unwrap();
+        assert!(clk.paths == full.paths);
     }
 
     /// A second, virtual clock `v` (rising 0.3 ns into the same 1 ns period).
