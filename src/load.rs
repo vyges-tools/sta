@@ -1679,10 +1679,23 @@ fn search_sdc_with(
                 _ => vec![0, 1],
             };
             for c in clocks.iter_mut().filter(|c| l.objects.iter().any(|n| vyges_loom::sdc::object_matches(n, &c.name))) {
-                // a latency on a propagated clock makes its source ideal (`seedClkArrival`); a
-                // propagated clock's insertion is taken out of its arrival again, not modelled
+                // `Sdc::setPropagatedClock(clk)` REMOVES the clock's network latency and
+                // `Sdc::setClockLatency(clk)` removes its propagation: the later command wins.
+                // The run's command (`set_propagated_clock` after the file, CTS's
+                // `setAllClocksPropagated`; virtual clocks are skipped, Warning 450) comes
+                // later, so the latency is gone. Both in the file: loom keeps the later one, so
+                // a network latency left on a clock the file propagates is refused. A source
+                // latency (`ClockInsertion`) is not removed; on a propagated clock it is not
+                // modelled.
                 if c.propagated {
-                    return Err(format!("set_clock_latency{} on a propagated clock: not modelled", if source { " -source" } else { "" }));
+                    if !source && named_propagated.is_empty() {
+                        continue;
+                    }
+                    return Err(format!(
+                        "set_clock_latency{} on a propagated clock: not modelled{}",
+                        if source { " -source" } else { "" },
+                        if source { "" } else { " (a network latency left on a clock the file propagates)" }
+                    ));
                 }
                 if source {
                     for &rf in &rfs {
@@ -2136,6 +2149,32 @@ mod tests {
         assert!(search_sdc(&both, 1e-9, false, false).unwrap_err().contains("setup repair"));
         let hold_only = sdc("set_clock_uncertainty -hold 0.2 clk\n");
         assert_eq!(search_sdc(&hold_only, 1e-9, false, false).unwrap().clocks[0].uncertainty, [None, None], "a setup repair leaves a hold uncertainty out");
+    }
+
+    /// Rules (`Sdc::setPropagatedClock(clk)`: `removeClockLatency(clk, nullptr)`;
+    /// `Sdc::setClockLatency(clk)`: `removePropagatedClock(clk)`; `set_propagated_clock` in
+    /// `sdc/Sdc.tcl` skips a virtual clock, Warning 450; CTS's `setAllClocksPropagated` skips
+    /// virtual clocks too): a clock the run propagates after the file loses the file's network
+    /// latency, and a virtual clock keeps its own for the I/O paths. Both commands on one clock in
+    /// one file: the later wins (loom applies it as it reads). `-source` on a propagated clock is
+    /// refused.
+    #[test]
+    fn propagating_a_clock_removes_its_network_latency() {
+        let nl = netlist(&vyges_loom::netlist::parse_compact("module t (ck, a, y); input ck, a; output y; BUF b (.A(a), .X(y)); endmodule\n").unwrap(), &[lib()]).unwrap();
+        let sdc = |t: &str| vyges_loom::sdc::Sdc::parse(&format!("create_clock -name ck -period 5 [get_ports {{ck}}]\ncreate_clock -name vck -period 5\n{t}")).unwrap();
+        let ns = |v: f64| crate::sdc::user_to_sta(v, 1e-9);
+        let both = sdc("set_clock_latency 1.05 [get_clocks {ck}]\nset_clock_latency 1.05 [get_clocks {vck}]\n");
+        let ideal = crate::scenes::mode_search_sdc(&both, &nl, 1e-9, false).unwrap();
+        assert_eq!((ideal.clocks[0].latency[0][1], ideal.clocks[1].latency[0][1]), (Some(ns(1.05)), Some(ns(1.05))));
+        let prop = crate::scenes::mode_search_sdc(&both, &nl, 1e-9, true).unwrap();
+        assert!(prop.clocks[0].propagated && !prop.clocks[1].propagated, "the virtual clock is never propagated");
+        assert_eq!(prop.clocks[0].latency, [[None; 2]; 2], "the propagated clock's latency is removed");
+        assert_eq!(prop.clocks[1].latency[0][1], Some(ns(1.05)), "the virtual clock keeps its latency");
+        // in one file the later command wins (loom applies both rules as it reads)
+        let later_latency = crate::scenes::mode_search_sdc(&sdc("set_propagated_clock [get_clocks {ck}]\nset_clock_latency 1.05 [get_clocks {ck}]\n"), &nl, 1e-9, false).unwrap();
+        assert!(!later_latency.clocks[0].propagated && later_latency.clocks[0].latency[0][1] == Some(ns(1.05)), "a later latency makes it ideal");
+        let source = sdc("set_clock_latency -source 0.2 [get_clocks {ck}]\n");
+        assert!(crate::scenes::mode_search_sdc(&source, &nl, 1e-9, true).unwrap_err().contains("-source on a propagated clock"));
     }
 
     /// Rule (`set_clock_uncertainty` in the reference's `sdc/Sdc.tcl`): `-setup` alone sets the
