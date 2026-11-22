@@ -17,7 +17,10 @@ use std::collections::BTreeSet;
 
 /// The graph as levelization reads it.
 pub trait LoopGraph {
-    /// Vertex ids are `0..vertex_count()`, in `VertexIterator` order.
+    /// Vertex ids are `0..vertex_count()`, in `VertexIterator` order. Since OpenSTA b395bb0 the
+    /// iterator walks `Network::pinIterator()` (the top instance's pins, then each leaf's), the
+    /// order a fresh build gives the ids, ports first (`Graph::build`). After an edit the
+    /// reference walks the network while new vertices take new ids; this trait reads ids.
     fn vertex_count(&self) -> usize;
     /// Edge ids are `0..edge_count()` (a deleted edge's id may be one no vertex lists).
     fn edge_count(&self) -> usize;

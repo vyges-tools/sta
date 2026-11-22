@@ -3881,8 +3881,10 @@ mod tests {
             assert!(s.paths[v("b1/X")].iter().all(|p| p.tag.mm == MAX && p.tag.states == States(1) && p.arrival == 0.0 && p.prev.is_none()));
             assert_eq!(s.paths[v("b1/X")].len(), 2);
             assert!(s.paths[v("b2/X")].is_empty() && s.paths[v("out")].is_empty());
+            // in vertex id order — the order `Search::endpoints()` (a `VertexSet`) holds them, the
+            // output port FIRST since OpenSTA b395bb0 (the top instance's pins take the lowest ids)
             let ends: Vec<usize> = (0..s.graph.vertices.len()).filter(|&x| s.is_endpoint(x)).collect();
-            assert_eq!(ends, vec![v("b1/A"), v("b2/A"), v("out")]);
+            assert_eq!(ends, vec![v("out"), v("b1/A"), v("b2/A")]);
             for p in &s.paths[v("b2/A")] {
                 assert_eq!(p.required, 2e-9);
             }
