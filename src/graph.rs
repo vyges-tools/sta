@@ -86,7 +86,7 @@ pub struct Edge {
 }
 
 /// A net's estimated RC network, nodes named by pin or point.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct NetParasitics {
     pub node_names: Vec<String>,
     pub network: Network,
