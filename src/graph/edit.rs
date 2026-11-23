@@ -128,6 +128,7 @@ impl<'a> Graph<'a> {
     /// The netlist edits `events` (the database's callbacks, in order) made on the graph, which then
     /// takes `netlist` — the generation after them. `pins` is the build's master-pin filter.
     pub fn apply_edits(&mut self, events: &[String], netlist: Arc<Netlist>, pins: Option<&HashMap<String, Vec<String>>>) -> Result<(), NotInPlace> {
+        self.drop_pass_caches(events);
         let mut shifted = false;
         let done = self.apply_edits_to(events, netlist.clone(), pins, &mut shifted);
         self.unusable_unless(done, || shifted.then_some(NetlistRef::Shared(netlist)))
@@ -155,11 +156,23 @@ impl<'a> Graph<'a> {
     /// costs what it edits; comparing two generations and copying one cost the whole design per
     /// repeater. `VYGES_STA_CHECK_EDIT` also checks the patched netlist equals `next`.
     pub fn apply_edits_held(&mut self, events: &[String], next: &Netlist, slots: &SlotDelta, pins: Option<&HashMap<String, Vec<String>>>) -> Result<(), NotInPlace> {
+        self.drop_pass_caches(events);
         let mut began = false;
         let done = self.apply_edits_held_to(events, next, slots, pins, &mut began);
         // once the edits began (no instance moved: checked first) `next` names every vertex, old
         // or made (copied: rare)
         self.unusable_unless(done, || began.then(|| NetlistRef::Shared(Arc::new(next.clone()))))
+    }
+
+    /// The whole-pass caches (each edge's arc set, the topological order) describe the graph as a
+    /// whole pass found it: an edit makes and frees vertices and edges, so they go with the first
+    /// event. A graph timed whole and then edited in place (the repair's held graphs) would
+    /// otherwise read an arc set by an edge id the cache never had.
+    fn drop_pass_caches(&mut self, events: &[String]) {
+        if !events.is_empty() {
+            self.arc_cache = None;
+            self.topo_cache = None;
+        }
     }
 
     /// An edit not made in place leaves the graph part-edited: vertices made or moved for the next
@@ -919,6 +932,35 @@ mod tests {
         let fresh_nl = chain(true);
         let fresh = Graph::build(&libs, &fresh_nl).unwrap();
         assert_eq!(g.differs_from_build(&fresh), None);
+    }
+
+    /// Rule (OpenSTA: one graph, timed whole by `findDelays()`, then edited by the network
+    /// callbacks and timed again incrementally): a graph timed whole and edited in place reads
+    /// each edge's arcs as a fresh build of the edited netlist does — its whole-pass caches go with
+    /// the edit (they were made for the edge ids before it) — in both edit paths.
+    #[test]
+    fn an_edit_after_a_whole_pass_drops_the_pass_caches() {
+        let libs = libs();
+        let next = Arc::new(chain(true));
+        let fresh = Graph::build(&libs, &next).unwrap();
+        for held in [false, true] {
+            let mut g = Graph::build_shared(&libs, Arc::new(chain(false)), None).unwrap();
+            g.find_delays(&HashMap::new(), None).unwrap();
+            assert!(g.arc_cache.is_some() && g.topo_cache.is_some(), "a whole pass made its caches");
+            if held {
+                let slots = SlotDelta { insts: vec![2], nets: vec![2, 5] };
+                g.apply_edits_held(&insertion(), &next, &slots, None).unwrap();
+            } else {
+                g.apply_edits(&insertion(), next.clone(), None).unwrap();
+            }
+            assert!(g.arc_cache.is_none() && g.topo_cache.is_none(), "the edit let them go");
+            for e in 0..g.edges.len() {
+                if let EdgeKind::Gate { set } = g.edges[e].kind {
+                    let _ = g.arc_set(e, set);
+                }
+            }
+            assert_eq!(g.differs_from_build(&fresh), None);
+        }
     }
 
     /// Rule (an edit not made in place is undone by building again, as the reference never edits

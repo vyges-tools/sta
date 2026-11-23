@@ -214,9 +214,9 @@ pub struct Graph<'a> {
     index_cache: std::sync::OnceLock<std::sync::Arc<HashMap<String, usize>>>,
     /// Each edge's arc set (`None`: a wire), resolved once ([`Graph::cache_arc_sets`], at the head
     /// of [`Graph::find_delays`]) instead of finding the cell by name at every [`Graph::arc_set`].
-    /// Valid for this graph's libraries, scene map and structure, which a graph never changes in
-    /// place (an edit builds a new graph; [`Graph::detach`] / [`Graph::reattach`] drop it); not
-    /// consulted while stale arcs are set. A plain field, not a lazy cell: a lazy cell would make
+    /// Valid for this graph's libraries, scene map and structure: an edit in place drops it (as
+    /// [`Graph::detach`] / [`Graph::reattach`] do), and it is made again at the next whole pass;
+    /// not consulted while stale arcs are set. A plain field, not a lazy cell: a lazy cell would make
     /// the graph invariant in `'a`, which callers that shorten it rely on.
     arc_cache: Option<Arc<Vec<Option<&'a crate::liberty::ArcSet>>>>,
     /// The topological order ([`Graph::topo_order`]) computed once ([`Graph::cache_topo_order`], at

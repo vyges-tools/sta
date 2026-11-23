@@ -313,6 +313,26 @@ impl IncTimer {
         }
     }
 
+    /// The edge of `g` whose [`IncTimer::edge_key`] is `key` (the lowest id when two are: as a
+    /// scan of every edge finds it), found among the in-edges of the vertices named as its head
+    /// (`index`: `g`'s pin index). A key costs its head's fan-in, not the graph: after a repair
+    /// the invalid check edges are every sink's, and a scan per key never ended on a large design.
+    pub fn edge_of_key(g: &Graph<'_>, index: &HashMap<String, usize>, key: &EdgeKey) -> Option<usize> {
+        let to = match key {
+            EdgeKey::Gate { to, .. } | EdgeKey::Wire { to, .. } => to,
+        };
+        let &v = index.get(to)?;
+        let mut found: Option<usize> = None;
+        for u in g.vertices_named(v) {
+            for &e in &g.in_edges[u] {
+                if found.is_none_or(|f| e < f) && Self::edge_key(g, e) == *key {
+                    found = Some(e);
+                }
+            }
+        }
+        found
+    }
+
     /// The stored slews and delays into a graph; a vertex or edge the state has never seen
     /// starts at 0. A graph that imported this state before (and edited in place since: what it
     /// made new is 0, as here) takes only the vertices written after; one built, whole.
@@ -349,6 +369,24 @@ impl IncTimer {
         }
         if g.state_seq != Some((self.stamp.0, self.written_base + self.written.len())) {
             return Err("a graph that has not imported the timer's state cannot hold it".into());
+        }
+        self.slews = HashMap::new();
+        self.delays = HashMap::new();
+        self.written = Vec::new();
+        self.written_base = 0;
+        self.stamp = Stamp::new();
+        self.held_by = Some(self.stamp.0);
+        g.state_seq = Some((self.stamp.0, 0));
+        Ok(())
+    }
+
+    /// Graph `g`, just timed whole, holds this timer's slews and delays from now on: the state
+    /// [`IncTimer::export`], [`IncTimer::import`] and [`IncTimer::hold_in`] leave, without writing
+    /// every value out by name and reading it back. The reference keeps one graph, timed once
+    /// (`findDelays`), and edits it; a copy of its values by name is ours alone.
+    pub fn hold_timed(&mut self, g: &mut Graph<'_>) -> Result<(), String> {
+        if self.held_by.is_some() {
+            return Err("the timer's values are held by another graph".into());
         }
         self.slews = HashMap::new();
         self.delays = HashMap::new();
@@ -854,8 +892,9 @@ pub fn find_delays_scenes(incs: &mut [IncTimer], gs: &mut [Graph<'_>], parasitic
     incs[0].levels = levels;
     // Timing checks, after the slews they read.
     for (inc, g) in incs.iter_mut().zip(gs.iter_mut()) {
+        let index = g.pin_index();
         for key in std::mem::take(&mut inc.invalid_check_edges) {
-            if let Some(e) = (0..g.edges.len()).find(|&e| IncTimer::edge_key(g, e) == key) {
+            if let Some(e) = IncTimer::edge_of_key(g, &index, &key) {
                 g.find_check_edge_delays(e);
                 inc.store_delay(g, e);
                 inc.required_invalid(g_name(g, g.edges[e].to));
@@ -867,7 +906,7 @@ pub fn find_delays_scenes(incs: &mut [IncTimer], gs: &mut [Graph<'_>], parasitic
     for ((inc, g), par) in incs.iter_mut().zip(gs.iter_mut()).zip(parasitics) {
         let index = g.pin_index();
         for key in std::mem::take(&mut inc.invalid_latch_edges) {
-            if let Some(e) = (0..g.edges.len()).find(|&e| IncTimer::edge_key(g, e) == key) {
+            if let Some(e) = IncTimer::edge_of_key(g, &index, &key) {
                 let changed = g.find_latch_edge_delays(e, par, &index);
                 inc.store_delay(g, e);
                 if changed {
@@ -1814,6 +1853,70 @@ mod tests {
         maps.import(&mut fa);
         held.import(&mut fb);
         assert_eq!((&fb.slew, &fb.delay), (&fa.slew, &fa.delay), "released: a fresh graph imports the same values");
+    }
+
+    /// Rule (OpenSTA `GraphDelayCalc::findCheckEdgeDelays` is handed the `Edge*` itself; we hold
+    /// keys by name): a key finds the edge a scan of every edge finds, for every edge of a graph,
+    /// and a key naming no edge finds none.
+    #[test]
+    fn an_edge_key_finds_the_edge_a_scan_finds() {
+        let libs = libs();
+        let nl = chain("buf");
+        let g = Graph::build(&libs, &nl).unwrap();
+        let index = g.pin_index();
+        assert!(g.edges.len() > 2, "a graph with edges to find");
+        for e in 0..g.edges.len() {
+            let key = IncTimer::edge_key(&g, e);
+            let scan = (0..g.edges.len()).find(|&f| IncTimer::edge_key(&g, f) == key);
+            assert_eq!(IncTimer::edge_of_key(&g, &index, &key), scan, "edge {e} {key:?}");
+        }
+        let none = EdgeKey::Wire { from: "nowhere".into(), to: "nothing".into() };
+        assert_eq!(IncTimer::edge_of_key(&g, &index, &none), None);
+    }
+
+    /// The graph the repair just timed whole holds the values as it is (`hold_timed`), as the
+    /// reference's one graph does after `findDelays()`: the same state, and the same timing after
+    /// an edit, as writing every value out by name, reading it back and holding it.
+    #[test]
+    fn a_graph_timed_whole_holds_the_values_as_an_export_import_would() {
+        let libs = libs();
+        let (nl0, nl1) = (Arc::new(chain("buf")), Arc::new(chain("big")));
+        let cx = EventCtx { libs: &libs, ideal_clock_mode: false };
+        let terms = "A=n1=b1/X,b2/A;X=n2=b2/X,b3/A";
+        let evs = [format!("swap_before|b2|buf|big|{terms}"), format!("swap_after|b2|{terms}")];
+        let run = |direct: bool| {
+            let mut inc = IncTimer::default();
+            inc.track_netlist(&nl0);
+            let mut g = Graph::build_shared(&libs, nl0.clone(), None).unwrap();
+            g.find_delays(&HashMap::new(), None).unwrap();
+            inc.relevelize(&g).unwrap();
+            // as the repair after its whole pass
+            inc.delays_exist = true;
+            if direct {
+                inc.hold_timed(&mut g).unwrap();
+            } else {
+                inc.export(&g);
+                inc.import(&mut g);
+                inc.hold_in(&mut g).unwrap();
+            }
+            assert!(inc.holds(&g));
+            let before = (g.slew.clone(), g.delay.clone());
+            for ev in &evs {
+                inc.apply_event(&cx, ev).unwrap();
+            }
+            g.apply_edits(&evs, nl1.clone(), None).unwrap();
+            inc.import(&mut g);
+            inc.find_delays(&mut g, &HashMap::new(), None).unwrap();
+            (inc, g, before)
+        };
+        let ((a, ga, ba), (b, gb, bb)) = (run(false), run(true));
+        assert_eq!(bb, ba, "held as timed: the values an export and import give");
+        assert!(!a.visited.is_empty(), "the swap re-timed something");
+        assert_eq!(b.visited, a.visited);
+        assert_eq!((&gb.slew, &gb.delay), (&ga.slew, &ga.delay));
+        assert!(b.slews.is_empty() && b.delays.is_empty() && b.written.is_empty(), "nothing kept by name");
+        let mut again = b.clone();
+        assert!(again.hold_timed(&mut Graph::build_shared(&libs, nl1.clone(), None).unwrap()).is_err(), "held by one graph at a time");
     }
 
     // An edit the holding graph cannot make in place (here an edge id left free) leaves it
